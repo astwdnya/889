@@ -28,9 +28,9 @@ from telethon.tl.types import Message
 from telethon.errors import MessageNotModifiedError
 
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
-API_ID = 2040
-API_HASH = "b18441a1ff607e10a989891a5462e627"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
 
 AUTHORIZED_USERS_RAW = os.environ.get("AUTHORIZED_USERS", "818185073,6936101187,7972834913")
 AUTHORIZED_USERS = set(int(uid.strip()) for uid in AUTHORIZED_USERS_RAW.split(",") if uid.strip())
@@ -229,10 +229,11 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
     async with async_playwright() as p:
         browser = None
         try:
-            await status_msg.edit("📄 Converting to PDF...")
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
             page = await browser.new_page()
+            await safe_edit(status_msg, "🌐 Loading page...")
             await page.goto(url, wait_until="load", timeout=60000)
+            await safe_edit(status_msg, "📄 Rendering PDF...")
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(4)
 
