@@ -141,42 +141,100 @@ class ProgressHandler:
 
 # ====================== DOWNLOAD FUNCTIONS ======================
 async def download_direct_with_progress(url: str, status_msg: Message, referer: Optional[str] = None) -> Tuple[Optional[str], Optional[str], int]:
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        if referer:
-            headers['Referer'] = referer
+    MAX_RETRIES = 3
+    CHUNK_SIZE = 512 * 1024  # 512KB chunks
 
-        timeout = ClientTimeout(total=DOWNLOAD_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, allow_redirects=True) as response:
-                if response.status != 200:
-                    return None, f"HTTP {response.status}", 0
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'identity',  # بدون gzip تا content-length درست باشه
+        'Connection': 'keep-alive',
+    }
+    if referer:
+        headers['Referer'] = referer
 
-                cd = response.headers.get('Content-Disposition', '')
-                filename = f"video_{int(time.time())}.mp4"
-                if 'filename=' in cd:
-                    m = re.search(r'filename="?([^";]+)', cd)
-                    if m:
-                        filename = m.group(1).strip()
+    # timeout فقط روی connect و read هر chunk - نه کل عملیات
+    timeout = ClientTimeout(
+        total=None,        # بدون محدودیت کلی
+        connect=30,        # 30 ثانیه برای connect
+        sock_read=120,     # 120 ثانیه برای هر chunk
+    )
 
-                filepath = os.path.join(OUTPUT_FOLDER, safe_filename(filename))
-                total = int(response.headers.get('content-length', 0))
+    filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
+    downloaded = 0
+    total = 0
 
-                if total > MAX_FILE_SIZE_MB * 1024 * 1024:
-                    return None, "File too large", 0
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            attempt_headers = headers.copy()
+            # Resume از جایی که موند
+            if downloaded > 0:
+                attempt_headers['Range'] = f'bytes={downloaded}-'
+                await safe_edit(status_msg, f"🔄 Retry {attempt}/{MAX_RETRIES} — resuming from {human_readable_size(downloaded)}...")
 
-                progress = ProgressHandler(status_msg, total)
-                downloaded = 0
-                async with aiofiles.open(filepath, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        await progress.update(downloaded)
+            connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300, ssl=False)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                async with session.get(url, headers=attempt_headers, allow_redirects=True) as response:
+                    if response.status not in (200, 206):
+                        return None, f"HTTP {response.status}", 0
 
-                await progress.finish(True, "")
-                return filepath, None, downloaded
-    except Exception as e:
-        return None, str(e), 0
+                    if total == 0:
+                        content_length = int(response.headers.get('content-length', 0))
+                        if response.status == 206:
+                            # Range request - total = downloaded + remaining
+                            content_range = response.headers.get('content-range', '')
+                            m = re.search(r'/(\d+)', content_range)
+                            total = int(m.group(1)) if m else content_length + downloaded
+                        else:
+                            total = content_length
+
+                        if total > MAX_FILE_SIZE_MB * 1024 * 1024:
+                            return None, f"File too large ({human_readable_size(total)})", 0
+
+                        # تشخیص نام فایل
+                        cd = response.headers.get('Content-Disposition', '')
+                        if 'filename=' in cd:
+                            fm = re.search(r'filename="?([^";]+)', cd)
+                            if fm:
+                                ext = os.path.splitext(fm.group(1).strip())[1] or '.mp4'
+                                filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}{ext}")
+
+                    progress = ProgressHandler(status_msg, total, "Downloading")
+                    progress.last_bytes = downloaded
+
+                    write_mode = 'ab' if downloaded > 0 else 'wb'
+                    async with aiofiles.open(filepath, write_mode) as f:
+                        async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            await progress.update(downloaded)
+
+            # دانلود کامل شد
+            await progress.finish(True, "")
+            return filepath, None, downloaded
+
+        except (aiohttp.ClientError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
+            logger.warning(f"Download attempt {attempt} failed at {human_readable_size(downloaded)}: {e}")
+            if attempt == MAX_RETRIES:
+                # پاک کردن فایل ناقص
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception:
+                    pass
+                return None, f"Download failed after {MAX_RETRIES} retries: {str(e)[:80]}", 0
+            await asyncio.sleep(3)  # صبر قبل از retry
+
+        except Exception as e:
+            logger.error(f"Unexpected download error: {e}")
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception:
+                pass
+            return None, str(e)[:100], 0
+
+    return None, "Download failed", 0
 
 
 def is_video_url(url: str) -> bool:
@@ -586,7 +644,8 @@ async def process_dirpy_request(event, url: str):
             filepath,
             caption=f"🎬 **Video Downloaded via Dirpy**\n"
                     f"📦 Size: {human_readable_size(final_size)}\n"
-                    f"🔗 [Source]({url})",
+                    f"🔗 [Source]({url})\n"
+                    f"⬇️ [DW Link]({direct_url})",
             supports_streaming=True,
             buttons=buttons,
             parse_mode='markdown'
