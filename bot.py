@@ -28,12 +28,11 @@ from telethon.tl.types import Message
 from telethon.errors import MessageNotModifiedError
 
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
+API_ID = 2040
+API_HASH = "b18441a1ff607e10a989891a5462e627"
 
-AUTHORIZED_USERS_RAW = os.environ.get("AUTHORIZED_USERS", "818185073,6936101187,7972834913")
-AUTHORIZED_USERS = set(int(uid.strip()) for uid in AUTHORIZED_USERS_RAW.split(",") if uid.strip())
+AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
 
 MAX_FILE_SIZE_MB = 2000
 DOWNLOAD_TIMEOUT = 300
@@ -688,10 +687,6 @@ async def generic_url_handler(event):
 
 # ====================== MAIN ======================
 async def main():
-    if not BOT_TOKEN or not API_HASH or not API_ID:
-        logger.critical("❌ Missing BOT_TOKEN, API_ID, or API_HASH environment variables!")
-        sys.exit(1)
-
     print("\n" + "="*80)
     print("🚀 ULTIMATE BOT - FIXED VERSION")
     print("   PDF Fixed + MHTML Added + Bracket Bug Fixed + ENV Vars")
