@@ -180,42 +180,112 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
         return None, str(e), 0
 
 
+def is_video_url(url: str) -> bool:
+    """Check if a request URL looks like a direct video stream."""
+    u = url.lower()
+
+    SITE_PATTERNS = [
+        ('xnxx-cdn.com',         lambda u: 'mp4' in u),
+        ('xnxx.com',             lambda u: 'mp4' in u and '/videos/' in u),
+        ('media4.luxuretv.com',  lambda u: '.mp4' in u),
+        ('luxuretv.com',         lambda u: '.mp4' in u),
+        ('rule34.xxx',           lambda u: '.mp4' in u or ('video' in u and 'api' not in u)),
+        ('rule34video.com',      lambda u: '.mp4' in u),
+        ('ahrimp4',              lambda u: True),
+        ('media4',               lambda u: '.mp4' in u),
+    ]
+
+    for domain, check in SITE_PATTERNS:
+        if domain in u and check(u):
+            return True
+
+    # fallback: هر URL عمومی با .mp4 روی CDN
+    if '.mp4' in u and any(cdn in u for cdn in ['-cdn', 'media', 'video', 'stream', 'content', 'storage']):
+        return True
+
+    return False
+
+
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
     async with async_playwright() as p:
         browser = None
         captured_url: Optional[str] = None
 
         try:
-            await status_msg.edit("🌐 Launching browser for network interception...")
+            await safe_edit(status_msg, "🌐 Launching browser for network interception...")
 
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             )
-            page = await browser.new_page()
 
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1280, 'height': 720}
+            )
+            page = await context.new_page()
+
+            # روش ۱: Request interception
             async def handle_route(route):
                 nonlocal captured_url
-                req_url = route.request.url.lower()
-                if '.mp4' in req_url and any(d in req_url for d in ['luxuretv', 'xnxx-cdn', 'rule34', 'ahrimp4', 'media4']):
-                    if not captured_url:
-                        captured_url = route.request.url
-                        logger.info(f"Captured MP4: {req_url[:150]}")
+                req_url = route.request.url
+                if not captured_url and is_video_url(req_url):
+                    captured_url = req_url
+                    logger.info(f"[REQUEST] Captured: {req_url[:200]}")
                 await route.continue_()
 
             await page.route("**/*", handle_route)
 
+            # روش ۲: Response interception (برای سایت‌هایی که URL شامل mp4 نیست)
+            async def handle_response(response):
+                nonlocal captured_url
+                if captured_url:
+                    return
+                content_type = response.headers.get('content-type', '')
+                if 'video' in content_type or 'octet-stream' in content_type:
+                    rurl = response.url
+                    if 'dirpy.com' not in rurl.lower():
+                        captured_url = rurl
+                        logger.info(f"[RESPONSE content-type] Captured: {rurl[:200]}")
+
+            page.on('response', handle_response)
+
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
-            await page.goto(dirpy_url, wait_until="domcontentloaded", timeout=50000)
-            await page.wait_for_timeout(18000)
+            await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
+            await page.goto(dirpy_url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(8000)
 
             if not captured_url:
-                await page.evaluate('() => document.querySelector("video")?.play()')
-                await page.wait_for_timeout(12000)
+                await safe_edit(status_msg, "⏳ Waiting for video stream...")
+                # کلیک روی دکمه دانلود dirpy اگه وجود داشت
+                try:
+                    btn = page.locator('button:has-text("Download"), button:has-text("Get"), .btn-download, #btn-download')
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        await page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+
+            if not captured_url:
+                await page.evaluate(
+                    '() => { const v = document.querySelector("video"); if(v) { v.muted = true; v.play(); } }'
+                )
+                await page.wait_for_timeout(10000)
+
+            if not captured_url:
+                # آخرین تلاش: scan کردن سورس HTML
+                await safe_edit(status_msg, "🔍 Scanning page source for video links...")
+                html = await page.content()
+                mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
+                for match in mp4_matches:
+                    if 'dirpy.com' not in match.lower():
+                        captured_url = match
+                        logger.info(f"[SOURCE] Captured from HTML: {match[:200]}")
+                        break
 
             if captured_url:
                 return captured_url, None
-            return None, "Could not capture direct MP4 link"
+            return None, "Could not capture direct video link after all attempts"
 
         except Exception as e:
             logger.error(f"Interception error: {e}")
