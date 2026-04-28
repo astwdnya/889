@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - PDF, HTML (MHTML), Dirpy (Any Site), Direct Links
-# All-in-one with progress bars & video playback
+# Telegram Ultimate Bot - PDF, HTML (MHTML), Dirpy (Direct Source Extraction)
+# Improved Dirpy with direct source tag extraction
 
 import asyncio
 import os
@@ -12,7 +12,7 @@ import zipfile
 import time
 import base64
 from datetime import datetime
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, unquote
 from html import unescape
 from typing import Optional, Tuple
 
@@ -41,9 +41,9 @@ API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
 
-MAX_FILE_SIZE_MB = 2000            # 2GB Telegram limit
-DIRPY_DOWNLOAD_TIMEOUT = 120       # seconds for file download
-DIRPY_PAGE_TIMEOUT = 60            # seconds for page load and operation
+MAX_FILE_SIZE_MB = 2000
+DIRPY_DOWNLOAD_TIMEOUT = 120
+DIRPY_PAGE_TIMEOUT = 60
 
 # Folders
 OUTPUT_FOLDER = "output_files"
@@ -195,8 +195,12 @@ async def download_file_with_progress(url: str, status_message: Message, headers
         logger.error(f"Download error: {e}")
         return None, f"Unexpected error: {str(e)[:50]}", 0
 
-# ========== CORE DIRPY LOGIC (UNIVERSAL - NO URL RESTRICTION) ==========
+# ========== IMPROVED DIRPY LOGIC: EXTRACT DIRECTLY FROM PAGE SOURCE ==========
 async def extract_download_link_from_dirpy(video_url: str, status_message: Message) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Opens Dirpy page and extracts the video source link directly from <source> tag.
+    No clicking on download buttons required.
+    """
     chromium_path = find_chromium()
     if not chromium_path:
         return None, "Chromium not found"
@@ -220,85 +224,78 @@ async def extract_download_link_from_dirpy(video_url: str, status_message: Messa
         dirpy_url = f"https://dirpy.com/studio?url={encoded_url}"
         await status_message.edit(f"📄 Opening Dirpy Studio for:\n{video_url[:60]}...")
         await page.goto(dirpy_url, {'waitUntil': 'networkidle0', 'timeout': DIRPY_PAGE_TIMEOUT * 1000})
-        await asyncio.sleep(3)
 
-        await status_message.edit("⏳ Waiting for video info (loading metadata)...")
+        # Wait for the video to load
+        await status_message.edit("⏳ Waiting for video to load...")
         try:
-            await page.wait_for_selector('video', timeout=45000)
-        except Exception:
-            pass
-        await asyncio.sleep(4)
+            await page.wait_for_selector('video', timeout=30000)
+            await asyncio.sleep(3)  # Additional wait for source tag to populate
+        except Exception as e:
+            logger.warning(f"Video selector timeout: {e}")
 
-        await status_message.edit("🔘 Looking for download button...")
-        download_url = None
-
-        # try common selectors
-        selectors_to_try = [
-            '#downloadButton', 'button.download-btn', '.download-button',
-            'a[download]', 'button[data-action="download"]'
-        ]
-        clicked = False
-        for selector in selectors_to_try:
-            btn = await page.querySelector(selector)
-            if btn:
-                await btn.click()
-                clicked = True
-                await status_message.edit("🔘 Download button clicked, waiting for modal...")
-                await asyncio.sleep(5)
-                break
-
-        if not clicked:
-            js_click = '''
-                () => {
-                    const buttons = Array.from(document.querySelectorAll('button, a'));
-                    const downloadBtn = buttons.find(btn => btn.innerText.toLowerCase().includes('download'));
-                    if (downloadBtn) { downloadBtn.click(); return true; }
-                    return false;
-                }
-            '''
-            clicked = await page.evaluate(js_click)
-            if clicked:
-                await asyncio.sleep(5)
-
-        if not clicked:
-            return None, "Could not find the download button on Dirpy. The site might not be supported."
-
+        # Extract the video source URL from the page
         await status_message.edit("🔗 Extracting video download link...")
-        await asyncio.sleep(3)
-
-        # look for direct link
-        direct_link = await page.querySelector('a[href*="googlevideo.com"], a[href*=".mp4"], a[href*=".mkv"]')
-        if direct_link:
-            download_url = await page.evaluate('(element) => element.href', direct_link)
-
+        
+        # JavaScript to get the video source URL
+        js_get_source = """
+            () => {
+                // Method 1: Check video element's src attribute
+                const video = document.querySelector('video');
+                if (video && video.src && video.src.startsWith('http')) {
+                    return video.src;
+                }
+                
+                // Method 2: Check source tag inside video
+                const source = document.querySelector('video source');
+                if (source && source.src && source.src.startsWith('http')) {
+                    return source.src;
+                }
+                
+                // Method 3: Find any link to google video
+                const links = Array.from(document.querySelectorAll('a'));
+                const videoLink = links.find(link => 
+                    link.href && (link.href.includes('googlevideo.com') || 
+                                 link.href.includes('.mp4'))
+                );
+                if (videoLink) return videoLink.href;
+                
+                return null;
+            }
+        """
+        
+        download_url = await page.evaluate(js_get_source)
+        
         if not download_url:
+            # Fallback: parse the entire page HTML (less reliable but sometimes works)
             page_html = await page.content()
             soup = BeautifulSoup(page_html, 'html.parser')
-            video_links = soup.find_all('a', href=re.compile(r'https?://[^\s]+\.(mp4|mkv|webm|googlevideo\.com)'))
-            if video_links:
-                download_url = video_links[0]['href']
+            
+            # Look for source tags
+            source_tag = soup.find('source')
+            if source_tag and source_tag.get('src'):
+                download_url = source_tag.get('src')
+            
+            if not download_url:
+                # Look for video tags
+                video_tag = soup.find('video')
+                if video_tag and video_tag.get('src'):
+                    download_url = video_tag.get('src')
 
         if not download_url:
-            js_extract = '''
-                () => {
-                    const links = Array.from(document.querySelectorAll('a'));
-                    const videoLink = links.find(link => 
-                        link.href && (link.href.includes('googlevideo.com') || 
-                                     link.href.match(/\\.(mp4|mkv|webm)(\\?|$)/i))
-                    );
-                    return videoLink ? videoLink.href : null;
-                }
-            '''
-            download_url = await page.evaluate(js_extract)
+            return None, "Could not find video source link. The page structure may have changed."
 
-        if not download_url:
-            return None, "Could not find the direct download link. The site might not be supported by Dirpy."
+        # Clean the URL
+        download_url = unescape(download_url)
+        download_url = unquote(download_url)  # Decode URL-encoded characters
+        
+        # Ensure it's a proper HTTP URL
+        if download_url.startswith('/url?q='):
+            download_url = download_url.replace('/url?q=', '').split('&')[0]
+        
+        if not download_url.startswith('http'):
+            return None, "Invalid URL format extracted."
 
-        decoded_url = unescape(download_url)
-        if decoded_url.startswith('/url?q='):
-            decoded_url = decoded_url.replace('/url?q=', '').split('&')[0]
-
-        return decoded_url, None
+        return download_url, None
 
     except Exception as e:
         logger.error(f"Dirpy extraction error: {e}")
@@ -583,7 +580,6 @@ async def generic_url_handler(event):
         return
 
     url = urls[0]
-    # If it's a known video site, suggest Dirpy, but still try direct download
     status_msg = await event.reply("⏬ Downloading file...", parse_mode='markdown')
     filepath, error, size = await download_file_with_progress(url, status_msg)
     if error or not filepath:
