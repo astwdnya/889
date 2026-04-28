@@ -186,8 +186,9 @@ def is_video_url(url: str) -> bool:
     SITE_PATTERNS = [
         ('xnxx-cdn.com',         lambda u: 'mp4' in u),
         ('xnxx.com',             lambda u: 'mp4' in u and '/videos/' in u),
-        ('media4.luxuretv.com',  lambda u: '.mp4' in u),
-        ('luxuretv.com',         lambda u: '.mp4' in u),
+        ('media4.luxuretv.com',  lambda u: '.mp4' in u and 'thumb' not in u and 'preview' not in u),
+        ('media.luxuretv.com',   lambda u: '.mp4' in u and 'thumb' not in u and 'preview' not in u),
+        ('luxuretv.com',         lambda u: '.mp4' in u and 'thumb' not in u and 'preview' not in u and any(m in u for m in ['media', 'cdn', 'video', 'stream'])),
         ('rule34.xxx',           lambda u: '.mp4' in u or ('video' in u and 'api' not in u)),
         ('rule34video.com',      lambda u: '.mp4' in u),
         ('ahrimp4',              lambda u: True),
@@ -204,6 +205,73 @@ def is_video_url(url: str) -> bool:
 
     return False
 
+
+
+# ====================== LUXURETV DIRECT EXTRACTOR ======================
+async def extract_luxuretv_direct(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
+    """مستقیماً از سورس صفحه luxuretv لینک mp4 رو میگیره بدون نیاز به dirpy."""
+    async with async_playwright() as p:
+        browser = None
+        try:
+            await safe_edit(status_msg, "🔍 Extracting luxuretv source directly...")
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+            )
+            page = await context.new_page()
+
+            captured: Optional[str] = None
+
+            async def on_response(response):
+                nonlocal captured
+                if captured:
+                    return
+                rurl = response.url.lower()
+                content_type = response.headers.get('content-type', '')
+                content_length = int(response.headers.get('content-length', 0))
+                if (('media' in rurl or 'cdn' in rurl) and '.mp4' in rurl
+                        and 'thumb' not in rurl and 'preview' not in rurl
+                        and content_length > 500 * 1024):
+                    captured = response.url
+                    logger.info(f"[LUXURE DIRECT] Captured: {response.url[:200]}")
+
+            page.on('response', on_response)
+
+            await page.goto(video_url, wait_until='domcontentloaded', timeout=60000)
+            await page.wait_for_timeout(5000)
+
+            if not captured:
+                # play ویدیو
+                await page.evaluate(
+                    '() => { const v = document.querySelector("video"); if(v) { v.muted=true; v.play(); } }'
+                )
+                await page.wait_for_timeout(8000)
+
+            if not captured:
+                # scan source
+                html = await page.content()
+                # دنبال URL با md5/expires که مشخصه لینک اصلیه
+                pat1 = re.compile(r"https?://\S+\.mp4\?\S*(?:md5|token|secure)\S*")
+                matches = pat1.findall(html)
+                if not matches:
+                    pat2 = re.compile(r"https?://(?:media|cdn)\S+\.mp4\S*")
+                    matches = pat2.findall(html)
+                matches = re.findall(PATTERN2, html)
+                for m in matches:
+                    if 'thumb' not in m.lower() and 'preview' not in m.lower():
+                        captured = m
+                        logger.info(f"[LUXURE HTML] Captured: {m[:200]}")
+                        break
+
+            if captured:
+                return captured, None
+            return None, "Could not find video source on luxuretv page"
+        except Exception as e:
+            logger.error(f"LuxureTV direct error: {e}")
+            return None, str(e)
+        finally:
+            if browser:
+                await browser.close()
 
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
     async with async_playwright() as p:
@@ -228,7 +296,10 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
             async def handle_route(route):
                 nonlocal captured_url
                 req_url = route.request.url
-                if not captured_url and is_video_url(req_url):
+                req_lower = req_url.lower()
+                # رد کردن thumbnail، preview، و فایل‌های کوچیک
+                skip_keywords = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'ad', 'tracking', 'analytics']
+                if not captured_url and is_video_url(req_url) and not any(k in req_lower for k in skip_keywords):
                     captured_url = req_url
                     logger.info(f"[REQUEST] Captured: {req_url[:200]}")
                 await route.continue_()
@@ -241,11 +312,13 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 if captured_url:
                     return
                 content_type = response.headers.get('content-type', '')
-                if 'video' in content_type or 'octet-stream' in content_type:
+                content_length = int(response.headers.get('content-length', 0))
+                # فقط فایل‌های بالای 500KB رو capture کن (جلوگیری از thumbnail/ad)
+                if ('video' in content_type or 'octet-stream' in content_type) and content_length > 500 * 1024:
                     rurl = response.url
                     if 'dirpy.com' not in rurl.lower():
                         captured_url = rurl
-                        logger.info(f"[RESPONSE content-type] Captured: {rurl[:200]}")
+                        logger.info(f"[RESPONSE content-type] size={content_length} Captured: {rurl[:200]}")
 
             page.on('response', handle_response)
 
@@ -301,10 +374,16 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
             page = await browser.new_page()
             await safe_edit(status_msg, "🌐 Loading page...")
-            await page.goto(url, wait_until="load", timeout=60000)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=120000)
+            except Exception:
+                pass  # ادامه بده حتی اگه timeout خورد - صفحه احتمالا لود شده
             await safe_edit(status_msg, "📄 Rendering PDF...")
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(4)
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass
+            await asyncio.sleep(5)
 
             filepath = os.path.join(OUTPUT_FOLDER, f"pdf_{int(time.time())}.pdf")
             await page.pdf(path=filepath, format='A4', print_background=True)
@@ -423,7 +502,15 @@ async def process_dirpy_request(event, url: str):
 
         await safe_edit(status_msg, "🌐 Opening Dirpy Studio and capturing stream...")
 
-        direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
+        # برای luxuretv مستقیم از سورس سایت بگیر، نه از dirpy
+        if 'luxuretv.com' in url.lower():
+            direct_url, intercept_err = await extract_luxuretv_direct(url, status_msg)
+            if not direct_url:
+                # fallback به dirpy
+                await safe_edit(status_msg, "⚠️ Direct failed, trying Dirpy fallback...")
+                direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
+        else:
+            direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
 
         if intercept_err or not direct_url:
             await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
@@ -512,6 +599,8 @@ async def size_input_handler(event):
     state = user_state.get(event.chat_id)
     if not state or state.get("action") != "wait_for_compression_size":
         return
+
+    raise events.StopPropagation  # جلوگیری از رسیدن به generic_url_handler
 
     video_id = state["video_id"]
     if video_id not in video_cache:
