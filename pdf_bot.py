@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - Complete: PDF, HTML (MHTML), Dirpy, Direct Links
-# Fixed HTTP 403 with latest yt-dlp + mobile headers fallback
+# Telegram Ultimate Bot - Direct YouTube download with yt-dlp (No 403!)
 
 import asyncio
 import os
@@ -32,7 +31,7 @@ try:
     PYPPETEER_AVAILABLE = True
 except ImportError:
     PYPPETEER_AVAILABLE = False
-    print("⚠️ pyppeteer not installed, PDF/HTML features disabled.")
+    print("⚠️ pyppeteer not installed")
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
@@ -41,8 +40,7 @@ API_HASH = "b18441a1ff607e10a989891a5462e627"
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
 
 MAX_FILE_SIZE_MB = 2000
-DIRPY_DOWNLOAD_TIMEOUT = 180
-DIRPY_PAGE_TIMEOUT = 90
+DOWNLOAD_TIMEOUT = 300
 
 OUTPUT_FOLDER = "output_files"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -78,9 +76,7 @@ def find_chromium() -> Optional[str]:
     ]
     for path in possible_paths:
         if os.path.exists(path):
-            logger.info(f"✅ Chromium found: {path}")
             return path
-    logger.error("❌ Chromium not found!")
     return None
 
 def human_readable_size(num_bytes: int) -> str:
@@ -93,19 +89,7 @@ def human_readable_size(num_bytes: int) -> str:
     else:
         return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
 
-def format_duration(seconds: float) -> str:
-    if seconds < 60:
-        return f"{int(seconds)} seconds"
-    elif seconds < 3600:
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}:{secs:02d} minutes"
-    else:
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        return f"{hours}:{minutes:02d} hours"
-
-# ========== PROGRESS BAR HANDLER ==========
+# ========== PROGRESS HANDLER ==========
 class ProgressHandler:
     def __init__(self, status_message: Message, total_size: int, operation: str = "Downloading"):
         self.status_message = status_message
@@ -155,226 +139,181 @@ class ProgressHandler:
         else:
             await self.status_message.edit(f"❌ {final_message}", parse_mode='markdown')
 
-# ========== DOWNLOAD WITH YT-DLP (FIX 403) ==========
-async def download_with_ytdlp(url: str, status_message: Message, referer: str = None) -> Tuple[Optional[str], Optional[str], int]:
-    """Download file using yt-dlp with proper headers to avoid 403"""
+# ========== YT-DLP DOWNLOAD (DIRECT - NO 403!) ==========
+class YTDLPProgressHook:
+    def __init__(self, status_message: Message, total_size: int):
+        self.status_message = status_message
+        self.total_size = total_size
+        self.progress = ProgressHandler(status_message, total_size, "Downloading video")
+        self.downloaded = 0
+    
+    def hook(self, d):
+        if d['status'] == 'downloading':
+            downloaded = d.get('downloaded_bytes', 0)
+            if downloaded > self.downloaded:
+                self.downloaded = downloaded
+                # Create a new asyncio task for the progress update
+                asyncio.create_task(self.progress.update(downloaded))
+        elif d['status'] == 'finished':
+            asyncio.create_task(self.progress.finish(True, ""))
+
+async def download_with_ytdlp_direct(url: str, status_message: Message) -> Tuple[Optional[str], Optional[str], int, Optional[str]]:
+    """Download video directly using yt-dlp (best method - no 403!)"""
     try:
-        filename = f"video_{int(time.time())}.mp4"
-        filepath = os.path.join(OUTPUT_FOLDER, filename)
+        filename = f"video_{int(time.time())}.%(ext)s"
+        filepath_template = os.path.join(OUTPUT_FOLDER, filename)
         
-        # Complete browser headers to bypass 403
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-        }
-        if referer:
-            headers['Referer'] = referer
+        # Get video info first to show duration and size
+        await status_message.edit("📊 Getting video information...")
         
-        ydl_opts = {
-            'outtmpl': filepath,
+        ydl_opts_info = {
             'quiet': True,
             'no_warnings': True,
-            'http_headers': headers,
-            'retries': 15,
-            'fragment_retries': 15,
-            'continuedl': True,
-            'ignoreerrors': True,
-            'no_check_certificate': True,
             'extract_flat': False,
-            'format': 'best',
         }
         
-        await status_message.edit("⏬ Downloading video via yt-dlp...")
-        
         loop = asyncio.get_event_loop()
+        def get_info():
+            with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+                return ydl.extract_info(url, download=False)
+        
+        info = await loop.run_in_executor(None, get_info)
+        
+        if info is None:
+            return None, "Could not get video info", 0, None
+        
+        # Extract duration
+        duration = info.get('duration', 0)
+        duration_str = ""
+        if duration:
+            if duration < 60:
+                duration_str = f"{int(duration)} sec"
+            elif duration < 3600:
+                mins = int(duration // 60)
+                secs = int(duration % 60)
+                duration_str = f"{mins}:{secs:02d} min"
+            else:
+                hours = int(duration // 3600)
+                mins = int((duration % 3600) // 60)
+                duration_str = f"{hours}:{mins:02d} hr"
+        
+        # Get estimated file size
+        file_size = 0
+        formats = info.get('formats', [])
+        for f in formats:
+            if f.get('filesize'):
+                file_size = max(file_size, f.get('filesize', 0))
+        
+        if file_size > 0 and file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+            return None, f"Video too large (>{MAX_FILE_SIZE_MB}MB)", 0, duration_str
+        
+        await status_message.edit(f"🎬 Video: {info.get('title', 'Unknown')[:50]}\n⏱️ Duration: {duration_str or 'Unknown'}\n⏬ Starting download...")
+        
+        # Download with progress hook
+        ydl_opts = {
+            'outtmpl': filepath_template,
+            'quiet': True,
+            'no_warnings': True,
+            'progress_hooks': [YTDLPProgressHook(status_message, file_size).hook],
+            'format': 'best[ext=mp4]/best',  # Prefer mp4
+            'merge_output_format': 'mp4',
+            'retries': 10,
+            'fragment_retries': 10,
+        }
+        
         def download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                try:
-                    return ydl.download([url])
-                except Exception as e:
-                    logger.error(f"yt-dlp download error: {e}")
-                    return 1
+                return ydl.download([url])
         
         result = await loop.run_in_executor(None, download)
         
-        if result != 0 or not os.path.exists(filepath):
-            return None, "yt-dlp download failed", 0
+        if result != 0:
+            return None, "Download failed", 0, duration_str
         
-        file_size = os.path.getsize(filepath)
-        await status_message.edit(f"✅ Download complete! Size: {human_readable_size(file_size)}")
-        return filepath, None, file_size
+        # Find the downloaded file
+        files = glob.glob(os.path.join(OUTPUT_FOLDER, "video_*"))
+        if not files:
+            return None, "Downloaded file not found", 0, duration_str
+        
+        filepath = max(files, key=os.path.getctime)
+        actual_size = os.path.getsize(filepath)
+        
+        await status_message.edit(f"✅ Download complete! Size: {human_readable_size(actual_size)}")
+        return filepath, None, actual_size, duration_str
         
     except Exception as e:
         logger.error(f"yt-dlp download error: {e}")
-        return None, str(e), 0
+        return None, str(e), 0, None
 
-# ========== FALLBACK DOWNLOAD WITH MOBILE HEADERS ==========
-async def download_with_mobile_fallback(url: str, status_message: Message, referer: str = None) -> Tuple[Optional[str], Optional[str], int]:
-    """Fallback download using mobile headers to bypass restrictions"""
-    try:
-        filename = f"video_{int(time.time())}.mp4"
-        filepath = os.path.join(OUTPUT_FOLDER, filename)
-        
-        mobile_headers = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
-            'Accept': 'video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Range': 'bytes=0-',
-            'Connection': 'keep-alive',
-        }
-        if referer:
-            mobile_headers['Referer'] = referer
-        
-        timeout = ClientTimeout(total=DIRPY_DOWNLOAD_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=mobile_headers, allow_redirects=True) as response:
-                if response.status != 200:
-                    return None, f"HTTP {response.status}", 0
-                
-                total_size = int(response.headers.get('content-length', 0))
-                if total_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                    return None, f"File too large (>{MAX_FILE_SIZE_MB}MB)", 0
-                
-                progress = ProgressHandler(status_message, total_size, "Downloading (mobile fallback)")
-                
-                downloaded = 0
-                async with aiofiles.open(filepath, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
-                        if chunk:
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            await progress.update(downloaded)
-                
-                await progress.finish(True, "")
-                return filepath, None, downloaded
-                
-    except Exception as e:
-        logger.error(f"Mobile fallback error: {e}")
-        return None, str(e), 0
-
-# ========== DIRPY EXTRACTION ==========
+# ========== DIRPY EXTRACTION (FALLBACK FOR NON-YOUTUBE) ==========
 async def extract_download_link_from_dirpy(video_url: str, status_message: Message) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Opens Dirpy page, waits for video to load, extracts source URL and duration.
-    Returns: (download_url, error_message, duration_str)
-    """
+    """Extract download link from Dirpy for non-YouTube sites"""
     chromium_path = find_chromium()
     if not chromium_path:
         return None, "Chromium not found", None
 
     browser = None
     try:
-        await status_message.edit("🌐 Launching browser...")
+        await status_message.edit("🌐 Launching browser for Dirpy...")
         browser = await launch(
             headless=True,
             executablePath=chromium_path,
-            args=[
-                '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                '--disable-gpu', '--disable-software-rasterizer'
-            ],
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
             defaultViewport={'width': 1280, 'height': 800}
         )
 
         page = await browser.newPage()
         encoded_url = quote(video_url, safe='')
         dirpy_url = f"https://dirpy.com/studio?url={encoded_url}"
-        await status_message.edit(f"📄 Opening Dirpy Studio...")
-        await page.goto(dirpy_url, {'waitUntil': 'networkidle0', 'timeout': DIRPY_PAGE_TIMEOUT * 1000})
-
-        # Wait for video to load (at least 12 seconds)
-        await status_message.edit("⏳ Waiting for video to load (12 seconds)...")
-        
-        # Wait for video element
-        try:
-            await page.wait_for_selector('video', timeout=30000)
-        except Exception:
-            pass
-        
-        # Wait additional time for video duration metadata to load
+        await page.goto(dirpy_url, {'waitUntil': 'networkidle0', 'timeout': 60000})
         await asyncio.sleep(12)
         
-        # Extract video duration
-        duration_js = """
-            () => {
-                const video = document.querySelector('video');
-                if (video && video.duration && !isNaN(video.duration)) {
-                    return video.duration;
-                }
-                return null;
-            }
-        """
+        # Extract duration
+        duration_js = "() => { const v = document.querySelector('video'); return v && v.duration ? v.duration : null; }"
         video_duration = await page.evaluate(duration_js)
-        
         duration_str = None
         if video_duration and video_duration > 0:
-            duration_str = format_duration(video_duration)
-            await status_message.edit(f"⏳ Video loaded! Duration: {duration_str}\n🔗 Extracting download link...")
-        else:
-            await status_message.edit(f"⏳ Video loaded! Extracting download link...")
+            if video_duration < 60:
+                duration_str = f"{int(video_duration)} sec"
+            elif video_duration < 3600:
+                mins = int(video_duration // 60)
+                secs = int(video_duration % 60)
+                duration_str = f"{mins}:{secs:02d} min"
+            else:
+                hours = int(video_duration // 3600)
+                mins = int((video_duration % 3600) // 60)
+                duration_str = f"{hours}:{mins:02d} hr"
         
-        # Extract the video source URL
-        js_get_source = """
+        # Extract video source
+        js_get = """
             () => {
-                const video = document.querySelector('video');
-                if (video && video.src && video.src.startsWith('http')) {
-                    return video.src;
-                }
-                const source = document.querySelector('video source');
-                if (source && source.src && source.src.startsWith('http')) {
-                    return source.src;
-                }
+                const v = document.querySelector('video');
+                if (v && v.src && v.src.startsWith('http')) return v.src;
+                const s = document.querySelector('video source');
+                if (s && s.src && s.src.startsWith('http')) return s.src;
                 return null;
             }
         """
-        
-        download_url = await page.evaluate(js_get_source)
+        download_url = await page.evaluate(js_get)
         
         if not download_url:
-            # Fallback: parse HTML
-            page_html = await page.content()
-            soup = BeautifulSoup(page_html, 'html.parser')
-            source_tag = soup.find('source')
-            if source_tag and source_tag.get('src'):
-                download_url = source_tag.get('src')
-            
-            if not download_url:
-                video_tag = soup.find('video')
-                if video_tag and video_tag.get('src'):
-                    download_url = video_tag.get('src')
+            return None, "Could not find video source", duration_str
 
-        if not download_url:
-            return None, "Could not find video source link", duration_str
-
-        # Clean URL
-        download_url = unescape(download_url)
-        download_url = unquote(download_url)
-        
+        download_url = unescape(unquote(download_url))
         if download_url.startswith('/url?q='):
             download_url = download_url.replace('/url?q=', '').split('&')[0]
-        
-        if not download_url.startswith('http'):
-            return None, "Invalid URL format extracted", duration_str
 
         return download_url, None, duration_str
-
+        
     except Exception as e:
-        logger.error(f"Dirpy extraction error: {e}")
-        return None, f"Automation failed: {str(e)[:100]}", None
+        logger.error(f"Dirpy error: {e}")
+        return None, str(e), None
     finally:
         if browser:
             await browser.close()
 
 # ========== HTML TO PDF ==========
-async def html_to_pdf(url: str, status_msg=None) -> Tuple[Optional[str], Optional[str], int]:
-    """Convert webpage to PDF"""
+async def html_to_pdf(url: str) -> Tuple[Optional[str], Optional[str], int]:
     if not PYPPETEER_AVAILABLE:
         return None, "pyppeteer not installed", 0
     chromium_path = find_chromium()
@@ -386,33 +325,27 @@ async def html_to_pdf(url: str, status_msg=None) -> Tuple[Optional[str], Optiona
         browser = await launch(
             headless=True,
             executablePath=chromium_path,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
             defaultViewport={'width': 1280, 'height': 800}
         )
         page = await browser.newPage()
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         await page.goto(url, {'waitUntil': 'networkidle0', 'timeout': 60000})
-
-        # Simple scroll
         await page.evaluate('window.scrollTo(0, document.body.scrollHeight);')
         await asyncio.sleep(1)
-        await page.evaluate('window.scrollTo(0, 0);')
-
+        
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"pdf_{timestamp}.pdf"
-        filepath = os.path.join(OUTPUT_FOLDER, filename)
+        filepath = os.path.join(OUTPUT_FOLDER, f"pdf_{timestamp}.pdf")
         await page.pdf({'path': filepath, 'format': 'A4', 'printBackground': True})
-        file_size = os.path.getsize(filepath)
-        return filepath, None, file_size
+        size = os.path.getsize(filepath)
+        return filepath, None, size
     except Exception as e:
         return None, str(e), 0
     finally:
         if browser:
             await browser.close()
 
-# ========== CAPTURE HTML AS MHTML ==========
-async def capture_html(url: str, status_msg=None) -> Tuple[Optional[str], Optional[str], int, bool]:
-    """Capture webpage as MHTML (complete snapshot with images, GIFs, links)"""
+# ========== CAPTURE MHTML ==========
+async def capture_html(url: str) -> Tuple[Optional[str], Optional[str], int, bool]:
     if not PYPPETEER_AVAILABLE:
         return None, "pyppeteer not installed", 0, False
     chromium_path = find_chromium()
@@ -424,47 +357,37 @@ async def capture_html(url: str, status_msg=None) -> Tuple[Optional[str], Option
         browser = await launch(
             headless=True,
             executablePath=chromium_path,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-            defaultViewport={'width': 1280, 'height': 800}
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         )
         page = await browser.newPage()
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         await page.goto(url, {'waitUntil': 'networkidle0', 'timeout': 60000})
-
-        # Scroll to bottom to trigger lazy-loading
         await page.evaluate('window.scrollTo(0, document.body.scrollHeight);')
         await asyncio.sleep(2)
-        await page.evaluate('window.scrollTo(0, 0);')
-
-        # Capture MHTML snapshot
+        
         client = await page.target.createCDPSession()
-        mhtml_data = await client.send('Page.captureSnapshot', {'format': 'mhtml'})
-        mhtml_bytes = base64.b64decode(mhtml_data['data'])
-
+        mhtml = await client.send('Page.captureSnapshot', {'format': 'mhtml'})
+        data = base64.b64decode(mhtml['data'])
+        
         title = await page.title() or "webpage"
         safe_title = re.sub(r'[<>:"/\\|?*]', '_', title[:50])
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"snapshot_{safe_title}_{timestamp}.mhtml"
-        filepath = os.path.join(OUTPUT_FOLDER, filename)
+        filepath = os.path.join(OUTPUT_FOLDER, f"snapshot_{safe_title}_{timestamp}.mhtml")
+        
         with open(filepath, 'wb') as f:
-            f.write(mhtml_bytes)
-
-        file_size = os.path.getsize(filepath)
+            f.write(data)
+        
+        size = os.path.getsize(filepath)
         is_zip = False
         
-        # Compress if too large
-        if file_size > 40 * 1024 * 1024:
-            zip_filename = f"snapshot_{safe_title}_{timestamp}.zip"
-            zip_filepath = os.path.join(OUTPUT_FOLDER, zip_filename)
-            with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(filepath, filename)
+        if size > 40 * 1024 * 1024:
+            zip_path = os.path.join(OUTPUT_FOLDER, f"snapshot_{safe_title}_{timestamp}.zip")
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.write(filepath, os.path.basename(filepath))
             os.remove(filepath)
-            filepath, file_size, is_zip = zip_filepath, os.path.getsize(zip_filepath), True
-
-        return filepath, None, file_size, is_zip
-
+            filepath, size, is_zip = zip_path, os.path.getsize(zip_path), True
+        
+        return filepath, None, size, is_zip
     except Exception as e:
-        logger.error(f"HTML capture error: {e}")
         return None, str(e), 0, False
     finally:
         if browser:
@@ -478,69 +401,95 @@ async def safe_edit(msg, text):
         await msg.edit(text, parse_mode='markdown')
     except telethon_errors.MessageNotModifiedError:
         pass
-    except Exception as e:
-        logger.warning(f"Edit failed: {e}")
 
 async def process_dirpy_request(event, url: str):
-    """Main entry point for /dirpy command - works with ANY URL"""
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
 
-    status_msg = await event.reply("🔄 Initializing Dirpy downloader...", parse_mode='markdown')
+    status_msg = await event.reply("🔄 Processing...", parse_mode='markdown')
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
-
-        download_url, error, duration = await extract_download_link_from_dirpy(url, status_msg)
-        if error or not download_url:
-            await safe_edit(status_msg, f"❌ {error}\n\n💡 Make sure the website is supported by Dirpy")
-            return
-
-        # Show duration in status if available
-        duration_text = f"\n🎬 Duration: {duration}" if duration else ""
-        await safe_edit(status_msg, f"✅ Link found!{duration_text}\n⏬ Starting download...")
         
-        # Pass the dirpy URL as referer to avoid 403
-        dirpy_referer = f"https://dirpy.com/studio?url={quote(url, safe='')}"
-        
-        # Try yt-dlp first
-        filepath, dl_error, file_size = await download_with_ytdlp(download_url, status_msg, dirpy_referer)
-        
-        # If yt-dlp fails, try mobile fallback
-        if dl_error or not filepath:
-            await safe_edit(status_msg, f"⚠️ yt-dlp failed, trying mobile fallback...")
-            filepath, dl_error, file_size = await download_with_mobile_fallback(download_url, status_msg, dirpy_referer)
+        # Check if it's a YouTube URL - use direct yt-dlp
+        if 'youtube.com/watch' in url or 'youtu.be/' in url or 'youtube.com/shorts' in url:
+            filepath, error, size, duration = await download_with_ytdlp_direct(url, status_msg)
             
-            if dl_error or not filepath:
-                await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
+            if error or not filepath:
+                await safe_edit(status_msg, f"❌ {error}")
                 return
-
-        await safe_edit(status_msg, "📤 Uploading to Telegram...")
-        
-        caption = f"🎬 **Video ready!**\n📦 {human_readable_size(file_size)}"
-        if duration:
-            caption += f"\n⏱️ Duration: {duration}"
-        caption += f"\n🌐 [Source]({url[:50]})"
-        
-        await event.client.send_file(
-            event.chat_id,
-            filepath,
-            caption=caption,
-            supports_streaming=True,
-            force_document=False,
-            parse_mode='markdown'
-        )
-        
-        try:
+            
+            caption = f"🎬 **Video ready!**\n📦 {human_readable_size(size)}"
+            if duration:
+                caption += f"\n⏱️ Duration: {duration}"
+            
+            await event.client.send_file(
+                event.chat_id, filepath, 
+                caption=caption, 
+                supports_streaming=True, 
+                force_document=False
+            )
             os.remove(filepath)
-        except:
-            pass
-        await status_msg.delete()
+            await status_msg.delete()
+            return
         
+        # For non-YouTube sites, try Dirpy
+        await safe_edit(status_msg, "🔄 Non-YouTube link detected, trying Dirpy...")
+        download_url, error, duration = await extract_download_link_from_dirpy(url, status_msg)
+        
+        if error or not download_url:
+            await safe_edit(status_msg, f"❌ {error}\n\n💡 This site may not be supported by Dirpy")
+            return
+        
+        await safe_edit(status_msg, f"✅ Link found! Downloading...")
+        
+        # Try direct download with headers
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://dirpy.com/',
+            }
+            timeout = ClientTimeout(total=DOWNLOAD_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(download_url, headers=headers, allow_redirects=True) as response:
+                    if response.status != 200:
+                        await safe_edit(status_msg, f"❌ HTTP {response.status}")
+                        return
+                    
+                    total_size = int(response.headers.get('content-length', 0))
+                    filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
+                    progress = ProgressHandler(status_msg, total_size, "Downloading video")
+                    
+                    downloaded = 0
+                    async with aiofiles.open(filepath, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
+                            if chunk:
+                                await f.write(chunk)
+                                downloaded += len(chunk)
+                                await progress.update(downloaded)
+                    
+                    await progress.finish(True, "")
+                    
+                    caption = f"🎬 **Video ready!**\n📦 {human_readable_size(downloaded)}"
+                    if duration:
+                        caption += f"\n⏱️ Duration: {duration}"
+                    
+                    await event.client.send_file(
+                        event.chat_id, filepath,
+                        caption=caption,
+                        supports_streaming=True,
+                        force_document=False
+                    )
+                    os.remove(filepath)
+                    await status_msg.delete()
+                    
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Download failed: {str(e)[:100]}")
+            
     except Exception as e:
-        logger.error(f"Dirpy process error: {e}")
+        logger.error(f"Process error: {e}")
         await safe_edit(status_msg, f"❌ Error: {str(e)[:100]}")
     finally:
         processing_messages.discard(msg_id)
@@ -550,7 +499,6 @@ async def process_pdf_request(event, url: str):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-
     status_msg = await event.reply("🔄 Converting to PDF...", parse_mode='markdown')
     try:
         if not url.startswith(('http://', 'https://')):
@@ -572,8 +520,7 @@ async def process_html_request(event, url: str):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-
-    status_msg = await event.reply("🔄 Capturing full webpage (MHTML)...", parse_mode='markdown')
+    status_msg = await event.reply("🔄 Capturing webpage...", parse_mode='markdown')
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -581,8 +528,7 @@ async def process_html_request(event, url: str):
         if error:
             await safe_edit(status_msg, f"❌ {error}")
             return
-        caption = "📄 **Complete webpage snapshot**\n✅ All images, GIFs and links preserved"
-        await event.client.send_file(event.chat_id, filepath, caption=caption)
+        await event.client.send_file(event.chat_id, filepath, caption="📄 Complete webpage snapshot")
         os.remove(filepath)
         await status_msg.delete()
     except Exception as e:
@@ -590,7 +536,7 @@ async def process_html_request(event, url: str):
     finally:
         processing_messages.discard(msg_id)
 
-# ========== TELEGRAM HANDLERS ==========
+# ========== HANDLERS ==========
 @events.register(events.NewMessage(pattern='/start', incoming=True))
 async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
@@ -599,11 +545,10 @@ async def start_cmd(event):
     await event.reply(
         "📄 **Ultimate Bot**\n\n"
         "**Commands:**\n"
-        "🌐 `/html <url>` → Save full page as MHTML (all images & GIFs, clickable links)\n"
-        "📑 `/pdf <url>` → Print page to PDF\n"
-        "🎬 `/dirpy <any-url>` → Download video (YouTube, FB, Twitter, etc.) via Dirpy\n"
-        "📥 Send any direct link → Download with progress bar\n\n"
-        "All downloads show **progress bars** and videos are sent as **native Telegram videos**.",
+        "🎬 `/dirpy <youtube-url>` → Download video directly (NO 403!)\n"
+        "🌐 `/html <url>` → Save webpage as MHTML\n"
+        "📑 `/pdf <url>` → Convert to PDF\n"
+        "📥 Send direct link → Download with progress bar",
         parse_mode='markdown'
     )
 
@@ -612,11 +557,11 @@ async def help_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return
     await event.reply(
-        "**Available commands:**\n"
-        "- `/html <url>` : captures the whole webpage as MHTML (everything included)\n"
-        "- `/pdf <url>` : converts page to PDF\n"
-        "- `/dirpy <url>` : uses Dirpy to get video from 1000+ sites\n"
-        "- Send direct .mp4/.mkv link: downloads with progress bar and sends as video",
+        "**Commands:**\n"
+        "- `/dirpy <youtube-url>` : Download YouTube videos directly\n"
+        "- `/html <url>` : Save complete webpage\n"
+        "- `/pdf <url>` : Convert to PDF\n"
+        "- Send any link : Direct download",
         parse_mode='markdown'
     )
 
@@ -627,26 +572,26 @@ async def status_cmd(event):
     chromium = find_chromium()
     await event.reply(
         f"**Bot Status**\n\n"
-        f"• Chromium: {'✅ Found' if chromium else '❌ Not found'}\n"
+        f"• Chromium: {'✅' if chromium else '❌'}\n"
         f"• Pyppeteer: {'✅' if PYPPETEER_AVAILABLE else '❌'}\n"
         f"• yt-dlp: ✅\n"
-        f"• Max File Size: {MAX_FILE_SIZE_MB}MB",
+        f"• Max Size: {MAX_FILE_SIZE_MB}MB",
         parse_mode='markdown'
     )
 
 @events.register(events.NewMessage(pattern='/dirpy', incoming=True))
-async def dirpy_command(event):
+async def dirpy_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         await event.reply("⛔ Unauthorized")
         return
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2:
-        await event.reply("❌ Usage: `/dirpy https://example.com/video`", parse_mode='markdown')
+        await event.reply("❌ Usage: `/dirpy <url>`", parse_mode='markdown')
         return
     await process_dirpy_request(event, parts[1].strip())
 
 @events.register(events.NewMessage(pattern='/html', incoming=True))
-async def html_command(event):
+async def html_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         await event.reply("⛔ Unauthorized")
         return
@@ -657,7 +602,7 @@ async def html_command(event):
     await process_html_request(event, parts[1].strip())
 
 @events.register(events.NewMessage(pattern='/pdf', incoming=True))
-async def pdf_command(event):
+async def pdf_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         await event.reply("⛔ Unauthorized")
         return
@@ -668,8 +613,7 @@ async def pdf_command(event):
     await process_pdf_request(event, parts[1].strip())
 
 @events.register(events.NewMessage(incoming=True))
-async def generic_url_handler(event):
-    """Handle direct URLs - download and send as video"""
+async def direct_handler(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return
     if event.raw_text.startswith('/'):
@@ -677,56 +621,62 @@ async def generic_url_handler(event):
     urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', event.raw_text)
     if not urls:
         return
-
     url = urls[0]
     
-    # Suggest /dirpy for YouTube links
     if 'youtube.com/watch' in url or 'youtu.be/' in url:
-        await event.reply("🎬 YouTube link detected. Use `/dirpy` for better quality.", parse_mode='markdown')
+        await event.reply("🎬 Send YouTube links with `/dirpy` for best results.", parse_mode='markdown')
         return
     
-    status_msg = await event.reply("⏬ Downloading file...", parse_mode='markdown')
-    
-    # Try yt-dlp first
-    filepath, error, size = await download_with_ytdlp(url, status_msg)
-    
-    if error or not filepath:
-        # Fallback to mobile download
-        filepath, error, size = await download_with_mobile_fallback(url, status_msg)
-        if error or not filepath:
-            await safe_edit(status_msg, f"❌ {error}")
-            return
-    
-    await event.client.send_file(event.chat_id, filepath, supports_streaming=True, force_document=False)
-    os.remove(filepath)
-    await status_msg.delete()
+    status_msg = await event.reply("⏬ Downloading...", parse_mode='markdown')
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        timeout = ClientTimeout(total=DOWNLOAD_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, allow_redirects=True) as response:
+                if response.status != 200:
+                    await safe_edit(status_msg, f"❌ HTTP {response.status}")
+                    return
+                total_size = int(response.headers.get('content-length', 0))
+                filepath = os.path.join(OUTPUT_FOLDER, f"file_{int(time.time())}.mp4")
+                progress = ProgressHandler(status_msg, total_size, "Downloading")
+                downloaded = 0
+                async with aiofiles.open(filepath, 'wb') as f:
+                    async for chunk in response.content.iter_chunked(8192):
+                        if chunk:
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            await progress.update(downloaded)
+                await progress.finish(True, "")
+                await event.client.send_file(event.chat_id, filepath, supports_streaming=True, force_document=False)
+                os.remove(filepath)
+                await status_msg.delete()
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ {str(e)[:100]}")
 
 # ========== MAIN ==========
 async def main():
     print("\n" + "="*50)
-    print("📄 ULTIMATE BOT (PDF/HTML/DIRPY/DIRECT)")
+    print("📄 ULTIMATE BOT (yt-dlp DIRECT DOWNLOAD)")
     print("="*50)
     chromium = find_chromium()
     if chromium:
-        print(f"✅ Chromium found: {chromium}")
-    else:
-        print("❌ Chromium NOT found! PDF/HTML features will fail.")
-    print("🤖 Starting bot...\n")
+        print(f"✅ Chromium: {chromium}")
+    print("🤖 Starting...\n")
 
     client = TelegramClient('bot_session', API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
-
+    
     client.add_event_handler(start_cmd)
     client.add_event_handler(help_cmd)
     client.add_event_handler(status_cmd)
-    client.add_event_handler(dirpy_command)
-    client.add_event_handler(html_command)
-    client.add_event_handler(pdf_command)
-    client.add_event_handler(generic_url_handler)
-
+    client.add_event_handler(dirpy_cmd)
+    client.add_event_handler(html_cmd)
+    client.add_event_handler(pdf_cmd)
+    client.add_event_handler(direct_handler)
+    
     me = await client.get_me()
     print(f"✅ Bot: @{me.username}")
-    print("🎉 Ready! Commands: /dirpy, /html, /pdf, /status\n")
+    print("🎉 Ready!\n")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
@@ -735,6 +685,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Stopped")
-    except Exception as e:
-        logger.error(f"Fatal: {e}")
-        sys.exit(1)
