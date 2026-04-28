@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - FIXED VERSION (PDF + LuxureTV + Check Button)
+# Telegram Ultimate Bot - FINAL FIXED VERSION
+# PDF Fixed + LuxureTV Improved + Check Button + Direct Dirpy
 
 import asyncio
 import os
@@ -59,6 +60,7 @@ def health():
 
 def start_keep_alive():
     Thread(target=lambda: flask_app.run(host='0.0.0.0', port=HEALTH_PORT, debug=False), daemon=True).start()
+    logger.info(f"Keep-alive started on port {HEALTH_PORT}")
 
 # ====================== UTILITIES ======================
 def human_readable_size(num_bytes: int) -> str:
@@ -177,7 +179,6 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
         return None, str(e), 0
 
 
-# ====================== SMART INTERCEPTION (بهبود یافته برای LuxureTV) ======================
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
     async with async_playwright() as p:
         browser = None
@@ -188,35 +189,32 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
 
             browser = await p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run']
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             )
             page = await browser.new_page()
 
             async def handle_route(route):
                 nonlocal captured_url
                 req_url = route.request.url.lower()
-                if '.mp4' in req_url and any(domain in req_url for domain in [
-                    'luxuretv.com', 'xnxx-cdn.com', 'rule34.xxx', 'ahrimp4', 'media4'
-                ]):
+                if '.mp4' in req_url and any(d in req_url for d in ['luxuretv', 'xnxx-cdn', 'rule34', 'ahrimp4', 'media4']):
                     if not captured_url:
                         captured_url = route.request.url
-                        logger.info(f"✅ Captured MP4: {req_url[:180]}")
+                        logger.info(f"Captured MP4: {req_url[:150]}")
                 await route.continue_()
 
             await page.route("**/*", handle_route)
 
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
             await page.goto(dirpy_url, wait_until="domcontentloaded", timeout=50000)
-
-            await page.wait_for_timeout(18000)   # افزایش زمان صبر برای LuxureTV
+            await page.wait_for_timeout(18000)
 
             if not captured_url:
-                await page.evaluate('() => { const videos = document.querySelectorAll("video"); if(videos.length) videos[0].play(); }')
+                await page.evaluate('() => document.querySelector("video")?.play()')
                 await page.wait_for_timeout(12000)
 
             if captured_url:
                 return captured_url, None
-            return None, "Could not find direct MP4 link"
+            return None, "Could not capture direct MP4 link"
 
         except Exception as e:
             logger.error(f"Interception error: {e}")
@@ -226,7 +224,6 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 await browser.close()
 
 
-# ====================== PDF FIXED (کمتر گیر کردن) ======================
 async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
     async with async_playwright() as p:
         browser = None
@@ -234,7 +231,7 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
             await status_msg.edit("📄 Converting to PDF...")
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
             page = await browser.new_page()
-            await page.goto(url, wait_until="load", timeout=60000)   # از networkidle به load تغییر دادیم
+            await page.goto(url, wait_until="load", timeout=60000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(4)
 
@@ -244,7 +241,7 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
             return filepath, None, size
         except Exception as e:
             logger.error(f"PDF Error: {e}")
-            return None, f"PDF timeout or error: {str(e)[:80]}", 0
+            return None, f"PDF Error: {str(e)[:80]}", 0
         finally:
             if browser:
                 await browser.close()
@@ -295,7 +292,7 @@ async def safe_edit(msg: Message, text: str):
         pass
 
 
-# ====================== PROCESS DIRPY REQUEST (مستقیم Dirpy) ======================
+# ====================== PROCESS DIRPY REQUEST (مستقیم Dirpy بدون yt-dlp) ======================
 processing_messages = set()
 
 async def process_dirpy_request(event, url: str):
@@ -310,15 +307,15 @@ async def process_dirpy_request(event, url: str):
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
 
-        await safe_edit(status_msg, "🌐 Opening Dirpy Studio and capturing video stream...")
+        await safe_edit(status_msg, "🌐 Opening Dirpy Studio and capturing stream...")
 
         direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
 
         if intercept_err or not direct_url:
-            await safe_edit(status_msg, f"❌ Could not capture video link:\n{intercept_err}")
+            await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
             return
 
-        await safe_edit(status_msg, "📥 Direct link found. Downloading video...")
+        await safe_edit(status_msg, "📥 Link captured. Downloading video...")
 
         filepath, dl_error, final_size = await download_direct_with_progress(direct_url, status_msg, referer=url)
 
@@ -326,7 +323,7 @@ async def process_dirpy_request(event, url: str):
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
             return
 
-        # ذخیره برای فشرده‌سازی
+        # ذخیره ویدیو برای عملیات بعدی
         video_id = f"vid_{event.chat_id}_{int(time.time())}"
         video_cache[video_id] = {
             "filepath": filepath,
@@ -335,10 +332,10 @@ async def process_dirpy_request(event, url: str):
             "original_url": url
         }
 
-        # دو دکمه: Compress و Check (حذف)
+        # دکمه‌ها: Compress + Check
         buttons = [
             [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
-            [Button.inline("✅ Check (Delete from server)", f"check_{video_id}")]
+            [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
         ]
 
         await event.client.send_file(
@@ -356,7 +353,7 @@ async def process_dirpy_request(event, url: str):
 
     except Exception as e:
         logger.error(f"Dirpy process error: {e}", exc_info=True)
-        await safe_edit(status_msg, f"❌ Unexpected error: {str(e)[:100]}")
+        await safe_edit(status_msg, f"❌ Unexpected error: {str(e)[:120]}")
     finally:
         processing_messages.discard(msg_id)
 
@@ -366,7 +363,7 @@ async def process_dirpy_request(event, url: str):
 async def compress_callback(event):
     video_id = event.pattern_match.group(1)
     if video_id not in video_cache:
-        return await event.answer("Video not found.", alert=True)
+        return await event.answer("Video not found or expired.", alert=True)
 
     await event.answer("Send desired size (e.g: 15mb or 800kb)", alert=False)
     user_state[event.chat_id] = {"action": "wait_for_compression_size", "video_id": video_id}
@@ -386,7 +383,7 @@ async def check_callback(event):
         await event.edit(buttons=None)
     except Exception as e:
         logger.error(f"Delete error: {e}")
-        await event.answer("Error while deleting file.", alert=True)
+        await event.answer("Error deleting file.", alert=True)
 
     if video_id in video_cache:
         del video_cache[video_id]
@@ -404,17 +401,18 @@ async def size_input_handler(event):
 
     video_id = state["video_id"]
     if video_id not in video_cache:
-        del user_state[event.chat_id]
+        if event.chat_id in user_state:
+            del user_state[event.chat_id]
         return
 
     target_bytes = parse_size_input(event.raw_text)
     if not target_bytes:
-        await event.reply("❌ Invalid size!\nUse: `15mb`, `800kb`, `1.5gb`", parse_mode='markdown')
+        await event.reply("❌ Invalid size format!\nExamples: `15mb`, `800kb`, `1.5gb`", parse_mode='markdown')
         return
 
     data = video_cache[video_id]
     if target_bytes >= data["original_size"]:
-        await event.reply("❌ Target size must be smaller than original.", parse_mode='markdown')
+        await event.reply("❌ Target size must be smaller than original size.", parse_mode='markdown')
         return
 
     status_msg = await event.reply(f"⚙️ Compressing to {human_readable_size(target_bytes)}...")
@@ -427,7 +425,7 @@ async def size_input_handler(event):
             compressed_path,
             caption=f"✅ **Compressed Video**\n"
                     f"🎯 Requested: {human_readable_size(target_bytes)}\n"
-                    f"📦 Final: {human_readable_size(os.path.getsize(compressed_path))}",
+                    f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}",
             supports_streaming=True,
             parse_mode='markdown'
         )
@@ -448,7 +446,7 @@ async def size_input_handler(event):
         del video_cache[video_id]
 
 
-# ====================== PDF & HTML ======================
+# ====================== PDF & HTML COMMANDS ======================
 async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
@@ -478,7 +476,7 @@ async def process_html_request(event, url: str):
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
 
-    status = await event.reply("🌐 Capturing webpage...", parse_mode='markdown')
+    status = await event.reply("🌐 Capturing full webpage...", parse_mode='markdown')
 
     try:
         if not url.startswith(('http://', 'https://')):
@@ -487,7 +485,7 @@ async def process_html_request(event, url: str):
         if error:
             await safe_edit(status, f"❌ {error}")
             return
-        await event.client.send_file(event.chat_id, filepath, caption="📦 Full Webpage Snapshot (MHTML)")
+        await event.client.send_file(event.chat_id, filepath, caption="📦 Complete Webpage Snapshot (MHTML)")
         await status.delete()
     finally:
         processing_messages.discard(msg_id)
@@ -495,6 +493,73 @@ async def process_html_request(event, url: str):
             if 'filepath' in locals() and os.path.exists(filepath):
                 os.remove(filepath)
         except: pass
+
+
+# ====================== TELEGRAM HANDLERS ======================
+@events.register(events.NewMessage(pattern='/start', incoming=True))
+async def start_cmd(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    await event.reply(
+        "🚀 **Ultimate Bot - Final Fixed Version**\n\n"
+        "• `/dirpy <url>` → Download via Dirpy (direct)\n"
+        "• `/pdf <url>` → Webpage to PDF\n"
+        "• `/html <url>` → Save as MHTML\n\n"
+        "After video sent, use:\n"
+        "🗜 Compress Video\n"
+        "✅ Check (Delete from server)",
+        parse_mode='markdown'
+    )
+
+
+@events.register(events.NewMessage(pattern='/dirpy', incoming=True))
+async def dirpy_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/dirpy <url>`", parse_mode='markdown')
+    await process_dirpy_request(event, parts[1].strip())
+
+
+@events.register(events.NewMessage(pattern='/pdf', incoming=True))
+async def pdf_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/pdf <url>`", parse_mode='markdown')
+    await process_pdf_request(event, parts[1].strip())
+
+
+@events.register(events.NewMessage(pattern='/html', incoming=True))
+async def html_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/html <url>`", parse_mode='markdown')
+    await process_html_request(event, parts[1].strip())
+
+
+@events.register(events.NewMessage(incoming=True))
+async def generic_url_handler(event):
+    if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith('/'):
+        return
+    urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
+    if not urls:
+        return
+    status_msg = await event.reply("⏬ Downloading direct link...")
+    filepath, error, size = await download_direct_with_progress(urls[0], status_msg)
+    if error or not filepath:
+        await safe_edit(status_msg, f"❌ {error or 'Failed'}")
+        return
+    await event.client.send_file(event.chat_id, filepath, supports_streaming=True)
+    await status_msg.delete()
+    try:
+        os.remove(filepath)
+    except:
+        pass
 
 
 # ====================== MAIN ======================
@@ -520,6 +585,7 @@ async def main():
 
     me = await client.get_me()
     logger.info(f"✅ Bot started as @{me.username}")
+    print(f"✅ Bot is online → @{me.username}")
 
     await client.run_until_disconnected()
 
