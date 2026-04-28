@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Telegram Ultimate Bot - Complete: PDF, HTML (MHTML), Dirpy, Direct Links
-# Fixed 403 with yt-dlp, full image/GIF support
+# Fixed HTTP 403 with latest yt-dlp + mobile headers fallback
 
 import asyncio
 import os
@@ -157,13 +157,23 @@ class ProgressHandler:
 
 # ========== DOWNLOAD WITH YT-DLP (FIX 403) ==========
 async def download_with_ytdlp(url: str, status_message: Message, referer: str = None) -> Tuple[Optional[str], Optional[str], int]:
-    """Download file using yt-dlp to avoid 403 errors"""
+    """Download file using yt-dlp with proper headers to avoid 403"""
     try:
         filename = f"video_{int(time.time())}.mp4"
         filepath = os.path.join(OUTPUT_FOLDER, filename)
         
+        # Complete browser headers to bypass 403
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
         }
         if referer:
             headers['Referer'] = referer
@@ -173,9 +183,13 @@ async def download_with_ytdlp(url: str, status_message: Message, referer: str = 
             'quiet': True,
             'no_warnings': True,
             'http_headers': headers,
-            'retries': 10,
-            'fragment_retries': 10,
+            'retries': 15,
+            'fragment_retries': 15,
             'continuedl': True,
+            'ignoreerrors': True,
+            'no_check_certificate': True,
+            'extract_flat': False,
+            'format': 'best',
         }
         
         await status_message.edit("⏬ Downloading video via yt-dlp...")
@@ -183,11 +197,15 @@ async def download_with_ytdlp(url: str, status_message: Message, referer: str = 
         loop = asyncio.get_event_loop()
         def download():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.download([url])
+                try:
+                    return ydl.download([url])
+                except Exception as e:
+                    logger.error(f"yt-dlp download error: {e}")
+                    return 1
         
         result = await loop.run_in_executor(None, download)
         
-        if result != 0:
+        if result != 0 or not os.path.exists(filepath):
             return None, "yt-dlp download failed", 0
         
         file_size = os.path.getsize(filepath)
@@ -198,32 +216,35 @@ async def download_with_ytdlp(url: str, status_message: Message, referer: str = 
         logger.error(f"yt-dlp download error: {e}")
         return None, str(e), 0
 
-# ========== DIRECT DOWNLOAD WITH PROGRESS (FALLBACK) ==========
-async def download_direct_with_progress(url: str, status_message: Message, headers: dict = None) -> Tuple[Optional[str], Optional[str], int]:
-    """Direct download with progress bar (fallback when yt-dlp fails)"""
-    timeout = ClientTimeout(total=DIRPY_DOWNLOAD_TIMEOUT)
-    default_headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': '*/*',
-        'Connection': 'keep-alive',
-    }
-    if headers:
-        default_headers.update(headers)
-    
+# ========== FALLBACK DOWNLOAD WITH MOBILE HEADERS ==========
+async def download_with_mobile_fallback(url: str, status_message: Message, referer: str = None) -> Tuple[Optional[str], Optional[str], int]:
+    """Fallback download using mobile headers to bypass restrictions"""
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=default_headers) as session:
-            async with session.get(url) as response:
+        filename = f"video_{int(time.time())}.mp4"
+        filepath = os.path.join(OUTPUT_FOLDER, filename)
+        
+        mobile_headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+            'Accept': 'video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Range': 'bytes=0-',
+            'Connection': 'keep-alive',
+        }
+        if referer:
+            mobile_headers['Referer'] = referer
+        
+        timeout = ClientTimeout(total=DIRPY_DOWNLOAD_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=mobile_headers, allow_redirects=True) as response:
                 if response.status != 200:
                     return None, f"HTTP {response.status}", 0
-
+                
                 total_size = int(response.headers.get('content-length', 0))
                 if total_size > MAX_FILE_SIZE_MB * 1024 * 1024:
                     return None, f"File too large (>{MAX_FILE_SIZE_MB}MB)", 0
-
-                filename = f"video_{int(time.time())}.mp4"
-                filepath = os.path.join(OUTPUT_FOLDER, filename)
-                progress = ProgressHandler(status_message, total_size, "Downloading video")
-
+                
+                progress = ProgressHandler(status_message, total_size, "Downloading (mobile fallback)")
+                
                 downloaded = 0
                 async with aiofiles.open(filepath, 'wb') as f:
                     async for chunk in response.content.iter_chunked(8192):
@@ -231,17 +252,13 @@ async def download_direct_with_progress(url: str, status_message: Message, heade
                             await f.write(chunk)
                             downloaded += len(chunk)
                             await progress.update(downloaded)
-
+                
                 await progress.finish(True, "")
                 return filepath, None, downloaded
-
-    except asyncio.TimeoutError:
-        return None, "Download timeout", 0
-    except ClientError as e:
-        return None, f"Network error: {str(e)[:50]}", 0
+                
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        return None, f"Unexpected error: {str(e)[:50]}", 0
+        logger.error(f"Mobile fallback error: {e}")
+        return None, str(e), 0
 
 # ========== DIRPY EXTRACTION ==========
 async def extract_download_link_from_dirpy(video_url: str, status_message: Message) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -488,15 +505,13 @@ async def process_dirpy_request(event, url: str):
         # Pass the dirpy URL as referer to avoid 403
         dirpy_referer = f"https://dirpy.com/studio?url={quote(url, safe='')}"
         
-        # Try yt-dlp first, fallback to direct download
+        # Try yt-dlp first
         filepath, dl_error, file_size = await download_with_ytdlp(download_url, status_msg, dirpy_referer)
         
+        # If yt-dlp fails, try mobile fallback
         if dl_error or not filepath:
-            await safe_edit(status_msg, f"⚠️ yt-dlp failed, trying direct download...")
-            filepath, dl_error, file_size = await download_direct_with_progress(download_url, status_msg, {
-                'Referer': dirpy_referer,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
+            await safe_edit(status_msg, f"⚠️ yt-dlp failed, trying mobile fallback...")
+            filepath, dl_error, file_size = await download_with_mobile_fallback(download_url, status_msg, dirpy_referer)
             
             if dl_error or not filepath:
                 await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
@@ -676,8 +691,8 @@ async def generic_url_handler(event):
     filepath, error, size = await download_with_ytdlp(url, status_msg)
     
     if error or not filepath:
-        # Fallback to direct download
-        filepath, error, size = await download_direct_with_progress(url, status_msg)
+        # Fallback to mobile download
+        filepath, error, size = await download_with_mobile_fallback(url, status_msg)
         if error or not filepath:
             await safe_edit(status_msg, f"❌ {error}")
             return
