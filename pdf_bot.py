@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - PDF, HTML (MHTML), Dirpy (Network Interception)
-# Fixed: uses request interception to capture googlevideo.com URLs
+# Telegram Ultimate Bot - PDF, HTML, Dirpy (Network Interception) - Fixed Timeout
 
 import asyncio
 import os
@@ -42,7 +41,7 @@ AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
 
 MAX_FILE_SIZE_MB = 2000
 DOWNLOAD_TIMEOUT = 300
-DIRPY_PAGE_TIMEOUT = 90
+DIRPY_PAGE_TIMEOUT = 60000  # 60 seconds maximum for page load
 
 OUTPUT_FOLDER = "output_files"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -155,7 +154,7 @@ class ProgressHandler:
         else:
             await self.status_message.edit(f"❌ {final_message}", parse_mode='markdown')
 
-# ========== DIRECT DOWNLOAD (FALLBACK) ==========
+# ========== DIRECT DOWNLOAD ==========
 async def download_direct_with_progress(url: str, status_message: Message, referer: str = None) -> Tuple[Optional[str], Optional[str], int]:
     try:
         filename = f"video_{int(time.time())}.mp4"
@@ -190,17 +189,15 @@ async def download_direct_with_progress(url: str, status_message: Message, refer
     except Exception as e:
         return None, str(e), 0
 
-# ========== DIRPY EXTRACTION WITH NETWORK INTERCEPTION ==========
+# ========== DIRPY EXTRACTION WITH NETWORK INTERCEPTION (FIXED TIMEOUT) ==========
 async def extract_download_link_from_dirpy(video_url: str, status_message: Message) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Opens Dirpy page and intercepts network requests to capture the direct video URL.
-    """
     chromium_path = find_chromium()
     if not chromium_path:
         return None, "Chromium not found", None
 
     browser = None
     captured_url = None
+    future = asyncio.Future()  # to signal when URL is found
 
     try:
         await status_message.edit("🌐 Launching browser...")
@@ -212,17 +209,15 @@ async def extract_download_link_from_dirpy(video_url: str, status_message: Messa
         )
 
         page = await browser.newPage()
-
-        # Enable request interception
         await page.setRequestInterception(True)
 
-        # Callback to intercept requests
         async def intercept_request(request):
             nonlocal captured_url
             url = request.url
-            # Look for Google Video direct links
             if 'googlevideo.com/videoplayback' in url and 'itag=' in url:
                 captured_url = url
+                if not future.done():
+                    future.set_result(True)
                 logger.info(f"Captured video URL: {url[:100]}...")
             await request.continue_()
 
@@ -235,36 +230,53 @@ async def extract_download_link_from_dirpy(video_url: str, status_message: Messa
             'Accept-Encoding': 'gzip, deflate, br',
         })
 
-        # Navigate to Dirpy
         encoded_url = quote(video_url, safe='')
         dirpy_url = f"https://dirpy.com/studio?url={encoded_url}"
         await status_message.edit(f"📄 Opening Dirpy Studio...")
-        await page.goto(dirpy_url, {'waitUntil': 'networkidle0', 'timeout': DIRPY_PAGE_TIMEOUT * 1000})
 
-        # Wait for video element and let it load fragments
-        await status_message.edit("⏳ Waiting for video to load (15 seconds)...")
+        # Navigate with a shorter timeout and don't wait for networkidle0 to avoid hanging
         try:
-            await page.wait_for_selector('video', timeout=30000)
+            await page.goto(dirpy_url, {
+                'waitUntil': 'domcontentloaded',  # faster, don't wait for all network activity
+                'timeout': 45000  # 45 seconds for navigation
+            })
+        except Exception as nav_err:
+            logger.warning(f"Navigation error: {nav_err}, but continuing...")
+            # Sometimes goto might timeout but page is still usable
+
+        # Wait for video element to appear
+        await status_message.edit("⏳ Waiting for video to load...")
+        try:
+            await page.wait_for_selector('video', timeout=20000)
         except:
             pass
-        await asyncio.sleep(15)  # Give time for video fragments to be requested
 
-        # If still no URL, wait a bit more
-        if not captured_url:
-            await status_message.edit("⏳ Still waiting for video fragments...")
+        # Now wait for the URL to be captured, but with a total timeout
+        await status_message.edit("🔍 Intercepting video request...")
+        try:
+            await asyncio.wait_for(future, timeout=45.0)
+        except asyncio.TimeoutError:
+            # If still not captured, try to manually trigger playback or wait a bit more
+            await status_message.edit("⚠️ No request captured yet, trying to force play...")
+            try:
+                await page.evaluate('document.querySelector("video")?.play()')
+            except:
+                pass
             await asyncio.sleep(10)
-
-        # Extract duration (optional)
-        duration_js = "() => { const v = document.querySelector('video'); return v && v.duration ? v.duration : null; }"
-        video_duration = await page.evaluate(duration_js)
-        duration_str = None
-        if video_duration and video_duration > 0:
-            duration_str = format_duration(video_duration)
+            if not captured_url:
+                # One more attempt: look for source tag directly
+                source_url = await page.evaluate('document.querySelector("video source")?.src')
+                if source_url and source_url.startswith('http'):
+                    captured_url = source_url
 
         if captured_url:
+            # Extract duration if possible
+            duration_js = "() => { const v = document.querySelector('video'); return v && v.duration ? v.duration : null; }"
+            video_duration = await page.evaluate(duration_js)
+            duration_str = format_duration(video_duration) if video_duration else None
             return captured_url, None, duration_str
         else:
-            return None, "Could not intercept video URL. Dirpy may have changed its behavior.", duration_str
+            return None, "Could not intercept video URL. Dirpy may have changed its behavior.", None
 
     except Exception as e:
         logger.error(f"Dirpy interception error: {e}")
@@ -380,13 +392,12 @@ async def process_dirpy_request(event, url: str):
 
         download_url, error, duration = await extract_download_link_from_dirpy(url, status_msg)
         if error or not download_url:
-            await safe_edit(status_msg, f"❌ {error}\n\n💡 Make sure the website is supported by Dirpy")
+            await safe_edit(status_msg, f"❌ {error}\n💡 Make sure the website is supported by Dirpy")
             return
 
         duration_text = f"\n🎬 Duration: {duration}" if duration else ""
         await safe_edit(status_msg, f"✅ Link intercepted!{duration_text}\n⏬ Starting download...")
 
-        # Download using the captured URL (direct googlevideo.com link)
         dirpy_referer = f"https://dirpy.com/studio?url={quote(url, safe='')}"
         filepath, dl_error, file_size = await download_direct_with_progress(download_url, status_msg, dirpy_referer)
 
@@ -476,11 +487,11 @@ async def start_cmd(event):
     await event.reply(
         "📄 **Ultimate Bot**\n\n"
         "**Commands:**\n"
-        "🎬 `/dirpy <url>` → Download video via Dirpy (works for YouTube & many sites)\n"
-        "🌐 `/html <url>` → Save full page as MHTML (all images & GIFs, clickable links)\n"
+        "🎬 `/dirpy <url>` → Download video via Dirpy\n"
+        "🌐 `/html <url>` → Save full page as MHTML\n"
         "📑 `/pdf <url>` → Print page to PDF\n"
         "📥 Send any direct link → Download with progress bar\n\n"
-        "All downloads show **progress bars** and videos are sent as **native Telegram videos**.",
+        "Videos are sent as **native Telegram videos** with progress bars.",
         parse_mode='markdown'
     )
 
@@ -490,10 +501,10 @@ async def help_cmd(event):
         return
     await event.reply(
         "**Commands:**\n"
-        "- `/dirpy <url>` : Download video (YouTube, Facebook, Twitter, etc.) via Dirpy\n"
+        "- `/dirpy <url>` : Download video (YouTube, etc.) via Dirpy\n"
         "- `/html <url>` : Capture complete webpage with all assets\n"
         "- `/pdf <url>` : Convert to PDF\n"
-        "- Send direct link : Direct download with progress bar",
+        "- Send direct link : Direct download",
         parse_mode='markdown'
     )
 
@@ -566,13 +577,13 @@ async def generic_url_handler(event):
 # ========== MAIN ==========
 async def main():
     print("\n" + "="*50)
-    print("📄 ULTIMATE BOT (PDF/HTML/DIRPY - NETWORK INTERCEPTION)")
+    print("📄 ULTIMATE BOT - FIXED TIMEOUT")
     print("="*50)
     chromium = find_chromium()
     if chromium:
-        print(f"✅ Chromium found: {chromium}")
+        print(f"✅ Chromium: {chromium}")
     else:
-        print("❌ Chromium NOT found! PDF/HTML features will fail.")
+        print("❌ Chromium NOT found!")
     print("🤖 Starting bot...\n")
 
     client = TelegramClient('bot_session', API_ID, API_HASH)
@@ -588,7 +599,7 @@ async def main():
 
     me = await client.get_me()
     print(f"✅ Bot: @{me.username}")
-    print("🎉 Ready! Commands: /dirpy, /html, /pdf, /status\n")
+    print("🎉 Ready!\n")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
