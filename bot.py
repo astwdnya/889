@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - FINAL FIXED VERSION
+# Telegram Ultimate Bot - FIXED VERSION
 # PDF Fixed + LuxureTV Improved + Check Button + Direct Dirpy
 
 import asyncio
@@ -32,7 +32,8 @@ BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
-AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
+AUTHORIZED_USERS_RAW = os.environ.get("AUTHORIZED_USERS", "818185073,6936101187,7972834913")
+AUTHORIZED_USERS = set(int(uid.strip()) for uid in AUTHORIZED_USERS_RAW.split(",") if uid.strip())
 
 MAX_FILE_SIZE_MB = 2000
 DOWNLOAD_TIMEOUT = 300
@@ -245,15 +246,54 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
         finally:
             if browser:
                 await browser.close()
-                # ====================== VIDEO COMPRESSION ======================
+
+
+# ====================== CAPTURE MHTML ======================
+async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
+    async with async_playwright() as p:
+        browser = None
+        try:
+            await status_msg.edit("🌐 Capturing full webpage as MHTML...")
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(3)
+
+            client = await context.new_cdp_session(page)
+            result = await client.send("Page.captureSnapshot", {"format": "mhtml"})
+            mhtml_data = result.get("data", "")
+
+            if not mhtml_data:
+                return None, "Failed to capture MHTML", 0
+
+            filepath = os.path.join(OUTPUT_FOLDER, f"page_{int(time.time())}.mhtml")
+            async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+                await f.write(mhtml_data)
+
+            size = os.path.getsize(filepath)
+            return filepath, None, size
+        except Exception as e:
+            logger.error(f"MHTML Error: {e}")
+            return None, f"MHTML Error: {str(e)[:80]}", 0
+        finally:
+            if browser:
+                await browser.close()
+
+
+# ====================== VIDEO COMPRESSION ======================
 async def compress_video(input_path: str, target_size_bytes: int, status_msg: Message) -> Tuple[Optional[str], str]:
     output_path = input_path.replace(".mp4", f"_compressed_{int(target_size_bytes/1024/1024)}mb.mp4")
 
     await safe_edit(status_msg, f"⚙️ Compressing video to ≈ {human_readable_size(target_size_bytes)}...")
 
     try:
-        cmd_duration = f"ffprobe -v quiet -print_format json -show_format \"{input_path}\""
-        proc = await asyncio.create_subprocess_shell(cmd_duration, stdout=asyncio.subprocess.PIPE)
+        cmd_duration = f'ffprobe -v quiet -print_format json -show_format "{input_path}"'
+        proc = await asyncio.create_subprocess_shell(
+            cmd_duration,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         stdout, _ = await proc.communicate()
         info = json.loads(stdout.decode())
         duration = float(info['format']['duration'])
@@ -269,7 +309,11 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
             '-y', output_path
         ]
 
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         _, stderr = await process.communicate()
 
         if process.returncode != 0:
@@ -292,7 +336,7 @@ async def safe_edit(msg: Message, text: str):
         pass
 
 
-# ====================== PROCESS DIRPY REQUEST (مستقیم Dirpy بدون yt-dlp) ======================
+# ====================== PROCESS DIRPY REQUEST ======================
 processing_messages = set()
 
 async def process_dirpy_request(event, url: str):
@@ -323,7 +367,6 @@ async def process_dirpy_request(event, url: str):
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
             return
 
-        # ذخیره ویدیو برای عملیات بعدی
         video_id = f"vid_{event.chat_id}_{int(time.time())}"
         video_cache[video_id] = {
             "filepath": filepath,
@@ -332,7 +375,6 @@ async def process_dirpy_request(event, url: str):
             "original_url": url
         }
 
-        # دکمه‌ها: Compress + Check
         buttons = [
             [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
             [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
@@ -361,7 +403,7 @@ async def process_dirpy_request(event, url: str):
 # ====================== CALLBACK HANDLERS ======================
 @events.register(events.CallbackQuery(pattern=r"compress_(.+)"))
 async def compress_callback(event):
-    video_id = event.pattern_match.group(1)
+    video_id = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
     if video_id not in video_cache:
         return await event.answer("Video not found or expired.", alert=True)
 
@@ -371,7 +413,7 @@ async def compress_callback(event):
 
 @events.register(events.CallbackQuery(pattern=r"check_(.+)"))
 async def check_callback(event):
-    video_id = event.pattern_match.group(1)
+    video_id = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
     if video_id not in video_cache:
         return await event.answer("Video already deleted.", alert=True)
 
@@ -392,17 +434,18 @@ async def check_callback(event):
 # ====================== SIZE INPUT HANDLER ======================
 @events.register(events.NewMessage(incoming=True))
 async def size_input_handler(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return
     if event.chat_id not in user_state:
         return
 
     state = user_state.get(event.chat_id)
-    if state.get("action") != "wait_for_compression_size":
+    if not state or state.get("action") != "wait_for_compression_size":
         return
 
     video_id = state["video_id"]
     if video_id not in video_cache:
-        if event.chat_id in user_state:
-            del user_state[event.chat_id]
+        user_state.pop(event.chat_id, None)
         return
 
     target_bytes = parse_size_input(event.raw_text)
@@ -434,25 +477,24 @@ async def size_input_handler(event):
         try:
             os.remove(compressed_path)
             os.remove(data["filepath"])
-        except:
+        except Exception:
             pass
     else:
         await safe_edit(status_msg, f"❌ Compression failed: {result}")
 
-    # پاکسازی
-    if event.chat_id in user_state:
-        del user_state[event.chat_id]
-    if video_id in video_cache:
-        del video_cache[video_id]
+    user_state.pop(event.chat_id, None)
+    video_cache.pop(video_id, None)
 
 
 # ====================== PDF & HTML COMMANDS ======================
 async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
-    if msg_id in processing_messages: return
+    if msg_id in processing_messages:
+        return
     processing_messages.add(msg_id)
 
     status = await event.reply("📄 Converting to PDF...", parse_mode='markdown')
+    filepath = None
 
     try:
         if not url.startswith(('http://', 'https://')):
@@ -463,20 +505,25 @@ async def process_pdf_request(event, url: str):
             return
         await event.client.send_file(event.chat_id, filepath, caption=f"📑 PDF • {human_readable_size(size)}", force_document=True)
         await status.delete()
+    except Exception as e:
+        await safe_edit(status, f"❌ Unexpected error: {str(e)[:120]}")
     finally:
         processing_messages.discard(msg_id)
         try:
-            if 'filepath' in locals() and os.path.exists(filepath):
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
-        except: pass
+        except Exception:
+            pass
 
 
 async def process_html_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
-    if msg_id in processing_messages: return
+    if msg_id in processing_messages:
+        return
     processing_messages.add(msg_id)
 
     status = await event.reply("🌐 Capturing full webpage...", parse_mode='markdown')
+    filepath = None
 
     try:
         if not url.startswith(('http://', 'https://')):
@@ -487,12 +534,15 @@ async def process_html_request(event, url: str):
             return
         await event.client.send_file(event.chat_id, filepath, caption="📦 Complete Webpage Snapshot (MHTML)")
         await status.delete()
+    except Exception as e:
+        await safe_edit(status, f"❌ Unexpected error: {str(e)[:120]}")
     finally:
         processing_messages.discard(msg_id)
         try:
-            if 'filepath' in locals() and os.path.exists(filepath):
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
-        except: pass
+        except Exception:
+            pass
 
 
 # ====================== TELEGRAM HANDLERS ======================
@@ -501,7 +551,7 @@ async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     await event.reply(
-        "🚀 **Ultimate Bot - Final Fixed Version**\n\n"
+        "🚀 **Ultimate Bot - Fixed Version**\n\n"
         "• `/dirpy <url>` → Download via Dirpy (direct)\n"
         "• `/pdf <url>` → Webpage to PDF\n"
         "• `/html <url>` → Save as MHTML\n\n"
@@ -546,6 +596,9 @@ async def html_command(event):
 async def generic_url_handler(event):
     if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith('/'):
         return
+    # اگه کاربر داره size می‌فرسته، این handler نباید اجرا بشه
+    if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_compression_size":
+        return
     urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
     if not urls:
         return
@@ -558,15 +611,19 @@ async def generic_url_handler(event):
     await status_msg.delete()
     try:
         os.remove(filepath)
-    except:
+    except Exception:
         pass
 
 
 # ====================== MAIN ======================
 async def main():
+    if not BOT_TOKEN or not API_HASH or not API_ID:
+        logger.critical("❌ Missing BOT_TOKEN, API_ID, or API_HASH environment variables!")
+        sys.exit(1)
+
     print("\n" + "="*80)
-    print("🚀 ULTIMATE BOT - FINAL FIXED VERSION")
-    print("   PDF Fixed + LuxureTV Improved + Check Button")
+    print("🚀 ULTIMATE BOT - FIXED VERSION")
+    print("   PDF Fixed + MHTML Added + Bracket Bug Fixed + ENV Vars")
     print("="*80)
 
     start_keep_alive()
@@ -578,10 +635,10 @@ async def main():
     client.add_event_handler(dirpy_command)
     client.add_event_handler(pdf_command)
     client.add_event_handler(html_command)
-    client.add_event_handler(generic_url_handler)
     client.add_event_handler(compress_callback)
     client.add_event_handler(check_callback)
     client.add_event_handler(size_input_handler)
+    client.add_event_handler(generic_url_handler)
 
     me = await client.get_me()
     logger.info(f"✅ Bot started as @{me.username}")
