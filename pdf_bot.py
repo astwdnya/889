@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Telegram PDF Bot - Fixed Chromium path detection
+# Telegram PDF Bot - Convert any webpage to PDF with images & GIFs
 
 import asyncio
 import os
@@ -20,6 +20,7 @@ try:
     PYPPETEER_AVAILABLE = True
 except ImportError:
     PYPPETEER_AVAILABLE = False
+    print("⚠️ pyppeteer not installed")
 
 # ========== CONFIGURATION ==========
 BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
@@ -58,69 +59,45 @@ def start_keep_alive():
 
 # ========== FIND CHROMIUM ==========
 def find_chromium():
-    """Find Chromium executable - Fixed for Render"""
-    
-    # Check all possible locations in Render
+    """Find Chromium executable"""
     possible_paths = [
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/google-chrome",
-        "/snap/bin/chromium",
-        "/usr/lib/chromium/chromium",
-        "/opt/google/chrome/chrome",
     ]
     
     for path in possible_paths:
         if os.path.exists(path):
-            logger.info(f"Found Chromium at: {path}")
+            logger.info(f"Found Chromium: {path}")
             return path
     
-    # Also check with which command (if possible)
-    import subprocess
-    try:
-        result = subprocess.run(['which', 'chromium'], capture_output=True, text=True)
-        if result.returncode == 0 and result.stdout.strip():
-            path = result.stdout.strip()
-            if os.path.exists(path):
-                logger.info(f"Found Chromium via which: {path}")
-                return path
-    except:
-        pass
-    
-    # Check pyppeteer's downloaded Chromium
+    # Check pyppeteer's download
     try:
         home = os.path.expanduser("~")
         pyppeteer_paths = glob.glob(f"{home}/.local/share/pyppeteer/local-chromium/*/chrome-linux/chrome")
         if pyppeteer_paths:
-            logger.info(f"Found pyppeteer Chromium at: {pyppeteer_paths[0]}")
+            logger.info(f"Found pyppeteer Chromium: {pyppeteer_paths[0]}")
             return pyppeteer_paths[0]
     except:
         pass
     
-    logger.error("Chromium not found in any location")
+    logger.error("Chromium not found")
     return None
 
-# ========== CHECK CHROMIUM ON STARTUP ==========
 CHROMIUM_PATH = find_chromium()
-if CHROMIUM_PATH:
-    logger.info(f"✅ Chromium ready: {CHROMIUM_PATH}")
-else:
-    logger.error("❌ Chromium NOT found! Make sure Aptfile is deployed.")
 
 # ========== PDF CONVERSION ==========
 async def html_to_pdf(url: str) -> tuple:
     if not PYPPETEER_AVAILABLE:
         return None, "pyppeteer not installed", 0
     
-    chromium_path = find_chromium()  # Search again in case it was installed
+    chromium_path = find_chromium()
     if not chromium_path:
-        return None, "Chromium not found. Please install via Aptfile", 0
+        return None, "Chromium not found", 0
     
     browser = None
     try:
-        logger.info(f"Launching Chromium from: {chromium_path}")
-        
         browser = await launch(
             headless=True,
             executablePath=chromium_path,
@@ -128,15 +105,9 @@ async def html_to_pdf(url: str) -> tuple:
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process',
-                '--no-zygote',
-                '--disable-extensions',
-                '--disable-web-security'
+                '--disable-gpu'
             ],
-            defaultViewport={'width': 1920, 'height': 1080},
-            handleSIGINT=False,
-            handleSIGTERM=False
+            defaultViewport={'width': 1920, 'height': 1080}
         )
         
         page = await browser.newPage()
@@ -185,27 +156,33 @@ async def html_to_pdf(url: str) -> tuple:
 # ========== TELEGRAM HANDLERS ==========
 processing_messages = set()
 
+async def safe_edit(msg, text):
+    try:
+        await msg.edit(text, parse_mode='markdown')
+    except MessageNotModifiedError:
+        pass
+    except Exception as e:
+        logger.warning(f"Edit failed: {e}")
+
 async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
     
-    status_msg = await event.reply(f"🔄 Converting `{url[:50]}}...`", parse_mode='markdown')
+    # FIXED: removed extra } in the f-string below
+    status_msg = await event.reply(f"🔄 Converting `{url[:50]}...`", parse_mode='markdown')
     
     try:
-        # Validate URL
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
-        # Convert
         filepath, error, size = await html_to_pdf(url)
         
         if error or not filepath:
             await safe_edit(status_msg, f"❌ {error}")
             return
         
-        # Send file
         size_mb = size / (1024 * 1024)
         await event.client.send_file(
             event.chat_id,
@@ -214,7 +191,6 @@ async def process_pdf_request(event, url: str):
             force_document=True
         )
         
-        # Cleanup
         os.remove(filepath)
         await status_msg.delete()
         
@@ -222,14 +198,6 @@ async def process_pdf_request(event, url: str):
         await safe_edit(status_msg, f"❌ Error: {str(e)[:100]}")
     finally:
         processing_messages.discard(msg_id)
-
-async def safe_edit(msg, text):
-    try:
-        await msg.edit(text, parse_mode='markdown')
-    except MessageNotModifiedError:
-        pass
-    except Exception as e:
-        logger.warning(f"Edit failed: {e}")
 
 @events.register(events.NewMessage(pattern='/start', incoming=True))
 async def start_cmd(event):
@@ -292,7 +260,6 @@ async def url_handler(event):
     if event.raw_text.startswith('/'):
         return
     
-    # Extract URL
     urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', event.raw_text)
     if not urls:
         return
@@ -305,14 +272,11 @@ async def main():
     print("📄 TELEGRAM PDF BOT")
     print("="*50)
     
-    # Check Chromium
     chromium_path = find_chromium()
     if chromium_path:
         print(f"✅ Chromium: {chromium_path}")
     else:
         print("❌ Chromium NOT FOUND!")
-        print("   Make sure Aptfile is in the project root")
-        print("   And Render is configured to use it")
     
     print(f"✅ Pyppeteer: {'Installed' if PYPPETEER_AVAILABLE else 'Not installed'}")
     print("🤖 Starting...\n")
@@ -321,7 +285,6 @@ async def main():
     
     await client.start(bot_token=BOT_TOKEN)
     
-    # Add handlers
     client.add_event_handler(start_cmd)
     client.add_event_handler(help_cmd)
     client.add_event_handler(status_cmd)
