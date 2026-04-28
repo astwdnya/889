@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Telegram PDF Bot - با پشتیبانی کامل از Chromium در Docker
+# Telegram PDF Bot - Fixed JavaScript evaluation error
 
 import asyncio
 import os
@@ -21,7 +21,7 @@ try:
 except ImportError:
     PYPPETEER_AVAILABLE = False
 
-# ========== تنظیمات ==========
+# ========== SETTINGS ==========
 BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
@@ -35,14 +35,14 @@ HEALTH_PORT = int(os.environ.get('PORT', 10000))
 
 os.makedirs(PDF_FOLDER, exist_ok=True)
 
-# ========== لاگینگ ==========
+# ========== LOGGING ==========
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ========== Flask برای Keep-Alive ==========
+# ========== FLASK KEEP-ALIVE ==========
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -56,16 +56,13 @@ def start_keep_alive():
     Thread(target=run_flask, daemon=True).start()
     logger.info(f"Keep-alive on port {HEALTH_PORT}")
 
-# ========== پیدا کردن Chromium ==========
+# ========== FIND CHROMIUM ==========
 def find_chromium():
-    """پیدا کردن مسیر Chromium در سیستم"""
-    # مسیرهای احتمالی
     possible_paths = [
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/google-chrome",
-        "/opt/google/chrome/chrome",
     ]
     
     for path in possible_paths:
@@ -73,7 +70,6 @@ def find_chromium():
             logger.info(f"✅ Chromium found: {path}")
             return path
     
-    # بررسی pyppeteer
     home = os.path.expanduser("~")
     pyppeteer_paths = glob.glob(f"{home}/.local/share/pyppeteer/local-chromium/*/chrome-linux/chrome")
     if pyppeteer_paths:
@@ -83,21 +79,19 @@ def find_chromium():
     logger.error("❌ Chromium not found!")
     return None
 
-# ========== تبدیل به PDF ==========
+# ========== PDF CONVERSION ==========
 async def html_to_pdf(url: str, status_msg=None) -> tuple:
-    """تبدیل صفحه وب به PDF"""
-    
     if not PYPPETEER_AVAILABLE:
         return None, "pyppeteer not installed", 0
     
     chromium_path = find_chromium()
     if not chromium_path:
-        return None, "Chromium not found. Please install Chromium.", 0
+        return None, "Chromium not found", 0
     
     browser = None
     try:
         if status_msg:
-            await safe_edit(status_msg, "🌐 Launching browser...")
+            await safe_edit(status_msg, "🌌 Launching browser...")
         
         browser = await launch(
             headless=True,
@@ -106,43 +100,39 @@ async def html_to_pdf(url: str, status_msg=None) -> tuple:
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process'
+                '--disable-gpu'
             ],
-            defaultViewport={'width': 1920, 'height': 1080}
+            defaultViewport={'width': 1280, 'height': 800}
         )
         
         page = await browser.newPage()
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
         if status_msg:
-            await safe_edit(status_msg, f"📄 Loading page...")
+            await safe_edit(status_msg, f"📄 Loading: {url[:50]}...")
         
         await page.goto(url, {
-            'waitUntil': 'networkidle2',
+            'waitUntil': 'networkidle0',
             'timeout': PDF_TIMEOUT * 1000
         })
         
-        # اسکرول به پایین برای بارگذاری همه محتوا
-        await page.evaluate('''
-            async function scroll() {
-                let totalHeight = 0;
-                const distance = 200;
-                const scrollHeight = document.body.scrollHeight;
-                while (totalHeight < scrollHeight) {
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    await new Promise(r => setTimeout(r, 100));
-                }
+        # Simple scroll - بدون async/await پیچیده
+        try:
+            await page.evaluate('''
+                window.scrollTo(0, document.body.scrollHeight);
+            ''')
+            await asyncio.sleep(1)
+            await page.evaluate('''
                 window.scrollTo(0, 0);
-            }
-            await scroll();
-        ''')
+            ''')
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Scroll error (non-critical): {e}")
         
         if status_msg:
             await safe_edit(status_msg, "📝 Generating PDF...")
         
-        # ساخت PDF
+        # Save PDF
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"pdf_{timestamp}.pdf"
         filepath = os.path.join(PDF_FOLDER, filename)
@@ -152,30 +142,34 @@ async def html_to_pdf(url: str, status_msg=None) -> tuple:
             'format': 'A4',
             'printBackground': True,
             'margin': {
-                'top': '20px',
-                'bottom': '20px',
-                'left': '20px',
-                'right': '20px'
+                'top': '15px',
+                'bottom': '15px',
+                'left': '15px',
+                'right': '15px'
             }
         })
         
         file_size = os.path.getsize(filepath)
+        
+        if file_size > MAX_PDF_SIZE_MB * 1024 * 1024:
+            os.remove(filepath)
+            return None, f"PDF too large ({file_size/(1024*1024):.1f}MB)", 0
+        
         return filepath, None, file_size
         
     except asyncio.TimeoutError:
         return None, "Page load timeout", 0
     except Exception as e:
         logger.error(f"PDF error: {e}")
-        return None, str(e)[:100], 0
+        return None, f"Error: {str(e)[:100]}", 0
     finally:
         if browser:
             await browser.close()
 
-# ========== توابع کمکی ==========
+# ========== HELPER FUNCTIONS ==========
 processing_messages = set()
 
 async def safe_edit(msg, text):
-    """ویرایش پیام بدون خطا"""
     try:
         await msg.edit(text, parse_mode='markdown')
     except MessageNotModifiedError:
@@ -184,37 +178,32 @@ async def safe_edit(msg, text):
         logger.warning(f"Edit failed: {e}")
 
 async def process_pdf_request(event, url: str):
-    """پردازش درخواست PDF"""
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
     
-    status_msg = await event.reply(f"🔄 Converting `{url[:50]}...`", parse_mode='markdown')
+    status_msg = await event.reply(f"🔄 Processing `{url[:50]}...`", parse_mode='markdown')
     
     try:
-        # اعتبارسنجی URL
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
-        # تبدیل به PDF
         filepath, error, size = await html_to_pdf(url, status_msg)
         
         if error or not filepath:
-            await safe_edit(status_msg, f"❌ {error}\n\nPlease make sure:\n• URL is valid\n• Chromium is installed")
+            await safe_edit(status_msg, f"❌ {error}")
             return
         
-        # ارسال فایل
         size_mb = size / (1024 * 1024)
         await event.client.send_file(
             event.chat_id,
             filepath,
-            caption=f"📄 **PDF Ready!**\n📦 Size: {size_mb:.2f} MB",
+            caption=f"📄 **PDF Ready!**\n📦 {size_mb:.2f} MB\n🌐 {url[:50]}",
             force_document=True,
             parse_mode='markdown'
         )
         
-        # پاکسازی
         try:
             os.remove(filepath)
         except:
@@ -228,7 +217,7 @@ async def process_pdf_request(event, url: str):
     finally:
         processing_messages.discard(msg_id)
 
-# ========== هندلرهای تلگرام ==========
+# ========== TELEGRAM HANDLERS ==========
 @events.register(events.NewMessage(pattern='/start', incoming=True))
 async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
@@ -240,10 +229,9 @@ async def start_cmd(event):
     
     await event.reply(
         f"📄 **PDF Bot**\n\n"
-        f"Send me any URL to convert to PDF.\n\n"
+        f"Send me a URL to convert to PDF.\n\n"
         f"**Status:** {status}\n"
-        f"**Commands:** /help, /status, /pdf\n\n"
-        f"_Chromium path: {chromium or 'Not found'}_",
+        f"**Commands:** /help, /status, /pdf",
         parse_mode='markdown'
     )
 
@@ -254,8 +242,8 @@ async def help_cmd(event):
     await event.reply(
         "**Usage:**\n"
         "• Send a URL directly\n"
-        "• Or use: `/pdf https://example.com`\n\n"
-        "The bot will convert the entire webpage to PDF.",
+        "• Or: `/pdf https://example.com`\n\n"
+        "The bot converts the entire webpage to PDF.",
         parse_mode='markdown'
     )
 
@@ -277,53 +265,49 @@ async def status_cmd(event):
 @events.register(events.NewMessage(pattern='/pdf', incoming=True))
 async def pdf_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
-        await event.reply("⛌ Unauthorized")
+        await event.reply("⛔ Unauthorized")
         return
     
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2:
-        await event.reply("❌ Please provide URL: `/pdf https://example.com`", parse_mode='markdown')
+        await event.reply("❌ Provide URL: `/pdf https://example.com`", parse_mode='markdown')
         return
     
     await process_pdf_request(event, parts[1].strip())
 
 @events.register(events.NewMessage(incoming=True))
 async def url_handler(event):
-    """پردازش پیام‌های حاوی URL"""
     if event.sender_id not in AUTHORIZED_USERS:
         return
     
     if event.raw_text.startswith('/'):
         return
     
-    # استخراج URL
     urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', event.raw_text)
     if not urls:
         return
     
     await process_pdf_request(event, urls[0])
 
-# ========== اجرای اصلی ==========
+# ========== MAIN ==========
 async def main():
     print("\n" + "="*50)
     print("📄 TELEGRAM PDF BOT")
     print("="*50)
     
-    # بررسی Chromium
     chromium_path = find_chromium()
     if chromium_path:
         print(f"✅ Chromium: {chromium_path}")
     else:
-        print("❌ Chromium NOT FOUND! Make sure Dockerfile installs it.")
+        print("❌ Chromium NOT FOUND!")
     
     print(f"✅ Pyppeteer: {'Installed' if PYPPETEER_AVAILABLE else 'Not installed'}")
-    print(f"✅ Bot starting...\n")
+    print("🤖 Starting bot...\n")
     
     client = TelegramClient('pdf_bot_session', API_ID, API_HASH)
     
     await client.start(bot_token=BOT_TOKEN)
     
-    # ثبت هندلرها
     client.add_event_handler(start_cmd)
     client.add_event_handler(help_cmd)
     client.add_event_handler(status_cmd)
