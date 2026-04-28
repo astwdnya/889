@@ -1,21 +1,39 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.50-noble
 
+# نصب وابستگی‌های سیستم اضافی (برای yt-dlp و ffmpeg)
 RUN apt-get update && apt-get install -y \
-    chromium \
-    chromium-driver \
-    libnss3 \
-    libxss1 \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libgbm-dev \
+    ffmpeg \
     fonts-liberation \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CHROMIUM_PATH=/usr/bin/chromium
+# تنظیم متغیر محیطی برای Playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
+
+# کپی و نصب پکیج‌های پایتون
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY pdf_bot.py .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    playwright install chromium --with-deps
+
+# کپی کد اصلی بات
+COPY bot.py .
+
+# ایجاد پوشه خروجی
+RUN mkdir -p output_files
+
 EXPOSE 10000
-CMD ["python", "pdf_bot.py"]
+
+# اجرای بات
+CMD ["python", "bot.py"]
