@@ -183,37 +183,56 @@ def is_video_url(url: str) -> bool:
     """Check if a request URL looks like a direct video stream."""
     u = url.lower()
 
+    SKIP_KEYWORDS = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite', 'storyboard', 'ad', 'tracking', 'analytics', 'pixel']
+
     SITE_PATTERNS = [
         ('xnxx-cdn.com',         lambda u: 'mp4' in u),
         ('xnxx.com',             lambda u: 'mp4' in u and '/videos/' in u),
-        ('media4.luxuretv.com',  lambda u: '.mp4' in u and 'thumb' not in u and 'preview' not in u),
-        ('media.luxuretv.com',   lambda u: '.mp4' in u and 'thumb' not in u and 'preview' not in u),
-        ('luxuretv.com',         lambda u: '.mp4' in u and 'thumb' not in u and 'preview' not in u and any(m in u for m in ['media', 'cdn', 'video', 'stream'])),
+        ('media4.luxuretv.com',  lambda u: '.mp4' in u),
+        ('media.luxuretv.com',   lambda u: '.mp4' in u),
+        ('luxuretv.com',         lambda u: '.mp4' in u and any(m in u for m in ['media', 'cdn', 'video', 'stream'])),
         ('rule34.xxx',           lambda u: '.mp4' in u or ('video' in u and 'api' not in u)),
         ('rule34video.com',      lambda u: '.mp4' in u),
+        # redtube و pornhub CDN (rdtcdn)
+        ('rdtcdn.com',           lambda u: '.mp4' in u),
+        ('ev-ph.rdtcdn.com',     lambda u: '.mp4' in u),
+        ('redtube.com',          lambda u: '.mp4' in u),
+        ('phncdn.com',           lambda u: '.mp4' in u),
+        ('pornhub.com',          lambda u: '.mp4' in u and 'cdn' in u),
+        # سایت‌های عمومی
         ('ahrimp4',              lambda u: True),
         ('media4',               lambda u: '.mp4' in u),
     ]
+
+    if any(k in u for k in SKIP_KEYWORDS):
+        return False
 
     for domain, check in SITE_PATTERNS:
         if domain in u and check(u):
             return True
 
-    # fallback: هر URL عمومی با .mp4 روی CDN
-    if '.mp4' in u and any(cdn in u for cdn in ['-cdn', 'media', 'video', 'stream', 'content', 'storage']):
+    # Generic detector: هر URL با .mp4 روی CDN/media server
+    # شبیه همون چیزی که تو network inspector میبینی - فایل‌های بزرگ روی CDN
+    GENERIC_CDN_SIGNALS = ['-cdn', 'media', 'video', 'stream', 'content', 'storage', 'ev-', 'cdn-', '.cdn']
+    if '.mp4' in u and any(sig in u for sig in GENERIC_CDN_SIGNALS):
         return True
+
+    # فرمت‌های ویدیو دیگه
+    for ext in ['.webm', '.m3u8', '.ts', '.mkv']:
+        if ext in u and any(sig in u for sig in GENERIC_CDN_SIGNALS):
+            return True
 
     return False
 
 
 
 # ====================== LUXURETV DIRECT EXTRACTOR ======================
-async def extract_luxuretv_direct(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
-    """مستقیماً از سورس صفحه luxuretv لینک mp4 رو میگیره بدون نیاز به dirpy."""
+async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
+    """مستقیماً از سورس صفحه سایت لینک mp4 رو میگیره بدون نیاز به dirpy."""
     async with async_playwright() as p:
         browser = None
         try:
-            await safe_edit(status_msg, "🔍 Extracting luxuretv source directly...")
+            await safe_edit(status_msg, "🔍 Extracting video source directly...")
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
@@ -229,11 +248,12 @@ async def extract_luxuretv_direct(video_url: str, status_msg: Message) -> Tuple[
                 rurl = response.url.lower()
                 content_type = response.headers.get('content-type', '')
                 content_length = int(response.headers.get('content-length', 0))
-                if (('media' in rurl or 'cdn' in rurl) and '.mp4' in rurl
-                        and 'thumb' not in rurl and 'preview' not in rurl
-                        and content_length > 500 * 1024):
+                skip = ['thumb', 'preview', 'poster', 'banner', 'sprite', 'storyboard']
+                is_video_response = ('video' in content_type or 'octet-stream' in content_type)
+                is_cdn_mp4 = '.mp4' in rurl and any(s in rurl for s in ['media', 'cdn', 'rdtcdn', 'ev-', 'stream'])
+                if (is_video_response or is_cdn_mp4) and content_length > 500 * 1024 and not any(k in rurl for k in skip):
                     captured = response.url
-                    logger.info(f"[LUXURE DIRECT] Captured: {response.url[:200]}")
+                    logger.info(f"[DIRECT] Captured: {response.url[:200]}")
 
             page.on('response', on_response)
 
@@ -371,22 +391,45 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
     async with async_playwright() as p:
         browser = None
         try:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-            page = await browser.new_page()
+            browser = await p.chromium.launch(headless=True, args=[
+                '--no-sandbox', '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+            ])
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
             await safe_edit(status_msg, "🌐 Loading page...")
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=120000)
             except Exception:
-                pass  # ادامه بده حتی اگه timeout خورد - صفحه احتمالا لود شده
-            await safe_edit(status_msg, "📄 Rendering PDF...")
-            try:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception:
-                pass
-            await asyncio.sleep(5)
+                pass  # ادامه بده حتی اگه timeout خورد
 
+            await safe_edit(status_msg, "📜 Scrolling to load all images...")
+            # اسکرول تدریجی برای trigger کردن lazy load
+            await page.evaluate("""
+                async () => {
+                    const delay = ms => new Promise(r => setTimeout(r, ms));
+                    const totalHeight = document.body.scrollHeight;
+                    const step = Math.floor(window.innerHeight * 0.8);
+                    let current = 0;
+                    while (current < totalHeight) {
+                        window.scrollTo(0, current);
+                        await delay(300);
+                        current += step;
+                    }
+                    window.scrollTo(0, totalHeight);
+                    await delay(500);
+                }
+            """)
+            # صبر برای لود شدن عکس‌ها بعد از scroll
+            await asyncio.sleep(4)
+
+            await safe_edit(status_msg, "📄 Rendering PDF...")
             filepath = os.path.join(OUTPUT_FOLDER, f"pdf_{int(time.time())}.pdf")
-            await page.pdf(path=filepath, format='A4', print_background=True)
+            await page.pdf(
+                path=filepath,
+                format="A4",
+                print_background=True,
+                margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"}
+            )
             size = os.path.getsize(filepath)
             return filepath, None, size
         except Exception as e:
@@ -502,11 +545,12 @@ async def process_dirpy_request(event, url: str):
 
         await safe_edit(status_msg, "🌐 Opening Dirpy Studio and capturing stream...")
 
-        # برای luxuretv مستقیم از سورس سایت بگیر، نه از dirpy
-        if 'luxuretv.com' in url.lower():
-            direct_url, intercept_err = await extract_luxuretv_direct(url, status_msg)
+        url_lower = url.lower()
+
+        # برای luxuretv و redtube مستقیم از سورس سایت بگیر
+        if 'luxuretv.com' in url_lower or 'redtube.com' in url_lower:
+            direct_url, intercept_err = await extract_direct_from_site(url, status_msg)
             if not direct_url:
-                # fallback به dirpy
                 await safe_edit(status_msg, "⚠️ Direct failed, trying Dirpy fallback...")
                 direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
         else:
