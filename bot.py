@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - FULL VERSION WITH COMPRESSION
-# Support: YouTube, Rule34, XNXX, LuxureTV + Smart Video Compression
+# Telegram Ultimate Bot - FULL FIXED VERSION with Compression Feature
+# Support: YouTube, Rule34, XNXX, LuxureTV + Smart Compression
 
 import asyncio
 import os
@@ -240,7 +240,7 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
         return None, str(e), 0
 
 
-# ====================== SMART INTERCEPTION (XNXX, LuxureTV, Rule34) ======================
+# ====================== SMART INTERCEPTION ======================
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
     async with async_playwright() as p:
         browser = None
@@ -261,7 +261,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 if any(k in req_url for k in ['.mp4', 'xnxx-cdn.com', 'luxuretv.com', 'rule34.xxx', 'ahrimp4', 'media4.luxuretv']):
                     if not captured_url:
                         captured_url = req_url
-                        logger.info(f"✅ Captured video URL: {req_url[:150]}...")
+                        logger.info(f"✅ Captured: {req_url[:150]}...")
                 await route.continue_()
 
             await page.route("**/*", handle_route)
@@ -287,98 +287,47 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
         finally:
             if browser:
                 await browser.close()
-
-
-# ====================== PDF (Fixed) ======================
-async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
-    async with async_playwright() as p:
-        browser = None
-        try:
-            await status_msg.edit("📄 Converting to PDF...")
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-            page = await browser.new_page()
-            await page.goto(url, wait_until="load", timeout=45000)
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(3)
-
-            filepath = os.path.join(OUTPUT_FOLDER, f"pdf_{int(time.time())}.pdf")
-            await page.pdf(path=filepath, format='A4', print_background=True)
-            size = os.path.getsize(filepath)
-            return filepath, None, size
-        except Exception as e:
-            logger.error(f"PDF error: {e}")
-            return None, str(e), 0
-        finally:
-            if browser:
-                await browser.close()
-
-
-# ====================== MHTML ======================
-async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
-    async with async_playwright() as p:
-        browser = None
-        try:
-            await status_msg.edit("🌐 Capturing full webpage...")
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-            page = await browser.new_page()
-            await page.goto(url, wait_until="load", timeout=45000)
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(2)
-
-            client = await page.context.new_cdp_session(page)
-            mhtml = await client.send('Page.captureSnapshot', {'format': 'mhtml'})
-            data = mhtml['data'].encode()
-
-            title = safe_filename(await page.title() or "webpage")
-            filepath = os.path.join(OUTPUT_FOLDER, f"snapshot_{title}_{int(time.time())}.mhtml")
-
-            async with aiofiles.open(filepath, 'wb') as f:
-                await f.write(data)
-
-            return filepath, None, len(data)
-        except Exception as e:
-            return None, str(e), 0
-        finally:
-            if browser:
-                await browser.close()
-
-
-# ====================== VIDEO COMPRESSION ======================
+                # ====================== VIDEO COMPRESSION ======================
 async def compress_video(input_path: str, target_size_bytes: int, status_msg: Message) -> Tuple[Optional[str], str]:
     output_path = input_path.replace(".mp4", f"_compressed_{int(target_size_bytes/1024/1024)}mb.mp4")
 
     await safe_edit(status_msg, f"⚙️ Compressing video to ≈ {human_readable_size(target_size_bytes)}...")
 
     try:
+        # گرفتن مدت زمان ویدیو با ffprobe
         cmd_duration = f"ffprobe -v quiet -print_format json -show_format \"{input_path}\""
         proc = await asyncio.create_subprocess_shell(cmd_duration, stdout=asyncio.subprocess.PIPE)
         stdout, _ = await proc.communicate()
         info = json.loads(stdout.decode())
         duration = float(info['format']['duration'])
 
+        # محاسبه بیت‌ریت هدف (با حاشیه اطمینان)
         target_bitrate = int((target_size_bytes * 8) / duration * 0.92)
 
         cmd = [
             'ffmpeg', '-i', input_path,
-            '-vcodec', 'libx264', '-crf', '28',
+            '-vcodec', 'libx264',
+            '-crf', '28',
             '-b:v', str(target_bitrate),
             '-preset', 'medium',
-            '-acodec', 'aac', '-b:a', '128k',
-            '-y', output_path
+            '-acodec', 'aac',
+            '-b:a', '128k',
+            '-y',
+            output_path
         ]
 
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         _, stderr = await process.communicate()
 
         if process.returncode != 0:
-            logger.error(f"FFmpeg error: {stderr.decode()[:200]}")
-            return None, "Compression failed"
+            logger.error(f"FFmpeg Error: {stderr.decode()[:300]}")
+            return None, "FFmpeg compression failed"
 
         final_size = os.path.getsize(output_path)
         return output_path, f"Compressed successfully ({human_readable_size(final_size)})"
 
     except Exception as e:
-        logger.error(f"Compression error: {e}")
+        logger.error(f"Compression exception: {e}")
         return None, str(e)
 
 
@@ -388,7 +337,9 @@ async def safe_edit(msg: Message, text: str):
         await msg.edit(text, parse_mode='markdown')
     except Exception:
         pass
-        # ====================== PROCESS DIRPY REQUEST ======================
+
+
+# ====================== PROCESS DIRPY REQUEST ======================
 processing_messages = set()
 
 async def process_dirpy_request(event, url: str):
@@ -407,27 +358,26 @@ async def process_dirpy_request(event, url: str):
         duration_text = None
         final_size = 0
 
-        # مرحله ۱: تلاش با yt-dlp
+        # مرحله اول: yt-dlp
         dl_path, error, info = await download_with_yt_dlp(url, status_msg)
 
         if error or not dl_path:
             await safe_edit(status_msg, "⚠️ yt-dlp failed → Using smart browser interception...")
             direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
             if intercept_err or not direct_url:
-                await safe_edit(status_msg, f"❌ Failed to extract video: {intercept_err}")
+                await safe_edit(status_msg, f"❌ {intercept_err or 'Failed to extract video link'}")
                 return
             filepath, dl_error, final_size = await download_direct_with_progress(direct_url, status_msg, referer=url)
-            duration_text = None
         else:
             filepath = dl_path
             final_size = os.path.getsize(filepath)
             duration_text = format_duration(info.get('duration')) if info else None
 
         if not filepath or not os.path.exists(filepath):
-            await safe_edit(status_msg, "❌ Failed to download the video")
+            await safe_edit(status_msg, "❌ Failed to download video")
             return
 
-        # ذخیره ویدیو در کش برای قابلیت فشرده‌سازی
+        # ذخیره اطلاعات ویدیو برای فشرده‌سازی
         video_id = f"vid_{event.chat_id}_{int(time.time())}"
         video_cache[video_id] = {
             "filepath": filepath,
@@ -437,7 +387,7 @@ async def process_dirpy_request(event, url: str):
             "duration": duration_text
         }
 
-        # اضافه کردن دکمه شیشه‌ای Compress
+        # دکمه شیشه‌ای فشرده‌سازی
         buttons = [[Button.inline("🗜 Compress Video", f"compress_{video_id}")]]
 
         await event.client.send_file(
@@ -467,9 +417,9 @@ async def compress_callback(event):
     video_id = event.pattern_match.group(1)
 
     if video_id not in video_cache:
-        return await event.answer("This video is no longer available or expired.", alert=True)
+        return await event.answer("This video is no longer available.", alert=True)
 
-    await event.answer("Please send the desired size.\nExample: 15mb or 800kb or 1.2gb", alert=False)
+    await event.answer("Send desired size (example: 15mb or 800kb)", alert=False)
 
     user_state[event.chat_id] = {
         "action": "wait_for_compression_size",
@@ -495,15 +445,15 @@ async def size_input_handler(event):
 
     target_bytes = parse_size_input(event.raw_text)
     if not target_bytes:
-        await event.reply("❌ Invalid size format!\n\nCorrect examples:\n• `15mb`\n• `800kb`\n• `1.5gb`", parse_mode='markdown')
+        await event.reply("❌ Invalid format!\n\nExamples:\n• `15mb`\n• `800kb`\n• `1.5gb`", parse_mode='markdown')
         return
 
     data = video_cache[video_id]
     if target_bytes >= data["original_size"]:
-        await event.reply("❌ Target size must be **smaller** than the original video size.", parse_mode='markdown')
+        await event.reply("❌ Target size must be **smaller** than original size.", parse_mode='markdown')
         return
 
-    status_msg = await event.reply(f"⚙️ Starting compression to ≈ {human_readable_size(target_bytes)}...")
+    status_msg = await event.reply(f"⚙️ Starting compression to {human_readable_size(target_bytes)}...")
 
     compressed_path, result = await compress_video(data["filepath"], target_bytes, status_msg)
 
@@ -513,14 +463,13 @@ async def size_input_handler(event):
             compressed_path,
             caption=f"✅ **Compressed Video**\n"
                     f"🎯 Requested: {human_readable_size(target_bytes)}\n"
-                    f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}\n"
-                    f"🔗 Original: {data['original_url']}",
+                    f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}",
             supports_streaming=True,
             parse_mode='markdown'
         )
         await status_msg.delete()
 
-        # پاک کردن فایل‌های موقت
+        # پاکسازی فایل‌ها
         try:
             os.remove(compressed_path)
             os.remove(data["filepath"])
@@ -529,20 +478,20 @@ async def size_input_handler(event):
     else:
         await safe_edit(status_msg, f"❌ Compression failed: {result}")
 
-    # پاک کردن حالت
+    # پاک کردن حالت کاربر و کش
     if event.chat_id in user_state:
         del user_state[event.chat_id]
     if video_id in video_cache:
         del video_cache[video_id]
 
 
-# ====================== PDF & HTML COMMANDS ======================
+# ====================== PDF & HTML PROCESSING ======================
 async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
 
-    status = await event.reply("📄 Converting webpage to PDF...", parse_mode='markdown')
+    status = await event.reply("📄 Converting to PDF...", parse_mode='markdown')
 
     try:
         if not url.startswith(('http://', 'https://')):
@@ -592,11 +541,10 @@ async def start_cmd(event):
         return await event.reply("⛔ Unauthorized")
     await event.reply(
         "🚀 **Ultimate Telegram Bot - Full Version**\n\n"
-        "Commands:\n"
-        "• `/dirpy <url>` → Download video (YouTube, XNXX, LuxureTV, Rule34, ...)\n"
+        "• `/dirpy <url>` → Download video + Compression option\n"
         "• `/pdf <url>` → Webpage to PDF\n"
-        "• `/html <url>` → Save full page as MHTML\n\n"
-        "After video is sent, click **🗜 Compress Video** button and send desired size (e.g: 15mb)",
+        "• `/html <url>` → Full webpage as MHTML\n\n"
+        "After video upload, click **🗜 Compress Video** and send size (e.g: 15mb)",
         parse_mode='markdown'
     )
 
@@ -654,8 +602,8 @@ async def generic_url_handler(event):
 # ====================== MAIN ======================
 async def main():
     print("\n" + "="*85)
-    print("🚀 ULTIMATE TELEGRAM BOT - FULL VERSION")
-    print("   With Smart Compression + Adult Sites Support")
+    print("🚀 ULTIMATE TELEGRAM BOT - FULL FIXED VERSION")
+    print("   Smart Compression + XNXX + LuxureTV + Rule34 Support")
     print("="*85)
 
     start_keep_alive()
