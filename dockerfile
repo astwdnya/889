@@ -16,8 +16,6 @@ ENV CHROMIUM_PATH=/usr/bin/chromium
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --upgrade yt-dlp  # اضافه شده برای آخرین نسخه
-
 COPY pdf_bot.py .
 EXPOSE 10000
 CMD ["python", "pdf_bot.py"]
