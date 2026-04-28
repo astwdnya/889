@@ -1,9 +1,7 @@
-# ================== Dockerfile for Render.com - Full Version ==================
-# این فایل برای اجرای بات با پشتیبانی کامل از Playwright، yt-dlp و فشرده‌سازی ویدیو با ffmpeg ساخته شده
-
+# ================== Dockerfile for Render.com - Fixed Version ==================
 FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
 
-# نصب ffmpeg (برای فشرده‌سازی ویدیو) و سایر وابستگی‌های سیستم
+# نصب ffmpeg و وابستگی‌های سیستم (فیکس شده برای Ubuntu Noble)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     fonts-liberation \
@@ -15,15 +13,14 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     libgbm1 \
-    libasound2 \
+    libasound2t64 \
+    libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
 
-# تنظیمات محیطی مهم
+# تنظیمات محیطی
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-
-# جلوگیری از نصب دوباره ffmpeg توسط yt-dlp (بهینه‌سازی)
 ENV PLAYWRIGHT_SKIP_FFMPEG_INSTALL=1
 
 WORKDIR /app
@@ -34,13 +31,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     playwright install chromium --with-deps
 
-# کپی کد اصلی بات
+# کپی کد بات
 COPY bot.py .
 
-# ایجاد پوشه خروجی با دسترسی کامل (مهم برای Render)
+# ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
 
 EXPOSE 10000
 
-# اجرای بات
 CMD ["python", "bot.py"]
