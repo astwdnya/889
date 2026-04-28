@@ -1,11 +1,7 @@
-telethon
+telethon>=1.36.0
 aiohttp
 aiofiles
-beautifulsoup4
 yt-dlp[default]
 playwright
 flask
-python-dotenv   # برای آینده (حتی اگر الان استفاده نکنی)
-
-# اختیاری اما توصیه می‌شود
-uvloop          # برای عملکرد بهتر asyncio
+uvloop
