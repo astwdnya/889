@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - FIXED VERSION v2
-# + Upload Progress Bar
-# + YouTube via Dirpy Fixed
-# + LuxureTV 403 Fixed (Origin header)
-# + StopPropagation Bug Fixed
+# Telegram Ultimate Bot - FIXED VERSION v3
+# + Pause/Cancel during download
+# + Upload progress bar FIXED (manual chunked upload)
 
 import asyncio
 import os
@@ -12,7 +10,6 @@ import sys
 import logging
 import time
 import json
-from datetime import datetime
 from urllib.parse import quote
 from typing import Optional, Tuple, Dict
 
@@ -23,12 +20,10 @@ import aiohttp
 import aiofiles
 from aiohttp import ClientTimeout
 
-import yt_dlp
 from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import Message
-from telethon.errors import MessageNotModifiedError
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
@@ -38,7 +33,6 @@ API_HASH = "b18441a1ff607e10a989891a5462e627"
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
 
 MAX_FILE_SIZE_MB = 2000
-DOWNLOAD_TIMEOUT = 300
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -46,6 +40,10 @@ HEALTH_PORT = int(os.environ.get('PORT', 10000))
 
 video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
+
+# فرهنگ لغت برای نگه داشتن وضعیت دانلودهای فعال
+# key: msg_id (str) → value: dict با کلیدهای "paused", "cancelled", "task"
+active_downloads: Dict[str, Dict] = {}
 
 # ====================== LOGGING ======================
 logging.basicConfig(
@@ -75,19 +73,6 @@ def human_readable_size(num_bytes: int) -> str:
         num_bytes /= 1024
     return f"{num_bytes:.2f} TB"
 
-def format_duration(seconds: Optional[float]) -> str:
-    if not seconds or seconds <= 0:
-        return "Unknown"
-    seconds = int(seconds)
-    if seconds < 60:
-        return f"{seconds}s"
-    elif seconds < 3600:
-        return f"{seconds//60}:{seconds%60:02d}"
-    else:
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        return f"{h}:{m:02d}"
-
 def safe_filename(title: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', title.strip()[:80]) or f"file_{int(time.time())}"
 
@@ -103,49 +88,52 @@ def parse_size_input(text: str) -> Optional[int]:
     elif unit == 'g': return int(num * 1024 * 1024 * 1024)
     return int(num)
 
-# ====================== PROGRESS HANDLER ======================
-class ProgressHandler:
-    def __init__(self, status_message: Message, total_size: int = 0, operation: str = "Downloading"):
-        self.status_message = status_message
-        self.total_size = total_size
-        self.operation = operation
-        self.last_update_time = 0
-        self.last_bytes = 0
-        self._lock = asyncio.Lock()
+# ====================== SAFE EDIT ======================
+async def safe_edit(msg: Message, text: str, buttons=None):
+    try:
+        if buttons is not None:
+            await msg.edit(text, parse_mode='markdown', buttons=buttons)
+        else:
+            await msg.edit(text, parse_mode='markdown')
+    except Exception:
+        pass
 
-    async def update(self, current_bytes: int):
-        async with self._lock:
-            now = time.time()
-            if now - self.last_update_time < 1.3 and current_bytes != self.total_size:
-                return
-            if self.total_size > 0:
-                percent = (current_bytes / self.total_size) * 100
-                speed = (current_bytes - self.last_bytes) / (now - self.last_update_time) if self.last_update_time > 0 else 0
-                eta = (self.total_size - current_bytes) / speed if speed > 0 else 0
-                bar = '█' * int(18 * current_bytes // self.total_size) + '░' * (18 - int(18 * current_bytes // self.total_size))
-                text = f"**{self.operation}**\n`[{bar}]` **{percent:.1f}%**\n📦 {human_readable_size(current_bytes)} / {human_readable_size(self.total_size)}\n🚀 {human_readable_size(int(speed))}/s"
-            else:
-                text = f"**{self.operation}...**\n📥 {human_readable_size(current_bytes)}"
-            try:
-                await self.status_message.edit(text, parse_mode='markdown')
-            except Exception:
-                pass
-            self.last_update_time = now
-            self.last_bytes = current_bytes
+# ====================== PROGRESS BAR BUILDER ======================
+def build_progress_text(operation: str, current: int, total: int, speed: float, start_time: float) -> str:
+    """یک متن پروگرس بار یکدست برای دانلود و آپلود می‌سازه."""
+    elapsed = time.time() - start_time
+    eta = (total - current) / speed if speed > 0 else 0
+    percent = (current / total) * 100 if total > 0 else 0
+    filled = int(18 * current // total) if total > 0 else 0
+    bar = '█' * filled + '░' * (18 - filled)
 
-    async def finish(self, success: bool, msg: str = ""):
-        try:
-            if success:
-                await self.status_message.delete()
-            else:
-                await self.status_message.edit(f"❌ {msg}", parse_mode='markdown')
-        except Exception:
-            pass
+    if eta < 60:
+        eta_str = f"{int(eta)}s"
+    elif eta < 3600:
+        eta_str = f"{int(eta // 60)}:{int(eta % 60):02d}"
+    else:
+        eta_str = f"{int(eta // 3600)}h{int((eta % 3600) // 60)}m"
 
-# ====================== DOWNLOAD FUNCTIONS ======================
-async def download_direct_with_progress(url: str, status_msg: Message, referer: Optional[str] = None) -> Tuple[Optional[str], Optional[str], int]:
+    return (
+        f"**{operation}**\n"
+        f"`[{bar}]` **{percent:.1f}%**\n"
+        f"📦 {human_readable_size(current)} / {human_readable_size(total)}\n"
+        f"🚀 {human_readable_size(int(speed))}/s  •  ⏱ {eta_str}"
+    )
+
+# ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
+async def download_with_controls(
+    url: str,
+    status_msg: Message,
+    dl_id: str,
+    referer: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str], int]:
+    """
+    دانلود با قابلیت Pause و Cancel.
+    dl_id: کلید یکتا که توی active_downloads ذخیره میشه.
+    """
     MAX_RETRIES = 3
-    CHUNK_SIZE = 512 * 1024  # 512KB chunks
+    CHUNK_SIZE = 512 * 1024
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
@@ -155,29 +143,38 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
     }
     if referer:
         headers['Referer'] = referer
-        # FIX: اضافه کردن Origin header برای رفع 403 روی LuxureTV و سایت‌های مشابه
         try:
-            origin = '/'.join(referer.split('/')[:3])
-            headers['Origin'] = origin
+            headers['Origin'] = '/'.join(referer.split('/')[:3])
         except Exception:
             pass
 
-    timeout = ClientTimeout(
-        total=None,
-        connect=30,
-        sock_read=120,
-    )
-
+    timeout = ClientTimeout(total=None, connect=30, sock_read=120)
     filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
     downloaded = 0
     total = 0
+    last_update = 0.0
+    last_bytes_for_speed = 0
+    last_time_for_speed = time.time()
+    start_time = time.time()
+
+    # مطمئن میشیم که dl_id توی active_downloads هست
+    if dl_id not in active_downloads:
+        active_downloads[dl_id] = {"paused": False, "cancelled": False}
+
+    dl_buttons_pause  = [[Button.inline("⏸ Pause",   f"dlpause_{dl_id}"), Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+    dl_buttons_resume = [[Button.inline("▶️ Resume", f"dlpause_{dl_id}"), Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    # دکمه‌ها رو از همون اول روی پیام نشون بده
+    await safe_edit(status_msg, "📥 Connecting...", buttons=dl_buttons_pause)
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             attempt_headers = headers.copy()
             if downloaded > 0:
                 attempt_headers['Range'] = f'bytes={downloaded}-'
-                await safe_edit(status_msg, f"🔄 Retry {attempt}/{MAX_RETRIES} — resuming from {human_readable_size(downloaded)}...")
+                await safe_edit(status_msg,
+                    f"🔄 Retry {attempt}/{MAX_RETRIES} — resuming from {human_readable_size(downloaded)}...",
+                    buttons=dl_buttons_pause)
 
             connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300, ssl=False)
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -188,8 +185,8 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                     if total == 0:
                         content_length = int(response.headers.get('content-length', 0))
                         if response.status == 206:
-                            content_range = response.headers.get('content-range', '')
-                            m = re.search(r'/(\d+)', content_range)
+                            cr = response.headers.get('content-range', '')
+                            m = re.search(r'/(\d+)', cr)
                             total = int(m.group(1)) if m else content_length + downloaded
                         else:
                             total = content_length
@@ -204,32 +201,81 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                                 ext = os.path.splitext(fm.group(1).strip())[1] or '.mp4'
                                 filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}{ext}")
 
-                    progress = ProgressHandler(status_msg, total, "📥 Downloading")
-                    progress.last_bytes = downloaded
-
                     write_mode = 'ab' if downloaded > 0 else 'wb'
                     async with aiofiles.open(filepath, write_mode) as f:
                         async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+
+                            # بررسی Cancel
+                            if active_downloads.get(dl_id, {}).get("cancelled"):
+                                try:
+                                    if os.path.exists(filepath):
+                                        os.remove(filepath)
+                                except Exception:
+                                    pass
+                                try:
+                                    await status_msg.edit("🚫 Download cancelled.", buttons=None)
+                                except Exception:
+                                    pass
+                                return None, "Cancelled by user", 0
+
+                            # بررسی Pause — منتظر میمونه تا Resume بشه
+                            if active_downloads.get(dl_id, {}).get("paused"):
+                                # یه بار پیام Paused نشون بده
+                                paused_text = build_progress_text("⏸ Paused", downloaded, total, 0, start_time)
+                                await safe_edit(status_msg, paused_text, buttons=dl_buttons_resume)
+                                while active_downloads.get(dl_id, {}).get("paused"):
+                                    if active_downloads.get(dl_id, {}).get("cancelled"):
+                                        try:
+                                            if os.path.exists(filepath):
+                                                os.remove(filepath)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            await status_msg.edit("🚫 Download cancelled.", buttons=None)
+                                        except Exception:
+                                            pass
+                                        return None, "Cancelled by user", 0
+                                    await asyncio.sleep(0.5)
+                                # Resume شد — دکمه رو برگردون
+                                last_update = 0.0  # فوری یه آپدیت بده
+
                             await f.write(chunk)
                             downloaded += len(chunk)
-                            await progress.update(downloaded)
 
-            await progress.finish(True, "")
+                            now = time.time()
+                            if now - last_update >= 1.5 and downloaded != total:
+                                dt = now - last_time_for_speed
+                                speed = (downloaded - last_bytes_for_speed) / dt if dt > 0 else 0
+                                last_bytes_for_speed = downloaded
+                                last_time_for_speed = now
+                                last_update = now
+
+                                text = build_progress_text("📥 Downloading", downloaded, total, speed, start_time)
+                                await safe_edit(status_msg, text, buttons=dl_buttons_pause)
+
+            # دانلود تموم شد
+            active_downloads.pop(dl_id, None)
+            try:
+                await status_msg.edit("✅ Download complete!", parse_mode='markdown', buttons=None)
+            except Exception:
+                pass
             return filepath, None, downloaded
 
         except (aiohttp.ClientError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
-            logger.warning(f"Download attempt {attempt} failed at {human_readable_size(downloaded)}: {e}")
+            logger.warning(f"Download attempt {attempt} failed: {e}")
             if attempt == MAX_RETRIES:
+                active_downloads.pop(dl_id, None)
                 try:
                     if os.path.exists(filepath):
                         os.remove(filepath)
                 except Exception:
                     pass
-                return None, f"Download failed after {MAX_RETRIES} retries: {str(e)[:80]}", 0
+                return None, f"Failed after {MAX_RETRIES} retries: {str(e)[:80]}", 0
             await asyncio.sleep(3)
 
         except Exception as e:
             logger.error(f"Unexpected download error: {e}")
+            active_downloads.pop(dl_id, None)
             try:
                 if os.path.exists(filepath):
                     os.remove(filepath)
@@ -237,123 +283,191 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                 pass
             return None, str(e)[:100], 0
 
+    active_downloads.pop(dl_id, None)
     return None, "Download failed", 0
 
 
-def is_video_url(url: str) -> bool:
-    """Check if a request URL looks like a direct video stream."""
-    u = url.lower()
+# ====================== PAUSE / CANCEL CALLBACKS ======================
+@events.register(events.CallbackQuery(pattern=r"dlpause_(.+)"))
+async def dl_pause_callback(event):
+    dl_id = event.data.decode().replace("dlpause_", "")
+    if dl_id not in active_downloads:
+        return await event.answer("No active download found.", alert=True)
 
-    SKIP_KEYWORDS = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite', 'storyboard', 'ad', 'tracking', 'analytics', 'pixel']
+    state = active_downloads[dl_id]
+    if state.get("paused"):
+        # Resume — loop داخل download خودش دکمه رو عوض میکنه
+        state["paused"] = False
+        await event.answer("▶️ Resumed!", alert=False)
+    else:
+        # Pause — loop داخل download خودش دکمه رو عوض میکنه
+        state["paused"] = True
+        await event.answer("⏸ Paused!", alert=False)
 
-    SITE_PATTERNS = [
-        ('xnxx-cdn.com',         lambda u: 'mp4' in u),
-        ('xnxx.com',             lambda u: 'mp4' in u and '/videos/' in u),
-        ('media4.luxuretv.com',  lambda u: '.mp4' in u),
-        ('media.luxuretv.com',   lambda u: '.mp4' in u),
-        ('luxuretv.com',         lambda u: '.mp4' in u and any(m in u for m in ['media', 'cdn', 'video', 'stream'])),
-        ('rule34.xxx',           lambda u: '.mp4' in u or ('video' in u and 'api' not in u)),
-        ('rule34video.com',      lambda u: '.mp4' in u),
-        ('rdtcdn.com',           lambda u: '.mp4' in u),
-        ('ev-ph.rdtcdn.com',     lambda u: '.mp4' in u),
-        ('redtube.com',          lambda u: '.mp4' in u),
-        ('phncdn.com',           lambda u: '.mp4' in u),
-        ('pornhub.com',          lambda u: '.mp4' in u and 'cdn' in u),
-        ('ahrimp4',              lambda u: True),
-        ('media4',               lambda u: '.mp4' in u),
-        # FIX: اضافه کردن یوتیوب
-        ('googlevideo.com',      lambda u: 'videoplayback' in u),
+
+@events.register(events.CallbackQuery(pattern=r"dlcancel_(.+)"))
+async def dl_cancel_callback(event):
+    dl_id = event.data.decode().replace("dlcancel_", "")
+    if dl_id not in active_downloads:
+        return await event.answer("No active download found.", alert=True)
+
+    active_downloads[dl_id]["cancelled"] = True
+    active_downloads[dl_id]["paused"] = False  # از pause خارج بشه تا cancel بره جلو
+    await event.answer("❌ Cancelling...", alert=False)
+    try:
+        await event.edit(buttons=None)
+    except Exception:
+        pass
+
+
+# ====================== UPLOAD WITH REAL PROGRESS ======================
+async def send_file_with_progress(
+    client,
+    chat_id: int,
+    filepath: str,
+    caption: str,
+    status_msg: Message,
+    buttons=None,
+    supports_streaming: bool = True
+):
+    """
+    آپلود فایل با پروگرس بار واقعی.
+    مرحله ۱: upload_file (آپلود به سرور تلگرام) — پروگرس نشون میده
+    مرحله ۲: send_file با فایل از پیش آپلودشده — فوری ارسال میشه
+    این روش برای همه سایزها کار میکنه چون progress_callback رو مستقیم کنترل میکنیم.
+    """
+    file_size = os.path.getsize(filepath)
+    start_time = time.time()
+    last_update = [0.0]
+    last_bytes = [0]
+    last_time = [start_time]
+
+    async def progress_cb(current: int, total: int):
+        now = time.time()
+        # هر ۱.۵ ثانیه یه بار آپدیت — نه بیشتر که flood بشه
+        if now - last_update[0] < 1.5 and current != total:
+            return
+        last_update[0] = now
+
+        dt = now - last_time[0]
+        speed = (current - last_bytes[0]) / dt if dt > 0 else 0
+        last_bytes[0] = current
+        last_time[0] = now
+
+        text = build_progress_text("📤 Uploading", current, total, speed, start_time)
+        try:
+            await status_msg.edit(text, parse_mode='markdown')
+        except Exception:
+            pass
+
+    # مرحله ۱: آپلود فایل به سرور تلگرام با پروگرس
+    uploaded = await client.upload_file(
+        filepath,
+        file_size=file_size,
+        progress_callback=progress_cb
+    )
+
+    # مرحله ۲: ارسال پیام با فایل آپلودشده
+    await client.send_file(
+        chat_id,
+        uploaded,
+        caption=caption,
+        supports_streaming=supports_streaming,
+        buttons=buttons,
+        parse_mode='markdown',
+    )
+
+    # پاک کردن پیام وضعیت بعد از اتمام
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+
+# ====================== DOWNLOAD AND SEND ======================
+async def do_download_and_send(event, status_msg, direct_url: str, source_url: str):
+    """دانلود با Pause/Cancel و آپلود با پروگرس بار."""
+
+    dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+
+    filepath, dl_error, final_size = await download_with_controls(
+        direct_url, status_msg, dl_id, referer=source_url
+    )
+
+    if dl_error or not filepath:
+        if dl_error != "Cancelled by user":
+            await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
+        return
+
+    video_id = f"vid_{event.chat_id}_{int(time.time())}"
+    video_cache[video_id] = {
+        "filepath": filepath,
+        "chat_id": event.chat_id,
+        "original_size": final_size,
+        "original_url": source_url
+    }
+
+    after_buttons = [
+        [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
+        [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
     ]
 
-    if any(k in u for k in SKIP_KEYWORDS):
-        return False
+    await safe_edit(status_msg, "📤 Uploading...")
 
-    for domain, check in SITE_PATTERNS:
-        if domain in u and check(u):
-            return True
+    try:
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=filepath,
+            caption=(
+                f"🎬 **Video Downloaded**\n"
+                f"📦 Size: {human_readable_size(final_size)}\n"
+                f"🔗 [Source]({source_url})\n"
+                f"⬇️ [DW Link]({direct_url})"
+            ),
+            status_msg=status_msg,
+            buttons=after_buttons,
+            supports_streaming=True
+        )
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
 
-    GENERIC_CDN_SIGNALS = ['-cdn', 'media', 'video', 'stream', 'content', 'storage', 'ev-', 'cdn-', '.cdn']
-    if '.mp4' in u and any(sig in u for sig in GENERIC_CDN_SIGNALS):
-        return True
 
-    for ext in ['.webm', '.m3u8', '.ts', '.mkv']:
-        if ext in u and any(sig in u for sig in GENERIC_CDN_SIGNALS):
-            return True
+# ====================== GET FILE SIZE ======================
+async def get_file_size(url: str) -> int:
+    try:
+        timeout = ClientTimeout(connect=10, sock_read=10, total=15)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, headers=headers, allow_redirects=True, ssl=False) as resp:
+                return int(resp.headers.get('content-length', 0))
+    except Exception:
+        return 0
 
-    return False
+
+def _url_label(url: str, size: int, index: int) -> str:
+    u = url.lower()
+    quality = "Unknown"
+    for q in ['2160p', '1080p', '720p', '480p', '360p', '240p', '4k', 'hd', 'sd']:
+        if q in u:
+            quality = q.upper()
+            break
+    sz_str = human_readable_size(size) if size > 0 else "? MB"
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.replace('www.', '')[:20]
+    except Exception:
+        domain = f"Link {index+1}"
+    return f"#{index+1} {quality} • {sz_str} • {domain}"
 
 
-# ====================== LUXURETV DIRECT EXTRACTOR ======================
-async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
-    """مستقیماً از سورس صفحه سایت همه لینک‌های mp4 رو جمع میکنه."""
-    async with async_playwright() as p:
-        browser = None
-        try:
-            await safe_edit(status_msg, "🔍 Extracting video sources directly...")
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-            )
-            page = await context.new_page()
-
-            captured_urls: list = []
-            seen: set = set()
-
-            async def on_response(response):
-                rurl = response.url.lower()
-                content_type = response.headers.get('content-type', '')
-                content_length = int(response.headers.get('content-length', 0))
-                skip = ['thumb', 'preview', 'poster', 'banner', 'sprite', 'storyboard']
-                is_video_response = ('video' in content_type or 'octet-stream' in content_type)
-                is_cdn_mp4 = '.mp4' in rurl and any(s in rurl for s in [
-                    'media', 'cdn', 'rdtcdn', 'ev-', 'stream',
-                    'p300cdn', 'p300', 'xvideos-cdn', 'xhamster',
-                    'phncdn', 'xnxx-cdn',
-                ])
-                if (is_video_response or is_cdn_mp4) and content_length > 500 * 1024 and not any(k in rurl for k in skip):
-                    url_norm = response.url.split('?')[0]
-                    if url_norm not in seen:
-                        seen.add(url_norm)
-                        captured_urls.append(response.url)
-                        logger.info(f"[DIRECT] Captured: {response.url[:200]}")
-
-            page.on('response', on_response)
-
-            await page.goto(video_url, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_timeout(5000)
-            await page.evaluate('() => { const v = document.querySelector("video"); if(v) { v.muted=true; v.play(); } }')
-            await page.wait_for_timeout(8000)
-
-            if not captured_urls:
-                html = await page.content()
-                pat1 = re.compile(r'https?://\S+?\.mp4(?:\?\S+)?')
-                for m in pat1.findall(html):
-                    ml = m.lower()
-                    url_norm = m.split('?')[0]
-                    if url_norm not in seen and not any(k in ml for k in ['thumb', 'preview', 'poster']):
-                        seen.add(url_norm)
-                        captured_urls.append(m)
-
-            if captured_urls:
-                return captured_urls, None
-            return [], "Could not find video source"
-        except Exception as e:
-            logger.error(f"Direct extract error: {e}")
-            return [], str(e)
-        finally:
-            if browser:
-                await browser.close()
-
+# ====================== LUXURETV / DIRPY EXTRACTOR ======================
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
-    """
-    فقط از Dirpy استفاده میکنه - هیچ وقت به سایت اصلی مراجعه نمیکنه.
-    فیلتر سایز: فقط فایل‌های > 1MB یا CDN‌های شناخته‌شده.
-
-    FIX: اضافه شدن googlevideo.com برای یوتیوب
-    """
     SKIP = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite',
             'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
-    MIN_SIZE = 2 * 1024 * 1024  # حداقل 2MB
+    MIN_SIZE = 2 * 1024 * 1024
 
     async with async_playwright() as p:
         browser = None
@@ -392,51 +506,37 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                             rul = ru.lower()
                             if any(k in rul for k in SKIP):
                                 return
-
-                            # شرط ۱: content-type ویدیو + حجم بالای MIN_SIZE
                             if ('video/' in ct) and cl > MIN_SIZE:
                                 add_url(ru, f"RESP-CT {label}")
                                 return
-
-                            # FIX: لیست CDN‌های شناخته‌شده - اضافه شدن googlevideo.com برای یوتیوب
                             is_cdn = any(d in rul for d in [
                                 'rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
                                 'media4.luxuretv', 'media.luxuretv',
                                 'rule34.xxx', 'rule34video',
                                 'kv-ph.', 'ev-ph.', 'di-ph.',
-                                'googlevideo.com',   # ← یوتیوب
-                                'videoplayback',     # ← یوتیوب fallback
+                                'googlevideo.com',
+                                'videoplayback',
                             ])
-
-                            # FIX: شرط mp4 یا videoplayback (برای یوتیوب که extension نداره)
                             is_video_path = '.mp4' in rul or 'videoplayback' in rul
-
                             if is_cdn and is_video_path:
-                                # اگه content-length داره باید بالای MIN_SIZE باشه
-                                # یوتیوب معمولاً content-length نمیده پس cl==0 رو قبول میکنیم
                                 if cl == 0 or cl > MIN_SIZE:
                                     add_url(ru, f"RESP-CDN {label}")
                         except Exception:
                             pass
 
                     page.on('response', on_response)
-
                     await page.goto(target_url, wait_until='domcontentloaded', timeout=60000)
                     await page.wait_for_timeout(7000)
-
                     if not captured_urls:
                         await page.evaluate('() => { try { document.querySelector("video")?.play(); } catch(e){} }')
                         await page.wait_for_timeout(8000)
-
                     if not captured_urls:
-                        # scan HTML برای CDN لینک‌های شناخته‌شده
                         html = await page.content()
                         cdn_domains = ['rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
                                        'media4.luxuretv', 'media.luxuretv',
                                        'kv-ph.', 'ev-ph.', 'di-ph.',
-                                       'rule34video', 'p300cdn',
-                                       'googlevideo.com']  # ← یوتیوب
-                        for m in re.findall(r"https?://[^\x22\x27<>\s]+[^\x22\x27<>\s]*", html):
+                                       'rule34video', 'p300cdn', 'googlevideo.com']
+                        for m in re.findall(r"https?://[^\x22\x27<>\s]+", html):
                             ml = m.lower()
                             if any(d in ml for d in cdn_domains):
                                 if '.mp4' in ml or 'videoplayback' in ml:
@@ -460,6 +560,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 await browser.close()
 
 
+# ====================== HTML TO PDF ======================
 async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
     async with async_playwright() as p:
         browser = None
@@ -474,36 +575,22 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
                 await page.goto(url, wait_until="domcontentloaded", timeout=120000)
             except Exception:
                 pass
-
             try:
                 age_selectors = [
-                    'button:has-text("I AM 18")',
-                    'button:has-text("I am 18")',
-                    'button:has-text("ENTER")',
-                    'button:has-text("Enter")',
-                    'button:has-text("over 18")',
-                    'button:has-text("Yes")',
-                    'button:has-text("Confirm")',
-                    'a:has-text("I AM 18")',
-                    'a:has-text("ENTER")',
-                    '.age-gate button',
-                    '#age-gate button',
-                    '[class*="age"] button',
-                    'button.y',
+                    'button:has-text("I AM 18")', 'button:has-text("ENTER")',
+                    'button:has-text("Yes")', '.age-gate button',
                 ]
                 for sel in age_selectors:
                     try:
                         el = page.locator(sel).first
                         if await el.is_visible(timeout=1000):
                             await el.click()
-                            logger.info(f"Age gate bypassed with: {sel}")
                             await asyncio.sleep(2)
                             break
                     except Exception:
                         continue
             except Exception:
                 pass
-
             await safe_edit(status_msg, "📜 Scrolling to load all images...")
             await page.evaluate("""
                 async () => {
@@ -521,19 +608,12 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
                 }
             """)
             await asyncio.sleep(4)
-
             await safe_edit(status_msg, "📄 Rendering PDF...")
             filepath = os.path.join(OUTPUT_FOLDER, f"pdf_{int(time.time())}.pdf")
-            await page.pdf(
-                path=filepath,
-                format="A4",
-                print_background=True,
-                margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"}
-            )
-            size = os.path.getsize(filepath)
-            return filepath, None, size
+            await page.pdf(path=filepath, format="A4", print_background=True,
+                           margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"})
+            return filepath, None, os.path.getsize(filepath)
         except Exception as e:
-            logger.error(f"PDF Error: {e}")
             return None, f"PDF Error: {str(e)[:80]}", 0
         finally:
             if browser:
@@ -545,28 +625,22 @@ async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], O
     async with async_playwright() as p:
         browser = None
         try:
-            await status_msg.edit("🌐 Capturing full webpage as MHTML...")
+            await safe_edit(status_msg, "🌐 Capturing full webpage as MHTML...")
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
             context = await browser.new_context()
             page = await context.new_page()
             await page.goto(url, wait_until="networkidle", timeout=60000)
             await asyncio.sleep(3)
-
             client = await context.new_cdp_session(page)
             result = await client.send("Page.captureSnapshot", {"format": "mhtml"})
             mhtml_data = result.get("data", "")
-
             if not mhtml_data:
                 return None, "Failed to capture MHTML", 0
-
             filepath = os.path.join(OUTPUT_FOLDER, f"page_{int(time.time())}.mhtml")
             async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
                 await f.write(mhtml_data)
-
-            size = os.path.getsize(filepath)
-            return filepath, None, size
+            return filepath, None, os.path.getsize(filepath)
         except Exception as e:
-            logger.error(f"MHTML Error: {e}")
             return None, f"MHTML Error: {str(e)[:80]}", 0
         finally:
             if browser:
@@ -574,205 +648,165 @@ async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], O
 
 
 # ====================== VIDEO COMPRESSION ======================
-async def compress_video(input_path: str, target_size_bytes: int, status_msg: Message) -> Tuple[Optional[str], str]:
-    output_path = input_path.replace(".mp4", f"_compressed_{int(target_size_bytes/1024/1024)}mb.mp4")
+async def _run_ffmpeg(args: list) -> Tuple[int, str]:
+    """اجرای ffmpeg و برگرداندن returncode + stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await proc.communicate()
+    return proc.returncode, stderr.decode(errors='replace')
 
-    await safe_edit(status_msg, f"⚙️ Compressing video to ≈ {human_readable_size(target_size_bytes)}...")
+
+async def get_video_duration(input_path: str) -> Optional[float]:
+    """مدت زمان ویدیو رو با ffprobe میگیره."""
+    proc = await asyncio.create_subprocess_exec(
+        'ffprobe', '-v', 'quiet',
+        '-print_format', 'json',
+        '-show_format', '-show_streams',
+        input_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(stdout.decode())
+        # اول از format میخونه، اگه نبود از stream
+        dur = info.get('format', {}).get('duration')
+        if dur:
+            return float(dur)
+        for s in info.get('streams', []):
+            if s.get('duration'):
+                return float(s['duration'])
+    except Exception:
+        pass
+    return None
+
+
+async def compress_video(input_path: str, target_size_bytes: int, status_msg: Message) -> Tuple[Optional[str], str]:
+    """
+    فشرده‌سازی ویدیو به حجم هدف با two-pass encoding.
+    - پاس اول: آنالیز ویدیو
+    - پاس دوم: رندر نهایی با bitrate محاسبه‌شده
+    حتی برای 1MB هم کار میکنه (کیفیت رو تا جایی که لازمه کم میکنه).
+    """
+    target_mb = target_size_bytes / 1024 / 1024
+    output_path = os.path.join(
+        OUTPUT_FOLDER,
+        f"compressed_{int(target_mb)}mb_{int(time.time())}.mp4"
+    )
+    # فایل‌های موقت two-pass
+    passlog = os.path.join(OUTPUT_FOLDER, f"passlog_{int(time.time())}")
+
+    await safe_edit(status_msg, f"🔍 Analyzing video...")
 
     try:
-        cmd_duration = f'ffprobe -v quiet -print_format json -show_format "{input_path}"'
-        proc = await asyncio.create_subprocess_shell(
-            cmd_duration,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        # ── مرحله ۱: گرفتن مدت زمان ──────────────────────────────────
+        duration = await get_video_duration(input_path)
+        if not duration or duration <= 0:
+            return None, "Could not read video duration. Is ffprobe installed?"
+
+        # ── مرحله ۲: محاسبه bitrate هدف ──────────────────────────────
+        # فرمول: (target_bytes * 8 bits) / duration_seconds
+        # 128kbps برای صدا رزرو میکنیم، بقیه برای ویدیو
+        audio_bitrate_bps = 64_000   # برای حجم‌های خیلی کم audio رو هم کم میکنیم
+        if target_size_bytes > 20 * 1024 * 1024:
+            audio_bitrate_bps = 128_000
+
+        total_bitrate_bps  = int((target_size_bytes * 8) / duration * 0.95)
+        video_bitrate_bps  = max(total_bitrate_bps - audio_bitrate_bps, 10_000)  # حداقل ۱۰kbps
+        audio_bitrate_k    = audio_bitrate_bps // 1000
+
+        await safe_edit(
+            status_msg,
+            f"⚙️ Compressing to ≈ {human_readable_size(target_size_bytes)}\n"
+            f"📊 Duration: {int(duration)}s  |  Video bitrate: {video_bitrate_bps//1000}kbps\n"
+            f"🔄 Pass 1/2..."
         )
-        stdout, _ = await proc.communicate()
-        info = json.loads(stdout.decode())
-        duration = float(info['format']['duration'])
 
-        target_bitrate = int((target_size_bytes * 8) / duration * 0.92)
-
-        cmd = [
-            'ffmpeg', '-i', input_path,
-            '-vcodec', 'libx264', '-crf', '28',
-            '-b:v', str(target_bitrate),
-            '-preset', 'medium',
-            '-acodec', 'aac', '-b:a', '128k',
-            '-y', output_path
+        # ── مرحله ۳: Two-Pass Pass 1 ──────────────────────────────────
+        pass1_args = [
+            'ffmpeg', '-y',
+            '-i', input_path,
+            '-c:v', 'libx264',
+            '-b:v', str(video_bitrate_bps),
+            '-pass', '1',
+            '-passlogfile', passlog,
+            '-an',                  # بدون صدا در پاس اول
+            '-f', 'null', '/dev/null'
         ]
+        rc, err = await _run_ffmpeg(pass1_args)
+        if rc != 0:
+            # اگه two-pass شکست خورد، single-pass امتحان میکنیم
+            logger.warning(f"Two-pass pass1 failed, trying single-pass. Error: {err[:200]}")
+            await safe_edit(status_msg, f"⚙️ Single-pass encoding...")
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await process.communicate()
+            sp_args = [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-b:v', str(video_bitrate_bps),
+                '-preset', 'fast',
+                '-c:a', 'aac',
+                '-b:a', f'{audio_bitrate_k}k',
+                '-movflags', '+faststart',
+                output_path
+            ]
+            rc2, err2 = await _run_ffmpeg(sp_args)
+            if rc2 != 0:
+                return None, f"FFmpeg error: {err2[-300:]}"
+        else:
+            # ── مرحله ۴: Two-Pass Pass 2 ──────────────────────────────
+            await safe_edit(
+                status_msg,
+                f"⚙️ Compressing to ≈ {human_readable_size(target_size_bytes)}\n"
+                f"📊 Duration: {int(duration)}s  |  Video bitrate: {video_bitrate_bps//1000}kbps\n"
+                f"🔄 Pass 2/2..."
+            )
+            pass2_args = [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-b:v', str(video_bitrate_bps),
+                '-pass', '2',
+                '-passlogfile', passlog,
+                '-preset', 'fast',
+                '-c:a', 'aac',
+                '-b:a', f'{audio_bitrate_k}k',
+                '-movflags', '+faststart',
+                output_path
+            ]
+            rc, err = await _run_ffmpeg(pass2_args)
+            if rc != 0:
+                return None, f"FFmpeg pass2 error: {err[-300:]}"
 
-        if process.returncode != 0:
-            logger.error(f"FFmpeg Error: {stderr.decode()[:300]}")
-            return None, "FFmpeg compression failed"
+        # ── مرحله ۵: بررسی نتیجه ──────────────────────────────────────
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            return None, "Output file is empty or missing."
 
         final_size = os.path.getsize(output_path)
-        return output_path, f"Compressed to {human_readable_size(final_size)}"
+        return output_path, f"✅ Compressed: {human_readable_size(final_size)}"
 
+    except FileNotFoundError:
+        return None, "ffmpeg/ffprobe not found. Please install ffmpeg on the server."
     except Exception as e:
-        logger.error(f"Compression error: {e}")
-        return None, str(e)
+        logger.error(f"Compression error: {e}", exc_info=True)
+        return None, f"Unexpected error: {str(e)[:150]}"
+    finally:
+        # پاک کردن فایل‌های موقت two-pass
+        for ext in ['.log', '-0.log', '-0.log.mbtree']:
+            try:
+                p = passlog + ext
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 
-# ====================== SAFE EDIT ======================
-async def safe_edit(msg: Message, text: str):
-    try:
-        await msg.edit(text, parse_mode='markdown')
-    except Exception:
-        pass
-
-
-# ====================== GET FILE SIZE VIA HEAD ======================
-async def get_file_size(url: str) -> int:
-    """حجم فایل رو با HEAD request میگیره."""
-    try:
-        timeout = ClientTimeout(connect=10, sock_read=10, total=15)
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(url, headers=headers, allow_redirects=True, ssl=False) as resp:
-                return int(resp.headers.get('content-length', 0))
-    except Exception:
-        return 0
-
-
-def _url_label(url: str, size: int, index: int) -> str:
-    """لیبل دکمه برای هر لینک."""
-    u = url.lower()
-    quality = "Unknown"
-    for q in ['2160p', '1080p', '720p', '480p', '360p', '240p', '4k', 'hd', 'sd', 'hq', 'lq']:
-        if q in u:
-            quality = q.upper()
-            break
-    sz_str = human_readable_size(size) if size > 0 else "? MB"
-    try:
-        from urllib.parse import urlparse
-        domain = urlparse(url).netloc.replace('www.', '')[:20]
-    except Exception:
-        domain = f"Link {index+1}"
-    return f"#{index+1} {quality} • {sz_str} • {domain}"
-
-
-# ====================== UPLOAD WITH PROGRESS BAR ======================
-async def send_file_with_progress(
-    client,
-    chat_id: int,
-    filepath: str,
-    caption: str,
-    status_msg: Message,
-    buttons=None,
-    supports_streaming: bool = True
-):
-    """
-    ارسال فایل به تلگرام با پروگرس بار آپلود.
-    کاربر میتونه ببینه چند درصد آپلود شده، سرعت چقدره، و چقدر زمان مونده.
-    """
-    file_size = os.path.getsize(filepath)
-    start_time = time.time()
-    last_update = [0.0]  # list به جای nonlocal برای سازگاری بیشتر
-
-    async def upload_progress_callback(current: int, total: int):
-        now = time.time()
-        # هر ۲ ثانیه یه بار آپدیت میکنیم - نه خیلی زیاد که flood بشه
-        if now - last_update[0] < 2.0 and current != total:
-            return
-        last_update[0] = now
-
-        elapsed = now - start_time
-        speed = current / elapsed if elapsed > 0 else 0
-        eta = (total - current) / speed if speed > 0 else 0
-        percent = (current / total) * 100 if total > 0 else 0
-        filled = int(18 * current // total) if total > 0 else 0
-        bar = '█' * filled + '░' * (18 - filled)
-
-        # فرمت زمان باقیمانده
-        if eta < 60:
-            eta_str = f"{int(eta)}s"
-        elif eta < 3600:
-            eta_str = f"{int(eta // 60)}:{int(eta % 60):02d}"
-        else:
-            eta_str = f"{int(eta // 3600)}h {int((eta % 3600) // 60)}m"
-
-        text = (
-            f"**📤 Uploading...**\n"
-            f"`[{bar}]` **{percent:.1f}%**\n"
-            f"📦 {human_readable_size(current)} / {human_readable_size(total)}\n"
-            f"🚀 {human_readable_size(int(speed))}/s  •  ⏱ {eta_str}"
-        )
-        try:
-            await status_msg.edit(text, parse_mode='markdown')
-        except Exception:
-            pass
-
-    await client.send_file(
-        chat_id,
-        filepath,
-        caption=caption,
-        supports_streaming=supports_streaming,
-        buttons=buttons,
-        parse_mode='markdown',
-        progress_callback=upload_progress_callback
-    )
-
-
-# ====================== DOWNLOAD AND SEND ======================
-async def do_download_and_send(event, status_msg, direct_url: str, source_url: str):
-    """دانلود و ارسال ویدیو به کاربر - با پروگرس بار هم دانلود هم آپلود."""
-    await safe_edit(status_msg, "📥 Downloading video...")
-    filepath, dl_error, final_size = await download_direct_with_progress(direct_url, status_msg, referer=source_url)
-
-    if dl_error or not filepath:
-        await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
-        return
-
-    video_id = f"vid_{event.chat_id}_{int(time.time())}"
-    video_cache[video_id] = {
-        "filepath": filepath,
-        "chat_id": event.chat_id,
-        "original_size": final_size,
-        "original_url": source_url
-    }
-
-    buttons = [
-        [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
-        [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
-    ]
-
-    # نشون دادن پیام شروع آپلود
-    await safe_edit(status_msg, "📤 Uploading...")
-
-    try:
-        # آپلود با پروگرس بار
-        await send_file_with_progress(
-            client=event.client,
-            chat_id=event.chat_id,
-            filepath=filepath,
-            caption=(
-                f"🎬 **Video Downloaded**\n"
-                f"📦 Size: {human_readable_size(final_size)}\n"
-                f"🔗 [Source]({source_url})\n"
-                f"⬇️ [DW Link]({direct_url})"
-            ),
-            status_msg=status_msg,
-            buttons=buttons,
-            supports_streaming=True
-        )
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        return
-
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-
-
+# ====================== DIRPY FLOW ======================
 processing_messages = set()
 
 async def process_dirpy_request(event, url: str):
@@ -780,50 +814,32 @@ async def process_dirpy_request(event, url: str):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-
     status_msg = await event.reply("🔄 Starting Dirpy extraction...", parse_mode='markdown')
-
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
-
         found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
-
         if not found_urls:
             await safe_edit(status_msg, f"❌ Could not capture video via Dirpy:\n{intercept_err}")
             return
-
         if len(found_urls) == 1:
             await do_download_and_send(event, status_msg, found_urls[0], url)
             return
-
         await safe_edit(status_msg, f"🔍 Found {len(found_urls)} links, checking sizes...")
         sized_urls = []
         for u in found_urls:
             sz = await get_file_size(u)
             sized_urls.append((u, sz))
-
         pick_id = f"pick_{event.chat_id}_{int(time.time())}"
-        video_cache[pick_id] = {
-            "urls": sized_urls,
-            "source_url": url,
-            "chat_id": event.chat_id
-        }
-
-        buttons = []
-        for i, (u, sz) in enumerate(sized_urls):
-            label = _url_label(u, sz, i)
-            buttons.append([Button.inline(label, f"pickurl_{pick_id}_{i}")])
-
+        video_cache[pick_id] = {"urls": sized_urls, "source_url": url, "chat_id": event.chat_id}
+        buttons = [[Button.inline(_url_label(u, sz, i), f"pickurl_{pick_id}_{i}")] for i, (u, sz) in enumerate(sized_urls)]
         await safe_edit(status_msg, "📋 **Select video to download:**")
         await event.client.send_message(
             event.chat_id,
             f"🎬 Found **{len(sized_urls)}** video links for:\n{url}\n\nChoose one to download:",
-            buttons=buttons,
-            parse_mode='markdown'
+            buttons=buttons, parse_mode='markdown'
         )
         await status_msg.delete()
-
     except Exception as e:
         logger.error(f"Dirpy process error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ Unexpected error: {str(e)[:120]}")
@@ -834,20 +850,18 @@ async def process_dirpy_request(event, url: str):
 # ====================== CALLBACK HANDLERS ======================
 @events.register(events.CallbackQuery(pattern=r"compress_(.+)"))
 async def compress_callback(event):
-    video_id = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
+    video_id = event.data.decode().replace("compress_", "")
     if video_id not in video_cache:
         return await event.answer("Video not found or expired.", alert=True)
-
     await event.answer("Send desired size (e.g: 15mb or 800kb)", alert=False)
     user_state[event.chat_id] = {"action": "wait_for_compression_size", "video_id": video_id}
 
 
 @events.register(events.CallbackQuery(pattern=r"check_(.+)"))
 async def check_callback(event):
-    video_id = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
+    video_id = event.data.decode().replace("check_", "")
     if video_id not in video_cache:
         return await event.answer("Video already deleted.", alert=True)
-
     data = video_cache[video_id]
     try:
         if os.path.exists(data["filepath"]):
@@ -855,42 +869,29 @@ async def check_callback(event):
         await event.answer("✅ Video deleted from server.", alert=False)
         await event.edit(buttons=None)
     except Exception as e:
-        logger.error(f"Delete error: {e}")
         await event.answer("Error deleting file.", alert=True)
-
-    if video_id in video_cache:
-        del video_cache[video_id]
+    video_cache.pop(video_id, None)
 
 
 @events.register(events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$"))
 async def pickurl_callback(event):
-    raw = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
-    idx_raw = event.pattern_match.group(2).decode() if isinstance(event.pattern_match.group(2), bytes) else event.pattern_match.group(2)
-    pick_id = raw
-    idx = int(idx_raw)
-
+    parts = event.data.decode().rsplit("_", 1)
+    idx = int(parts[1])
+    pick_id = parts[0].replace("pickurl_", "")
     if pick_id not in video_cache:
         return await event.answer("Session expired. Please resend /dirpy command.", alert=True)
-
     data = video_cache[pick_id]
-    urls = data["urls"]
-
-    if idx >= len(urls):
+    if idx >= len(data["urls"]):
         return await event.answer("Invalid selection.", alert=True)
-
-    chosen_url, _ = urls[idx]
+    chosen_url, _ = data["urls"][idx]
     source_url = data["source_url"]
-
     await event.answer(f"Starting download #{idx+1}...", alert=False)
-
     try:
         await event.delete()
     except Exception:
         pass
-
     status_msg = await event.client.send_message(event.chat_id, "📥 Starting download...")
     del video_cache[pick_id]
-
     await do_download_and_send(event, status_msg, chosen_url, source_url)
 
 
@@ -901,13 +902,9 @@ async def size_input_handler(event):
         return
     if event.chat_id not in user_state:
         return
-
     state = user_state.get(event.chat_id)
     if not state or state.get("action") != "wait_for_compression_size":
         return
-
-    # FIX: StopPropagation باید آخر بیاد تا منطق اصلی اجرا بشه
-    # قبلاً اول بود و هیچ‌وقت کد زیرش اجرا نمیشد!
 
     video_id = state["video_id"]
     if video_id not in video_cache:
@@ -924,12 +921,11 @@ async def size_input_handler(event):
         await event.reply("❌ Target size must be smaller than original size.", parse_mode='markdown')
         raise events.StopPropagation
 
-    status_msg = await event.reply(f"⚙️ Compressing to {human_readable_size(target_bytes)}...")
-
+    status_msg = await event.reply(f"⚙️ Starting compression → {human_readable_size(target_bytes)}...")
     compressed_path, result = await compress_video(data["filepath"], target_bytes, status_msg)
+    logger.info(f"Compress result: {result}")
 
     if compressed_path and os.path.exists(compressed_path):
-        # آپلود ویدیو فشرده‌شده هم با پروگرس بار
         await safe_edit(status_msg, "📤 Uploading compressed video...")
         try:
             await send_file_with_progress(
@@ -942,17 +938,9 @@ async def size_input_handler(event):
                     f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}"
                 ),
                 status_msg=status_msg,
-                supports_streaming=True
             )
         except Exception as e:
-            logger.error(f"Compressed upload error: {e}")
             await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
         try:
             os.remove(compressed_path)
             os.remove(data["filepath"])
@@ -963,7 +951,7 @@ async def size_input_handler(event):
 
     user_state.pop(event.chat_id, None)
     video_cache.pop(video_id, None)
-    raise events.StopPropagation  # ← اینجا باید باشه، نه اول تابع
+    raise events.StopPropagation  # ← درست: آخر تابع
 
 
 # ====================== PDF & HTML COMMANDS ======================
@@ -972,10 +960,8 @@ async def process_pdf_request(event, url: str):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-
     status = await event.reply("📄 Converting to PDF...", parse_mode='markdown')
     filepath = None
-
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -1001,10 +987,8 @@ async def process_html_request(event, url: str):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-
     status = await event.reply("🌐 Capturing full webpage...", parse_mode='markdown')
     filepath = None
-
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -1031,13 +1015,14 @@ async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     await event.reply(
-        "🚀 **Ultimate Bot - Fixed Version**\n\n"
-        "• `/dirpy <url>` → Download via Dirpy (direct)\n"
+        "🚀 **Ultimate Bot v3**\n\n"
+        "• `/dirpy <url>` → Download via Dirpy\n"
         "• `/pdf <url>` → Webpage to PDF\n"
         "• `/html <url>` → Save as MHTML\n\n"
-        "After video sent, use:\n"
-        "🗜 Compress Video\n"
-        "✅ Check (Delete from server)",
+        "**During download:**\n"
+        "⏸ Pause  •  ❌ Cancel\n\n"
+        "**After download:**\n"
+        "🗜 Compress  •  ✅ Delete from server",
         parse_mode='markdown'
     )
 
@@ -1081,10 +1066,15 @@ async def generic_url_handler(event):
     urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
     if not urls:
         return
+
+    dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading direct link...")
-    filepath, error, size = await download_direct_with_progress(urls[0], status_msg)
+
+    filepath, error, size = await download_with_controls(urls[0], status_msg, dl_id)
     if error or not filepath:
-        await safe_edit(status_msg, f"❌ {error or 'Failed'}")
+        if error != "Cancelled by user":
+            await safe_edit(status_msg, f"❌ {error or 'Failed'}")
         return
 
     await safe_edit(status_msg, "📤 Uploading...")
@@ -1095,16 +1085,10 @@ async def generic_url_handler(event):
             filepath=filepath,
             caption=f"📦 {human_readable_size(size)}",
             status_msg=status_msg,
-            supports_streaming=True
         )
     except Exception as e:
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
         return
-
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
     try:
         os.remove(filepath)
     except Exception:
@@ -1113,13 +1097,12 @@ async def generic_url_handler(event):
 
 # ====================== MAIN ======================
 async def main():
-    print("\n" + "="*80)
-    print("🚀 ULTIMATE BOT - FIXED VERSION v2")
-    print("   + Upload Progress Bar")
-    print("   + YouTube/googlevideo.com Fixed")
-    print("   + LuxureTV 403 Fixed (Origin header)")
-    print("   + StopPropagation Bug Fixed")
-    print("="*80)
+    print("\n" + "="*60)
+    print("🚀 ULTIMATE BOT v3")
+    print("   + Pause/Cancel during download")
+    print("   + Upload progress bar fixed")
+    print("   + YouTube + LuxureTV 403 fixed")
+    print("="*60)
 
     start_keep_alive()
 
@@ -1133,6 +1116,8 @@ async def main():
     client.add_event_handler(compress_callback)
     client.add_event_handler(check_callback)
     client.add_event_handler(pickurl_callback)
+    client.add_event_handler(dl_pause_callback)
+    client.add_event_handler(dl_cancel_callback)
     client.add_event_handler(size_input_handler)
     client.add_event_handler(generic_url_handler)
 
@@ -1145,6 +1130,9 @@ async def main():
 
 if __name__ == '__main__':
     try:
+        import uvloop
+        uvloop.run(main())
+    except ImportError:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Bot stopped.")
