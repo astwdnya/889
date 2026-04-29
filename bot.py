@@ -423,6 +423,53 @@ def _should_capture(url: str, content_type: str = "", content_length: int = 0) -
     return False
 
 
+def _extract_from_html(html: str, seen: set, captured_urls: list, label: str):
+    """
+    HTML سورس صفحه رو برای لینک ویدیو scan میکنه.
+    شامل پلیرهای خاص مثل kvsplayer/kt_player که URL رو داخل JS قرار میدن.
+    """
+
+    # ── روش ۱: URL های معمولی ───────────────────────────────────────
+    for m in re.findall(r"https?://[^\x22\x27<>\s]+", html):
+        if _should_capture(m):
+            norm = m.split('?')[0]
+            if norm not in seen:
+                seen.add(norm)
+                captured_urls.append(m)
+                logger.info(f"[{label}-URL] {m[:180]}")
+
+    # ── روش ۲: kvsplayer / kt_player ────────────────────────────────
+    # فرمت: video_url: 'function/0/https://...'
+    # یا:   video_url: 'https://...'
+    kv_patterns = [
+        r"video_url\s*:\s*[\x22\x27](?:function/\d+/)?(https?://[^\x22\x27\s]+)[\x22\x27]",
+        r"video_url_hd\s*:\s*[\x22\x27](?:function/\d+/)?(https?://[^\x22\x27\s]+)[\x22\x27]",
+        r"event_reporting2\s*:\s*[\x22\x27]([^\x22\x27\s]+/get_file/[^\x22\x27\s]+)[\x22\x27]",
+        r"[\x22\x27](?:file|src|url|video_url)[\x22\x27\s]*:\s*[\x22\x27](?:function/\d+/)?(https?://[^\x22\x27\s]+\.mp4[^\x22\x27\s]*)[\x22\x27]",
+    ]
+    for pat in kv_patterns:
+        for m in re.findall(pat, html, re.IGNORECASE):
+            # تمیز کردن trailing slash و کاراکترهای اضافه
+            url = m.rstrip('/')
+            if not url.startswith('http'):
+                continue
+            norm = url.split('?')[0]
+            if norm not in seen and not any(k in url.lower() for k in SKIP_KEYWORDS):
+                seen.add(norm)
+                captured_urls.append(url)
+                logger.info(f"[{label}-KV] {url[:180]}")
+
+    # ── روش ۳: هر JS object با /get_file/ ───────────────────────────
+    for m in re.findall(r"[\x22\x27]([^\x22\x27]*?/get_file/[^\x22\x27]+\.mp4[^\x22\x27]*)[\x22\x27]", html):
+        if m.startswith('http'):
+            url = m.rstrip('/')
+            norm = url.split('?')[0]
+            if norm not in seen:
+                seen.add(norm)
+                captured_urls.append(url)
+                logger.info(f"[{label}-GETFILE] {url[:180]}")
+
+
 async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
     """Response listener + HTML scan برای یه صفحه."""
     async def on_response(response):
@@ -439,19 +486,31 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
         except Exception:
             pass
     page.on('response', on_response)
-    await page.wait_for_timeout(7000)
+
+    # اول HTML رو بررسی کن — خیلی سریعتر از منتظر موندن برای network
+    try:
+        html = await page.content()
+        _extract_from_html(html, seen, captured_urls, label + "-FAST")
+    except Exception:
+        pass
+
+    if not captured_urls:
+        await page.wait_for_timeout(5000)
+        # دوباره HTML رو چک کن (شاید JS لود شده باشه)
+        try:
+            html = await page.content()
+            _extract_from_html(html, seen, captured_urls, label + "-AFTER5S")
+        except Exception:
+            pass
+
     if not captured_urls:
         await page.evaluate('() => { try { document.querySelector("video")?.play(); } catch(e){} }')
-        await page.wait_for_timeout(8000)
-    if not captured_urls:
-        html = await page.content()
-        for m in re.findall(r'https?://[^\x22\x27<>\s]+', html):
-            if _should_capture(m):
-                norm = m.split('?')[0]
-                if norm not in seen:
-                    seen.add(norm)
-                    captured_urls.append(m)
-                    logger.info(f"[{label}-HTML] {m[:180]}")
+        await page.wait_for_timeout(6000)
+        try:
+            html = await page.content()
+            _extract_from_html(html, seen, captured_urls, label + "-AFTERPLAY")
+        except Exception:
+            pass
 
 
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, dict, Optional[str]]:
