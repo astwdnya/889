@@ -285,24 +285,22 @@ def is_video_url(url: str) -> bool:
 
 
 # ====================== LUXURETV DIRECT EXTRACTOR ======================
-async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
-    """مستقیماً از سورس صفحه سایت لینک mp4 رو میگیره بدون نیاز به dirpy."""
+async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
+    """مستقیماً از سورس صفحه سایت همه لینک‌های mp4 رو جمع میکنه."""
     async with async_playwright() as p:
         browser = None
         try:
-            await safe_edit(status_msg, "🔍 Extracting video source directly...")
+            await safe_edit(status_msg, "🔍 Extracting video sources directly...")
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
             )
             page = await context.new_page()
 
-            captured: Optional[str] = None
+            captured_urls: list = []
+            seen: set = set()
 
             async def on_response(response):
-                nonlocal captured
-                if captured:
-                    return
                 rurl = response.url.lower()
                 content_type = response.headers.get('content-type', '')
                 content_length = int(response.headers.get('content-length', 0))
@@ -310,51 +308,45 @@ async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple
                 is_video_response = ('video' in content_type or 'octet-stream' in content_type)
                 is_cdn_mp4 = '.mp4' in rurl and any(s in rurl for s in ['media', 'cdn', 'rdtcdn', 'ev-', 'stream'])
                 if (is_video_response or is_cdn_mp4) and content_length > 500 * 1024 and not any(k in rurl for k in skip):
-                    captured = response.url
-                    logger.info(f"[DIRECT] Captured: {response.url[:200]}")
+                    url_norm = response.url.split('?')[0]
+                    if url_norm not in seen:
+                        seen.add(url_norm)
+                        captured_urls.append(response.url)
+                        logger.info(f"[DIRECT] Captured: {response.url[:200]}")
 
             page.on('response', on_response)
 
             await page.goto(video_url, wait_until='domcontentloaded', timeout=60000)
             await page.wait_for_timeout(5000)
+            await page.evaluate('() => { const v = document.querySelector("video"); if(v) { v.muted=true; v.play(); } }')
+            await page.wait_for_timeout(8000)
 
-            if not captured:
-                # play ویدیو
-                await page.evaluate(
-                    '() => { const v = document.querySelector("video"); if(v) { v.muted=true; v.play(); } }'
-                )
-                await page.wait_for_timeout(8000)
-
-            if not captured:
-                # scan source
+            if not captured_urls:
                 html = await page.content()
-                # دنبال URL با md5/expires که مشخصه لینک اصلیه
-                pat1 = re.compile(r"https?://\S+\.mp4\?\S*(?:md5|token|secure)\S*")
-                matches = pat1.findall(html)
-                if not matches:
-                    pat2 = re.compile(r"https?://(?:media|cdn)\S+\.mp4\S*")
-                    matches = pat2.findall(html)
-                matches = re.findall(PATTERN2, html)
-                for m in matches:
-                    if 'thumb' not in m.lower() and 'preview' not in m.lower():
-                        captured = m
-                        logger.info(f"[LUXURE HTML] Captured: {m[:200]}")
-                        break
+                pat1 = re.compile(r'https?://\S+?\.mp4(?:\?\S+)?')
+                for m in pat1.findall(html):
+                    ml = m.lower()
+                    url_norm = m.split('?')[0]
+                    if url_norm not in seen and not any(k in ml for k in ['thumb', 'preview', 'poster']):
+                        seen.add(url_norm)
+                        captured_urls.append(m)
 
-            if captured:
-                return captured, None
-            return None, "Could not find video source on luxuretv page"
+            if captured_urls:
+                return captured_urls, None
+            return [], "Could not find video source"
         except Exception as e:
-            logger.error(f"LuxureTV direct error: {e}")
-            return None, str(e)
+            logger.error(f"Direct extract error: {e}")
+            return [], str(e)
         finally:
             if browser:
                 await browser.close()
 
-async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str]]:
+async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
     async with async_playwright() as p:
         browser = None
-        captured_url: Optional[str] = None
+        captured_urls: list = []
+        seen: set = set()
+        skip_keywords = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'ad', 'tracking', 'analytics', 'sprite', 'storyboard']
 
         try:
             await safe_edit(status_msg, "🌐 Launching browser for network interception...")
@@ -370,33 +362,28 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
             )
             page = await context.new_page()
 
-            # روش ۱: Request interception
+            def add_url(u: str):
+                norm = u.split('?')[0]
+                if norm not in seen and not any(k in u.lower() for k in skip_keywords):
+                    seen.add(norm)
+                    captured_urls.append(u)
+                    logger.info(f"[CAPTURED] {u[:200]}")
+
             async def handle_route(route):
-                nonlocal captured_url
                 req_url = route.request.url
-                req_lower = req_url.lower()
-                # رد کردن thumbnail، preview، و فایل‌های کوچیک
-                skip_keywords = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'ad', 'tracking', 'analytics']
-                if not captured_url and is_video_url(req_url) and not any(k in req_lower for k in skip_keywords):
-                    captured_url = req_url
-                    logger.info(f"[REQUEST] Captured: {req_url[:200]}")
+                if is_video_url(req_url):
+                    add_url(req_url)
                 await route.continue_()
 
             await page.route("**/*", handle_route)
 
-            # روش ۲: Response interception (برای سایت‌هایی که URL شامل mp4 نیست)
             async def handle_response(response):
-                nonlocal captured_url
-                if captured_url:
-                    return
                 content_type = response.headers.get('content-type', '')
                 content_length = int(response.headers.get('content-length', 0))
-                # فقط فایل‌های بالای 500KB رو capture کن (جلوگیری از thumbnail/ad)
                 if ('video' in content_type or 'octet-stream' in content_type) and content_length > 500 * 1024:
                     rurl = response.url
                     if 'dirpy.com' not in rurl.lower():
-                        captured_url = rurl
-                        logger.info(f"[RESPONSE content-type] size={content_length} Captured: {rurl[:200]}")
+                        add_url(rurl)
 
             page.on('response', handle_response)
 
@@ -405,9 +392,8 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
             await page.goto(dirpy_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(8000)
 
-            if not captured_url:
+            if not captured_urls:
                 await safe_edit(status_msg, "⏳ Waiting for video stream...")
-                # کلیک روی دکمه دانلود dirpy اگه وجود داشت
                 try:
                     btn = page.locator('button:has-text("Download"), button:has-text("Get"), .btn-download, #btn-download')
                     if await btn.count() > 0:
@@ -416,26 +402,20 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 except Exception:
                     pass
 
-            if not captured_url:
-                await page.evaluate(
-                    '() => { const v = document.querySelector("video"); if(v) { v.muted = true; v.play(); } }'
-                )
+            if not captured_urls:
+                await page.evaluate('() => { const v = document.querySelector("video"); if(v) { v.muted = true; v.play(); } }')
                 await page.wait_for_timeout(10000)
 
-            if not captured_url:
-                # آخرین تلاش: scan کردن سورس HTML
+            if not captured_urls:
                 await safe_edit(status_msg, "🔍 Scanning page source for video links...")
                 html = await page.content()
-                mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
-                for match in mp4_matches:
+                for match in re.findall(r"https?://[^\x22<>\s]+\.mp4[^\x22<>\s]*", html):
                     if 'dirpy.com' not in match.lower():
-                        captured_url = match
-                        logger.info(f"[SOURCE] Captured from HTML: {match[:200]}")
-                        break
+                        add_url(match)
 
-            if captured_url:
-                return captured_url, None
-            return None, "Could not capture direct video link after all attempts"
+            if captured_urls:
+                return captured_urls, None
+            return [], "Could not capture direct video link after all attempts"
 
         except Exception as e:
             logger.error(f"Interception error: {e}")
@@ -459,6 +439,36 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
                 await page.goto(url, wait_until="domcontentloaded", timeout=120000)
             except Exception:
                 pass  # ادامه بده حتی اگه timeout خورد
+
+            # Age gate bypass - کلیک روی دکمه تایید سن
+            try:
+                age_selectors = [
+                    'button:has-text("I AM 18")',
+                    'button:has-text("I am 18")',
+                    'button:has-text("ENTER")',
+                    'button:has-text("Enter")',
+                    'button:has-text("over 18")',
+                    'button:has-text("Yes")',
+                    'button:has-text("Confirm")',
+                    'a:has-text("I AM 18")',
+                    'a:has-text("ENTER")',
+                    '.age-gate button',
+                    '#age-gate button',
+                    '[class*="age"] button',
+                    'button.y',
+                ]
+                for sel in age_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.is_visible(timeout=1000):
+                            await el.click()
+                            logger.info(f"Age gate bypassed with: {sel}")
+                            await asyncio.sleep(2)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
             await safe_edit(status_msg, "📜 Scrolling to load all images...")
             # اسکرول تدریجی برای trigger کردن lazy load
@@ -587,6 +597,77 @@ async def safe_edit(msg: Message, text: str):
 
 
 # ====================== PROCESS DIRPY REQUEST ======================
+
+# ====================== GET FILE SIZE VIA HEAD ======================
+async def get_file_size(url: str) -> int:
+    """حجم فایل رو با HEAD request میگیره."""
+    try:
+        timeout = ClientTimeout(connect=10, sock_read=10, total=15)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, headers=headers, allow_redirects=True, ssl=False) as resp:
+                return int(resp.headers.get('content-length', 0))
+    except Exception:
+        return 0
+
+
+def _url_label(url: str, size: int, index: int) -> str:
+    """لیبل دکمه برای هر لینک."""
+    u = url.lower()
+    # تشخیص کیفیت از URL
+    quality = "Unknown"
+    for q in ['2160p', '1080p', '720p', '480p', '360p', '240p', '4k', 'hd', 'sd', 'hq', 'lq']:
+        if q in u:
+            quality = q.upper()
+            break
+    sz_str = human_readable_size(size) if size > 0 else "? MB"
+    # اسم دامین
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.replace('www.', '')[:20]
+    except Exception:
+        domain = f"Link {index+1}"
+    return f"#{index+1} {quality} • {sz_str} • {domain}"
+
+
+async def do_download_and_send(event, status_msg, direct_url: str, source_url: str):
+    """دانلود و ارسال ویدیو به کاربر."""
+    await safe_edit(status_msg, "📥 Downloading video...")
+    filepath, dl_error, final_size = await download_direct_with_progress(direct_url, status_msg, referer=source_url)
+
+    if dl_error or not filepath:
+        await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
+        return
+
+    video_id = f"vid_{event.chat_id}_{int(time.time())}"
+    video_cache[video_id] = {
+        "filepath": filepath,
+        "chat_id": event.chat_id,
+        "original_size": final_size,
+        "original_url": source_url
+    }
+
+    buttons = [
+        [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
+        [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
+    ]
+
+    await event.client.send_file(
+        event.chat_id,
+        filepath,
+        caption=f"🎬 **Video Downloaded**\n"
+                f"📦 Size: {human_readable_size(final_size)}\n"
+                f"🔗 [Source]({source_url})\n"
+                f"⬇️ [DW Link]({direct_url})",
+        supports_streaming=True,
+        buttons=buttons,
+        parse_mode='markdown'
+    )
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
 processing_messages = set()
 
 async def process_dirpy_request(event, url: str):
@@ -607,50 +688,50 @@ async def process_dirpy_request(event, url: str):
 
         # برای luxuretv و redtube مستقیم از سورس سایت بگیر
         if 'luxuretv.com' in url_lower or 'redtube.com' in url_lower:
-            direct_url, intercept_err = await extract_direct_from_site(url, status_msg)
-            if not direct_url:
+            found_urls, intercept_err = await extract_direct_from_site(url, status_msg)
+            if not found_urls:
                 await safe_edit(status_msg, "⚠️ Direct failed, trying Dirpy fallback...")
-                direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
+                found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
         else:
-            direct_url, intercept_err = await extract_video_url_smart(url, status_msg)
+            found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
 
-        if intercept_err or not direct_url:
+        if not found_urls:
             await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
             return
 
-        await safe_edit(status_msg, "📥 Link captured. Downloading video...")
-
-        filepath, dl_error, final_size = await download_direct_with_progress(direct_url, status_msg, referer=url)
-
-        if dl_error or not filepath:
-            await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
+        # اگه فقط یه لینک پیدا شد مستقیم دانلود کن
+        if len(found_urls) == 1:
+            await do_download_and_send(event, status_msg, found_urls[0], url)
             return
 
-        video_id = f"vid_{event.chat_id}_{int(time.time())}"
-        video_cache[video_id] = {
-            "filepath": filepath,
-            "chat_id": event.chat_id,
-            "original_size": final_size,
-            "original_url": url
+        # چند لینک پیدا شد - حجم هر کدوم رو بگیر و لیست کن
+        await safe_edit(status_msg, f"🔍 Found {len(found_urls)} links, checking sizes...")
+        sized_urls = []
+        for u in found_urls:
+            sz = await get_file_size(u)
+            sized_urls.append((u, sz))
+
+        # ذخیره لینک‌ها برای callback
+        pick_id = f"pick_{event.chat_id}_{int(time.time())}"
+        video_cache[pick_id] = {
+            "urls": sized_urls,
+            "source_url": url,
+            "chat_id": event.chat_id
         }
 
-        buttons = [
-            [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
-            [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
-        ]
+        # ساخت دکمه‌ها - هر لینک یه دکمه
+        buttons = []
+        for i, (u, sz) in enumerate(sized_urls):
+            label = _url_label(u, sz, i)
+            buttons.append([Button.inline(label, f"pickurl_{pick_id}_{i}")])
 
-        await event.client.send_file(
+        await safe_edit(status_msg, "📋 **Select video to download:**")
+        await event.client.send_message(
             event.chat_id,
-            filepath,
-            caption=f"🎬 **Video Downloaded via Dirpy**\n"
-                    f"📦 Size: {human_readable_size(final_size)}\n"
-                    f"🔗 [Source]({url})\n"
-                    f"⬇️ [DW Link]({direct_url})",
-            supports_streaming=True,
+            f"🎬 Found **{len(sized_urls)}** video links for:\n{url}\n\nChoose one to download:",
             buttons=buttons,
             parse_mode='markdown'
         )
-
         await status_msg.delete()
 
     except Exception as e:
@@ -691,7 +772,40 @@ async def check_callback(event):
         del video_cache[video_id]
 
 
-# ====================== SIZE INPUT HANDLER ======================
+
+@events.register(events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$"))
+async def pickurl_callback(event):
+    raw = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
+    idx_raw = event.pattern_match.group(2).decode() if isinstance(event.pattern_match.group(2), bytes) else event.pattern_match.group(2)
+    pick_id = raw
+    idx = int(idx_raw)
+
+    if pick_id not in video_cache:
+        return await event.answer("Session expired. Please resend /dirpy command.", alert=True)
+
+    data = video_cache[pick_id]
+    urls = data["urls"]
+
+    if idx >= len(urls):
+        return await event.answer("Invalid selection.", alert=True)
+
+    chosen_url, _ = urls[idx]
+    source_url = data["source_url"]
+
+    await event.answer(f"Starting download #{idx+1}...", alert=False)
+
+    # حذف پیام انتخاب
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    status_msg = await event.client.send_message(event.chat_id, "📥 Starting download...")
+    del video_cache[pick_id]
+
+    await do_download_and_send(event, status_msg, chosen_url, source_url)
+
+# ====================== SIZE INPUT HANDLER =======================
 @events.register(events.NewMessage(incoming=True))
 async def size_input_handler(event):
     if event.sender_id not in AUTHORIZED_USERS:
@@ -895,6 +1009,7 @@ async def main():
     client.add_event_handler(html_command)
     client.add_event_handler(compress_callback)
     client.add_event_handler(check_callback)
+    client.add_event_handler(pickurl_callback)
     client.add_event_handler(size_input_handler)
     client.add_event_handler(generic_url_handler)
 
