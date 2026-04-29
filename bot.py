@@ -454,49 +454,63 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
                     logger.info(f"[{label}-HTML] {m[:180]}")
 
 
-async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
+async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, dict, Optional[str]]:
     """
     مرحله ۱: از طریق dirpy.com
-    مرحله ۲ (fallback): مستقیم سایت اصلی — play ویدیو و گرفتن لینک از network
+    مرحله ۲ (fallback): مستقیم سایت اصلی
+    برمیگردونه: (urls, session_headers, error)
+    session_headers شامل Cookie و Referer هست که برای دانلود لازمه
     """
     async with async_playwright() as p:
         browser = None
         captured_urls: list = []
         seen: set = set()
+        session_headers: dict = {}
+        used_context = None
+
         try:
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             )
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1280, 'height': 720}
-            )
+
+            async def make_context():
+                return await browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': 1280, 'height': 720}
+                )
 
             # ── مرحله ۱: Dirpy ──────────────────────────────────────────
             await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
-            page1 = await context.new_page()
+            ctx1 = await make_context()
+            page1 = await ctx1.new_page()
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
             try:
                 await page1.goto(dirpy_url, wait_until='domcontentloaded', timeout=60000)
                 await _collect_from_page(page1, "DIRPY", captured_urls, seen)
+                if captured_urls:
+                    # cookie های dirpy معمولاً لازم نیست — از referer اصلی استفاده میکنیم
+                    session_headers = {"Referer": video_url}
             except Exception as e:
                 logger.warning(f"Dirpy page error: {e}")
             finally:
                 await page1.close()
+                await ctx1.close()
 
             # ── مرحله ۲: Direct site fallback ───────────────────────────
             if not captured_urls:
                 await safe_edit(status_msg, "🌐 Dirpy failed — trying direct site extraction...")
-                page2 = await context.new_page()
+                ctx2 = await make_context()
+                used_context = ctx2
+                page2 = await ctx2.new_page()
                 try:
-                    # Age gate bypass
                     async def handle_dialog(dialog):
                         await dialog.accept()
                     page2.on('dialog', handle_dialog)
 
                     await page2.goto(video_url, wait_until='domcontentloaded', timeout=60000)
-                    # Age gate click
+
+                    # Age gate bypass
                     age_selectors = [
                         'button:has-text("I AM 18")', 'button:has-text("ENTER")',
                         'button:has-text("Yes")', '.age-gate button', 'button.y',
@@ -512,19 +526,38 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                                 break
                         except Exception:
                             continue
+
                     await _collect_from_page(page2, "DIRECT", captured_urls, seen)
+
+                    if captured_urls:
+                        # ── مهم: cookie های سایت اصلی رو بگیر ──
+                        raw_cookies = await ctx2.cookies()
+                        cookie_str = "; ".join(
+                            f"{c['name']}={c['value']}" for c in raw_cookies
+                            if video_url.split('/')[2].replace('www.', '') in c.get('domain', '')
+                               or c.get('domain', '').lstrip('.') in video_url
+                        )
+                        session_headers = {
+                            "Referer": video_url,
+                            "Origin": '/'.join(video_url.split('/')[:3]),
+                        }
+                        if cookie_str:
+                            session_headers["Cookie"] = cookie_str
+                            logger.info(f"Captured cookies: {cookie_str[:100]}")
+
                 except Exception as e:
                     logger.warning(f"Direct page error: {e}")
                 finally:
                     await page2.close()
+                    await ctx2.close()
 
             if captured_urls:
-                return captured_urls, None
-            return [], "Could not capture video link via Dirpy or direct extraction"
+                return captured_urls, session_headers, None
+            return [], {}, "Could not capture video link via Dirpy or direct extraction"
 
         except Exception as e:
             logger.error(f"Extractor error: {e}")
-            return [], str(e)
+            return [], {}, str(e)
         finally:
             if browser:
                 await browser.close()
@@ -667,14 +700,9 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
         video_bitrate_bps = max(total_bitrate_bps - audio_bitrate_bps, 10_000)
         audio_bitrate_k = audio_bitrate_bps // 1000
 
-        # اگه ابعاد ویدیو فرد بودن، باید به زوج تبدیل بشن (FFmpeg requirement)
-        vf_filter = []
-        if width % 2 != 0 or height % 2 != 0:
-            # pad به نزدیک‌ترین زوج
-            new_w = width + (width % 2)
-            new_h = height + (height % 2)
-            vf_filter = ['-vf', f'scale={new_w}:{new_h}']
-            logger.info(f"Odd dimensions {width}x{height} → padding to {new_w}x{new_h}")
+        # همیشه scale=trunc(iw/2)*2:trunc(ih/2)*2 اضافه میکنیم
+        # این ابعاد فرد رو به زوج تبدیل میکنه — بدون این libx264 crash میکنه
+        vf_filter = ['-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2']
 
         await safe_edit(
             status_msg,
@@ -683,27 +711,31 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
             f"🔄 Pass 1/2..."
         )
 
-        # Pass 1
-        pass1_args = (
-            ['ffmpeg', '-y', '-i', input_path]
-            + vf_filter
-            + ['-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
-               '-pass', '1', '-passlogfile', passlog,
-               '-an', '-f', 'null', '/dev/null']
-        )
+        # Pass 1 — باید همون vf_filter رو داشته باشه وگرنه pass 2 crash میکنه
+        pass1_args = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            '-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
+            '-pass', '1', '-passlogfile', passlog,
+            '-an', '-f', 'null', '/dev/null'
+        ]
         rc, err = await _run_ffmpeg(pass1_args)
 
         if rc != 0:
-            # single-pass fallback
-            logger.warning(f"Two-pass pass1 failed → single-pass. err: {err[:200]}")
-            await safe_edit(status_msg, "⚙️ Single-pass encoding...")
-            sp_args = (
-                ['ffmpeg', '-y', '-i', input_path]
-                + vf_filter
-                + ['-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
-                   '-preset', 'fast', '-c:a', 'aac', '-b:a', f'{audio_bitrate_k}k',
-                   '-movflags', '+faststart', output_path]
-            )
+            # single-pass fallback با CRF به جای bitrate
+            logger.warning(f"Two-pass pass1 failed → single-pass CRF. err: {err[:200]}")
+            await safe_edit(status_msg, "⚙️ Single-pass encoding (CRF mode)...")
+            sp_args = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                '-c:v', 'libx264', '-crf', '28',
+                '-maxrate', str(video_bitrate_bps),
+                '-bufsize', str(video_bitrate_bps * 2),
+                '-preset', 'fast',
+                '-c:a', 'aac', '-b:a', f'{audio_bitrate_k}k',
+                '-movflags', '+faststart',
+                output_path
+            ]
             rc2, err2 = await _run_ffmpeg(sp_args)
             if rc2 != 0:
                 return None, f"FFmpeg error: {err2[-300:]}"
@@ -715,14 +747,16 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
                 f"📊 Duration: {int(duration)}s  |  Video: {video_bitrate_bps//1000}kbps\n"
                 f"🔄 Pass 2/2..."
             )
-            pass2_args = (
-                ['ffmpeg', '-y', '-i', input_path]
-                + vf_filter
-                + ['-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
-                   '-pass', '2', '-passlogfile', passlog,
-                   '-preset', 'fast', '-c:a', 'aac', '-b:a', f'{audio_bitrate_k}k',
-                   '-movflags', '+faststart', output_path]
-            )
+            pass2_args = [
+                'ffmpeg', '-y', '-i', input_path,
+                '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+                '-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
+                '-pass', '2', '-passlogfile', passlog,
+                '-preset', 'fast',
+                '-c:a', 'aac', '-b:a', f'{audio_bitrate_k}k',
+                '-movflags', '+faststart',
+                output_path
+            ]
             rc, err = await _run_ffmpeg(pass2_args)
             if rc != 0:
                 return None, f"FFmpeg pass2 error: {err[-300:]}"
@@ -758,12 +792,12 @@ async def process_dirpy_request(event, url: str):
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
-        found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
+        found_urls, session_headers, intercept_err = await extract_video_url_smart(url, status_msg)
         if not found_urls:
             await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
             return
         if len(found_urls) == 1:
-            await do_download_and_send(event, status_msg, found_urls[0], url)
+            await do_download_and_send(event, status_msg, found_urls[0], url, extra_headers=session_headers)
             return
         await safe_edit(status_msg, f"🔍 Found {len(found_urls)} links, checking sizes...")
         sized_urls = []
@@ -771,7 +805,7 @@ async def process_dirpy_request(event, url: str):
             sz = await get_file_size(u)
             sized_urls.append((u, sz))
         pick_id = f"pick_{event.chat_id}_{int(time.time())}"
-        video_cache[pick_id] = {"urls": sized_urls, "source_url": url, "chat_id": event.chat_id}
+        video_cache[pick_id] = {"urls": sized_urls, "source_url": url, "chat_id": event.chat_id, "session_headers": session_headers}
         buttons = [[Button.inline(_url_label(u, sz, i), f"pickurl_{pick_id}_{i}")] for i, (u, sz) in enumerate(sized_urls)]
         await safe_edit(status_msg, "📋 **Select video to download:**")
         await event.client.send_message(
@@ -824,13 +858,14 @@ async def pickurl_callback(event):
         return await event.answer("Invalid selection.", alert=True)
     chosen_url, _ = data["urls"][idx]
     source_url = data["source_url"]
+    session_headers = data.get("session_headers", {})
     await event.answer(f"Starting download #{idx+1}...", alert=False)
     try:
         await event.delete()
     except Exception: pass
     status_msg = await event.client.send_message(event.chat_id, "📥 Starting download...")
     del video_cache[pick_id]
-    await do_download_and_send(event, status_msg, chosen_url, source_url)
+    await do_download_and_send(event, status_msg, chosen_url, source_url, extra_headers=session_headers)
 
 
 # ====================== ADMIN HANDLERS ======================
