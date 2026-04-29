@@ -1,5 +1,6 @@
-# ================== Dockerfile for [Render.com](http://Render.com) ==================
+# ================== Dockerfile for Render.com ==================
 FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
+
 # نصب ffmpeg و وابستگی‌های سیستم
 RUN apt-get update && apt-get install -y \
     ffmpeg \
@@ -16,20 +17,26 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
 # تنظیمات محیطی
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_SKIP_FFMPEG_INSTALL=1
+
 WORKDIR /app
+
 # نصب پکیج‌های پایتون
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     playwright install chromium --with-deps
+
 # کپی کد بات
-COPY [bot.py](http://bot.py) .
+COPY bot.py .
+
 # ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
+
 EXPOSE 10000
-CMD ["python", "-u", "[bot.py](http://bot.py)"]
+CMD ["python", "-u", "bot.py"]
