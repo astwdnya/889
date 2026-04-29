@@ -1,7 +1,7 @@
-# ================== Dockerfile for Render.com - Fixed Version ==================
+# ================== Dockerfile for Render.com ==================
 FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
 
-# نصب ffmpeg و وابستگی‌های سیستم (فیکس شده برای Ubuntu Noble)
+# نصب ffmpeg و وابستگی‌های سیستم
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     fonts-liberation \
@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     libasound2t64 \
     libxshmfence1 \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # تنظیمات محیطی
@@ -39,4 +40,4 @@ RUN mkdir -p output_files && chmod -R 777 output_files
 
 EXPOSE 10000
 
-CMD ["python", "bot.py"]
+CMD ["python", "-u", "bot.py"]
