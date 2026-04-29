@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - FIXED VERSION
-# PDF Fixed + LuxureTV Improved + Check Button + Direct Dirpy
+# Telegram Ultimate Bot - FIXED VERSION v2
+# + Upload Progress Bar
+# + YouTube via Dirpy Fixed
+# + LuxureTV 403 Fixed (Origin header)
+# + StopPropagation Bug Fixed
 
 import asyncio
 import os
@@ -152,6 +155,12 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
     }
     if referer:
         headers['Referer'] = referer
+        # FIX: اضافه کردن Origin header برای رفع 403 روی LuxureTV و سایت‌های مشابه
+        try:
+            origin = '/'.join(referer.split('/')[:3])
+            headers['Origin'] = origin
+        except Exception:
+            pass
 
     timeout = ClientTimeout(
         total=None,
@@ -195,7 +204,7 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                                 ext = os.path.splitext(fm.group(1).strip())[1] or '.mp4'
                                 filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}{ext}")
 
-                    progress = ProgressHandler(status_msg, total, "Downloading")
+                    progress = ProgressHandler(status_msg, total, "📥 Downloading")
                     progress.last_bytes = downloaded
 
                     write_mode = 'ab' if downloaded > 0 else 'wb'
@@ -252,6 +261,8 @@ def is_video_url(url: str) -> bool:
         ('pornhub.com',          lambda u: '.mp4' in u and 'cdn' in u),
         ('ahrimp4',              lambda u: True),
         ('media4',               lambda u: '.mp4' in u),
+        # FIX: اضافه کردن یوتیوب
+        ('googlevideo.com',      lambda u: 'videoplayback' in u),
     ]
 
     if any(k in u for k in SKIP_KEYWORDS):
@@ -337,10 +348,11 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
     """
     فقط از Dirpy استفاده میکنه - هیچ وقت به سایت اصلی مراجعه نمیکنه.
     فیلتر سایز: فقط فایل‌های > 1MB یا CDN‌های شناخته‌شده.
+
+    FIX: اضافه شدن googlevideo.com برای یوتیوب
     """
     SKIP = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite',
             'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
-    # حداقل سایز برای capture کردن - جلوگیری از گرفتن gif یا thumbnail
     MIN_SIZE = 2 * 1024 * 1024  # حداقل 2MB
 
     async with async_playwright() as p:
@@ -380,19 +392,28 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                             rul = ru.lower()
                             if any(k in rul for k in SKIP):
                                 return
+
                             # شرط ۱: content-type ویدیو + حجم بالای MIN_SIZE
                             if ('video/' in ct) and cl > MIN_SIZE:
                                 add_url(ru, f"RESP-CT {label}")
                                 return
-                            # شرط ۲: CDN شناخته‌شده + mp4 + حجم بالا (اگه content-length داشت)
+
+                            # FIX: لیست CDN‌های شناخته‌شده - اضافه شدن googlevideo.com برای یوتیوب
                             is_cdn = any(d in rul for d in [
                                 'rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
                                 'media4.luxuretv', 'media.luxuretv',
                                 'rule34.xxx', 'rule34video',
                                 'kv-ph.', 'ev-ph.', 'di-ph.',
+                                'googlevideo.com',   # ← یوتیوب
+                                'videoplayback',     # ← یوتیوب fallback
                             ])
-                            if is_cdn and '.mp4' in rul:
+
+                            # FIX: شرط mp4 یا videoplayback (برای یوتیوب که extension نداره)
+                            is_video_path = '.mp4' in rul or 'videoplayback' in rul
+
+                            if is_cdn and is_video_path:
                                 # اگه content-length داره باید بالای MIN_SIZE باشه
+                                # یوتیوب معمولاً content-length نمیده پس cl==0 رو قبول میکنیم
                                 if cl == 0 or cl > MIN_SIZE:
                                     add_url(ru, f"RESP-CDN {label}")
                         except Exception:
@@ -413,14 +434,16 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                         cdn_domains = ['rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
                                        'media4.luxuretv', 'media.luxuretv',
                                        'kv-ph.', 'ev-ph.', 'di-ph.',
-                                       'rule34video', 'p300cdn']
-                        for m in re.findall(r"https?://[^\x22\x27<>\s]+\.mp4[^\x22\x27<>\s]*", html):
-                            if any(d in m.lower() for d in cdn_domains):
-                                add_url(m, f"HTML-CDN {label}")
+                                       'rule34video', 'p300cdn',
+                                       'googlevideo.com']  # ← یوتیوب
+                        for m in re.findall(r"https?://[^\x22\x27<>\s]+[^\x22\x27<>\s]*", html):
+                            ml = m.lower()
+                            if any(d in ml for d in cdn_domains):
+                                if '.mp4' in ml or 'videoplayback' in ml:
+                                    add_url(m, f"HTML-CDN {label}")
                 finally:
                     await page.close()
 
-            # فقط از Dirpy - هیچ fallback به سایت اصلی وجود نداره
             await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
             await run_dirpy_page(dirpy_url, "DIRPY")
@@ -635,8 +658,71 @@ def _url_label(url: str, size: int, index: int) -> str:
     return f"#{index+1} {quality} • {sz_str} • {domain}"
 
 
+# ====================== UPLOAD WITH PROGRESS BAR ======================
+async def send_file_with_progress(
+    client,
+    chat_id: int,
+    filepath: str,
+    caption: str,
+    status_msg: Message,
+    buttons=None,
+    supports_streaming: bool = True
+):
+    """
+    ارسال فایل به تلگرام با پروگرس بار آپلود.
+    کاربر میتونه ببینه چند درصد آپلود شده، سرعت چقدره، و چقدر زمان مونده.
+    """
+    file_size = os.path.getsize(filepath)
+    start_time = time.time()
+    last_update = [0.0]  # list به جای nonlocal برای سازگاری بیشتر
+
+    async def upload_progress_callback(current: int, total: int):
+        now = time.time()
+        # هر ۲ ثانیه یه بار آپدیت میکنیم - نه خیلی زیاد که flood بشه
+        if now - last_update[0] < 2.0 and current != total:
+            return
+        last_update[0] = now
+
+        elapsed = now - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        eta = (total - current) / speed if speed > 0 else 0
+        percent = (current / total) * 100 if total > 0 else 0
+        filled = int(18 * current // total) if total > 0 else 0
+        bar = '█' * filled + '░' * (18 - filled)
+
+        # فرمت زمان باقیمانده
+        if eta < 60:
+            eta_str = f"{int(eta)}s"
+        elif eta < 3600:
+            eta_str = f"{int(eta // 60)}:{int(eta % 60):02d}"
+        else:
+            eta_str = f"{int(eta // 3600)}h {int((eta % 3600) // 60)}m"
+
+        text = (
+            f"**📤 Uploading...**\n"
+            f"`[{bar}]` **{percent:.1f}%**\n"
+            f"📦 {human_readable_size(current)} / {human_readable_size(total)}\n"
+            f"🚀 {human_readable_size(int(speed))}/s  •  ⏱ {eta_str}"
+        )
+        try:
+            await status_msg.edit(text, parse_mode='markdown')
+        except Exception:
+            pass
+
+    await client.send_file(
+        chat_id,
+        filepath,
+        caption=caption,
+        supports_streaming=supports_streaming,
+        buttons=buttons,
+        parse_mode='markdown',
+        progress_callback=upload_progress_callback
+    )
+
+
+# ====================== DOWNLOAD AND SEND ======================
 async def do_download_and_send(event, status_msg, direct_url: str, source_url: str):
-    """دانلود و ارسال ویدیو به کاربر."""
+    """دانلود و ارسال ویدیو به کاربر - با پروگرس بار هم دانلود هم آپلود."""
     await safe_edit(status_msg, "📥 Downloading video...")
     filepath, dl_error, final_size = await download_direct_with_progress(direct_url, status_msg, referer=source_url)
 
@@ -657,21 +743,35 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
         [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
     ]
 
-    await event.client.send_file(
-        event.chat_id,
-        filepath,
-        caption=f"🎬 **Video Downloaded**\n"
+    # نشون دادن پیام شروع آپلود
+    await safe_edit(status_msg, "📤 Uploading...")
+
+    try:
+        # آپلود با پروگرس بار
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=filepath,
+            caption=(
+                f"🎬 **Video Downloaded**\n"
                 f"📦 Size: {human_readable_size(final_size)}\n"
                 f"🔗 [Source]({source_url})\n"
-                f"⬇️ [DW Link]({direct_url})",
-        supports_streaming=True,
-        buttons=buttons,
-        parse_mode='markdown'
-    )
+                f"⬇️ [DW Link]({direct_url})"
+            ),
+            status_msg=status_msg,
+            buttons=buttons,
+            supports_streaming=True
+        )
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        return
+
     try:
         await status_msg.delete()
     except Exception:
         pass
+
 
 processing_messages = set()
 
@@ -687,7 +787,6 @@ async def process_dirpy_request(event, url: str):
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
 
-        # همیشه فقط از Dirpy - برای همه سایت‌ها
         found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
 
         if not found_urls:
@@ -794,7 +893,8 @@ async def pickurl_callback(event):
 
     await do_download_and_send(event, status_msg, chosen_url, source_url)
 
-# ====================== SIZE INPUT HANDLER =======================
+
+# ====================== SIZE INPUT HANDLER ======================
 @events.register(events.NewMessage(incoming=True))
 async def size_input_handler(event):
     if event.sender_id not in AUTHORIZED_USERS:
@@ -806,38 +906,52 @@ async def size_input_handler(event):
     if not state or state.get("action") != "wait_for_compression_size":
         return
 
-    raise events.StopPropagation
+    # FIX: StopPropagation باید آخر بیاد تا منطق اصلی اجرا بشه
+    # قبلاً اول بود و هیچ‌وقت کد زیرش اجرا نمیشد!
 
     video_id = state["video_id"]
     if video_id not in video_cache:
         user_state.pop(event.chat_id, None)
-        return
+        raise events.StopPropagation
 
     target_bytes = parse_size_input(event.raw_text)
     if not target_bytes:
         await event.reply("❌ Invalid size format!\nExamples: `15mb`, `800kb`, `1.5gb`", parse_mode='markdown')
-        return
+        raise events.StopPropagation
 
     data = video_cache[video_id]
     if target_bytes >= data["original_size"]:
         await event.reply("❌ Target size must be smaller than original size.", parse_mode='markdown')
-        return
+        raise events.StopPropagation
 
     status_msg = await event.reply(f"⚙️ Compressing to {human_readable_size(target_bytes)}...")
 
     compressed_path, result = await compress_video(data["filepath"], target_bytes, status_msg)
 
     if compressed_path and os.path.exists(compressed_path):
-        await event.client.send_file(
-            event.chat_id,
-            compressed_path,
-            caption=f"✅ **Compressed Video**\n"
+        # آپلود ویدیو فشرده‌شده هم با پروگرس بار
+        await safe_edit(status_msg, "📤 Uploading compressed video...")
+        try:
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=compressed_path,
+                caption=(
+                    f"✅ **Compressed Video**\n"
                     f"🎯 Requested: {human_readable_size(target_bytes)}\n"
-                    f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}",
-            supports_streaming=True,
-            parse_mode='markdown'
-        )
-        await status_msg.delete()
+                    f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}"
+                ),
+                status_msg=status_msg,
+                supports_streaming=True
+            )
+        except Exception as e:
+            logger.error(f"Compressed upload error: {e}")
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
         try:
             os.remove(compressed_path)
@@ -849,6 +963,7 @@ async def size_input_handler(event):
 
     user_state.pop(event.chat_id, None)
     video_cache.pop(video_id, None)
+    raise events.StopPropagation  # ← اینجا باید باشه، نه اول تابع
 
 
 # ====================== PDF & HTML COMMANDS ======================
@@ -971,8 +1086,25 @@ async def generic_url_handler(event):
     if error or not filepath:
         await safe_edit(status_msg, f"❌ {error or 'Failed'}")
         return
-    await event.client.send_file(event.chat_id, filepath, supports_streaming=True)
-    await status_msg.delete()
+
+    await safe_edit(status_msg, "📤 Uploading...")
+    try:
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=filepath,
+            caption=f"📦 {human_readable_size(size)}",
+            status_msg=status_msg,
+            supports_streaming=True
+        )
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        return
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
     try:
         os.remove(filepath)
     except Exception:
@@ -982,8 +1114,11 @@ async def generic_url_handler(event):
 # ====================== MAIN ======================
 async def main():
     print("\n" + "="*80)
-    print("🚀 ULTIMATE BOT - FIXED VERSION")
-    print("   PDF Fixed + MHTML Added + Bracket Bug Fixed + ENV Vars")
+    print("🚀 ULTIMATE BOT - FIXED VERSION v2")
+    print("   + Upload Progress Bar")
+    print("   + YouTube/googlevideo.com Fixed")
+    print("   + LuxureTV 403 Fixed (Origin header)")
+    print("   + StopPropagation Bug Fixed")
     print("="*80)
 
     start_keep_alive()
