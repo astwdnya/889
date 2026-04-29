@@ -306,7 +306,11 @@ async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple
                 content_length = int(response.headers.get('content-length', 0))
                 skip = ['thumb', 'preview', 'poster', 'banner', 'sprite', 'storyboard']
                 is_video_response = ('video' in content_type or 'octet-stream' in content_type)
-                is_cdn_mp4 = '.mp4' in rurl and any(s in rurl for s in ['media', 'cdn', 'rdtcdn', 'ev-', 'stream'])
+                is_cdn_mp4 = '.mp4' in rurl and any(s in rurl for s in [
+                    'media', 'cdn', 'rdtcdn', 'ev-', 'stream',
+                    'p300cdn', 'p300', 'xvideos-cdn', 'xhamster',
+                    'phncdn', 'xnxx-cdn',
+                ])
                 if (is_video_response or is_cdn_mp4) and content_length > 500 * 1024 and not any(k in rurl for k in skip):
                     url_norm = response.url.split('?')[0]
                     if url_norm not in seen:
@@ -342,76 +346,99 @@ async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple
                 await browser.close()
 
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
+    """
+    دو مرحله:
+    1. صفحه رو از طریق dirpy باز میکنه و response های ویدیویی رو collect میکنه
+    2. اگه چیزی پیدا نشد، مستقیم سایت اصلی رو باز میکنه
+    فقط فایل‌هایی که content-length > 1MB دارن یا URL شون مشخصاً CDN ویدیو هست capture میشن.
+    """
+    SKIP = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite',
+            'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
+    MIN_SIZE = 1 * 1024 * 1024  # حداقل 1MB برای response-based capture
+
     async with async_playwright() as p:
         browser = None
         captured_urls: list = []
         seen: set = set()
-        skip_keywords = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'ad', 'tracking', 'analytics', 'sprite', 'storyboard']
+
+        def add_url(u: str, source: str = ""):
+            ul = u.lower()
+            if any(k in ul for k in SKIP):
+                return
+            norm = u.split('?')[0]
+            if norm in seen:
+                return
+            seen.add(norm)
+            captured_urls.append(u)
+            logger.info(f"[{source}] {u[:180]}")
 
         try:
-            await safe_edit(status_msg, "🌐 Launching browser for network interception...")
-
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             )
-
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1280, 'height': 720}
             )
-            page = await context.new_page()
 
-            def add_url(u: str):
-                norm = u.split('?')[0]
-                if norm not in seen and not any(k in u.lower() for k in skip_keywords):
-                    seen.add(norm)
-                    captured_urls.append(u)
-                    logger.info(f"[CAPTURED] {u[:200]}")
-
-            async def handle_route(route):
-                req_url = route.request.url
-                if is_video_url(req_url):
-                    add_url(req_url)
-                await route.continue_()
-
-            await page.route("**/*", handle_route)
-
-            async def handle_response(response):
-                content_type = response.headers.get('content-type', '')
-                content_length = int(response.headers.get('content-length', 0))
-                if ('video' in content_type or 'octet-stream' in content_type) and content_length > 500 * 1024:
-                    rurl = response.url
-                    if 'dirpy.com' not in rurl.lower():
-                        add_url(rurl)
-
-            page.on('response', handle_response)
-
-            dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
-            await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
-            await page.goto(dirpy_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(8000)
-
-            if not captured_urls:
-                await safe_edit(status_msg, "⏳ Waiting for video stream...")
+            async def run_page(target_url: str, label: str):
+                page = await context.new_page()
                 try:
-                    btn = page.locator('button:has-text("Download"), button:has-text("Get"), .btn-download, #btn-download')
-                    if await btn.count() > 0:
-                        await btn.first.click()
-                        await page.wait_for_timeout(5000)
-                except Exception:
-                    pass
+                    # Response interception - فقط فایل‌های بزرگ
+                    async def on_response(response):
+                        try:
+                            ct = response.headers.get('content-type', '')
+                            cl = int(response.headers.get('content-length', 0))
+                            ru = response.url
+                            rul = ru.lower()
+                            if any(k in rul for k in SKIP):
+                                return
+                            # شرط ۱: content-type ویدیو + حجم بالا
+                            if ('video/' in ct) and cl > MIN_SIZE:
+                                add_url(ru, f"RESP-CT {label}")
+                                return
+                            # شرط ۲: URL مشخصاً CDN ویدیو هست (حتی اگه content-length نداشت)
+                            is_cdn = any(d in rul for d in [
+                                'rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
+                                'media4.luxuretv', 'media.luxuretv',
+                                'rule34.xxx', 'rule34video',
+                            ])
+                            if is_cdn and '.mp4' in rul:
+                                add_url(ru, f"RESP-CDN {label}")
+                        except Exception:
+                            pass
 
-            if not captured_urls:
-                await page.evaluate('() => { const v = document.querySelector("video"); if(v) { v.muted = true; v.play(); } }')
-                await page.wait_for_timeout(10000)
+                    page.on('response', on_response)
 
+                    await page.goto(target_url, wait_until='domcontentloaded', timeout=60000)
+                    await page.wait_for_timeout(7000)
+
+                    if not captured_urls:
+                        await page.evaluate('() => { try { document.querySelector("video")?.play(); } catch(e){} }')
+                        await page.wait_for_timeout(8000)
+
+                    if not captured_urls:
+                        # scan HTML برای لینک‌های CDN مشخص
+                        html = await page.content()
+                        cdn_domains = ['rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
+                                       'media4.luxuretv', 'media.luxuretv',
+                                       'ev-ph.', 'rule34video', 'p300cdn']
+                        for m in re.findall(r"https?://[^\x22\x27<>\s]+\.mp4[^\x22\x27<>\s]*", html):
+                            if any(d in m.lower() for d in cdn_domains):
+                                add_url(m, f"HTML-CDN {label}")
+                finally:
+                    await page.close()
+
+            # مرحله ۱: از طریق dirpy
+            await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
+            dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
+            await run_page(dirpy_url, "DIRPY")
+
+            # مرحله ۲: اگه پیدا نشد، مستقیم سایت اصلی رو باز کن
             if not captured_urls:
-                await safe_edit(status_msg, "🔍 Scanning page source for video links...")
-                html = await page.content()
-                for match in re.findall(r"https?://[^\x22<>\s]+\.mp4[^\x22<>\s]*", html):
-                    if 'dirpy.com' not in match.lower():
-                        add_url(match)
+                await safe_edit(status_msg, "🌐 Trying direct site extraction...")
+                await run_page(video_url, "DIRECT")
 
             if captured_urls:
                 return captured_urls, None
@@ -419,7 +446,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
 
         except Exception as e:
             logger.error(f"Interception error: {e}")
-            return None, str(e)
+            return [], str(e)
         finally:
             if browser:
                 await browser.close()
@@ -686,8 +713,9 @@ async def process_dirpy_request(event, url: str):
 
         url_lower = url.lower()
 
-        # برای luxuretv و redtube مستقیم از سورس سایت بگیر
-        if 'luxuretv.com' in url_lower or 'redtube.com' in url_lower:
+        # برای این سایت‌ها مستقیم از سورس سایت بگیر (نه از dirpy)
+        DIRECT_SITES = ['luxuretv.com', 'redtube.com', 'porn300.com', 'pornhub.com', 'xvideos.com', 'xhamster.com']
+        if any(s in url_lower for s in DIRECT_SITES):
             found_urls, intercept_err = await extract_direct_from_site(url, status_msg)
             if not found_urls:
                 await safe_edit(status_msg, "⚠️ Direct failed, trying Dirpy fallback...")
