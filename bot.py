@@ -31,6 +31,7 @@ API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913}
+ADMIN_ID = 818185073
 
 MAX_FILE_SIZE_MB = 2000
 OUTPUT_FOLDER = "output_files"
@@ -40,6 +41,9 @@ HEALTH_PORT = int(os.environ.get('PORT', 10000))
 
 video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
+
+# وضعیت منتظر دریافت ایدی جدید از ادمین
+admin_pending_add: Dict[int, bool] = {}
 
 # فرهنگ لغت برای نگه داشتن وضعیت دانلودهای فعال
 # key: msg_id (str) → value: dict با کلیدهای "paused", "cancelled", "task"
@@ -895,6 +899,53 @@ async def pickurl_callback(event):
     await do_download_and_send(event, status_msg, chosen_url, source_url)
 
 
+# ====================== ADMIN INPUT HANDLER ======================
+@events.register(events.NewMessage(incoming=True))
+async def admin_input_handler(event):
+    if event.sender_id != ADMIN_ID:
+        return
+    if event.sender_id not in admin_pending_add:
+        return
+
+    action = admin_pending_add.pop(event.sender_id)
+    raw = event.raw_text.strip()
+
+    # چک کن که عدد باشه
+    if not raw.isdigit():
+        await event.reply("❌ Invalid ID! Please send a numeric ID only.", parse_mode='markdown')
+        raise events.StopPropagation
+
+    uid = int(raw)
+
+    if action == "add":
+        if uid in AUTHORIZED_USERS:
+            await event.reply(f"⚠️ User `{uid}` is already authorized.", parse_mode='markdown')
+        else:
+            AUTHORIZED_USERS.add(uid)
+            await event.reply(
+                f"✅ User `{uid}` added successfully!\n"
+                f"Total authorized users: **{len(AUTHORIZED_USERS)}**",
+                parse_mode='markdown'
+            )
+            logger.info(f"Admin added user {uid} to AUTHORIZED_USERS")
+
+    elif action == "remove":
+        if uid == ADMIN_ID:
+            await event.reply("❌ You cannot remove yourself!", parse_mode='markdown')
+        elif uid not in AUTHORIZED_USERS:
+            await event.reply(f"⚠️ User `{uid}` is not in the list.", parse_mode='markdown')
+        else:
+            AUTHORIZED_USERS.discard(uid)
+            await event.reply(
+                f"✅ User `{uid}` removed successfully!\n"
+                f"Total authorized users: **{len(AUTHORIZED_USERS)}**",
+                parse_mode='markdown'
+            )
+            logger.info(f"Admin removed user {uid} from AUTHORIZED_USERS")
+
+    raise events.StopPropagation
+
+
 # ====================== SIZE INPUT HANDLER ======================
 @events.register(events.NewMessage(incoming=True))
 async def size_input_handler(event):
@@ -1010,6 +1061,88 @@ async def process_html_request(event, url: str):
 
 
 # ====================== TELEGRAM HANDLERS ======================
+# ====================== ADMIN PANEL ======================
+@events.register(events.NewMessage(pattern='/admin', incoming=True))
+async def admin_cmd(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.reply("⛔ Unauthorized")
+
+    users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
+    await event.reply(
+        f"👑 **Admin Panel**\n\n"
+        f"**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\n"
+        f"Choose an action:",
+        parse_mode='markdown',
+        buttons=[
+            [Button.inline("➕ Add User", "admin_add")],
+            [Button.inline("➖ Remove User", "admin_remove")],
+            [Button.inline("🔄 Refresh List", "admin_refresh")],
+        ]
+    )
+
+
+@events.register(events.CallbackQuery(pattern=r"admin_add"))
+async def admin_add_callback(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    admin_pending_add[event.sender_id] = "add"
+    await event.answer("", alert=False)
+    await event.client.send_message(
+        event.chat_id,
+        "📩 Send me the **numeric user ID** to add:\n\n_Example: `123456789`_",
+        parse_mode='markdown',
+        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]]
+    )
+
+
+@events.register(events.CallbackQuery(pattern=r"admin_remove"))
+async def admin_remove_callback(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    admin_pending_add[event.sender_id] = "remove"
+    await event.answer("", alert=False)
+    await event.client.send_message(
+        event.chat_id,
+        "📩 Send me the **numeric user ID** to remove:\n\n_Example: `123456789`_",
+        parse_mode='markdown',
+        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]]
+    )
+
+
+@events.register(events.CallbackQuery(pattern=r"admin_refresh"))
+async def admin_refresh_callback(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
+    await event.answer("✅ Refreshed", alert=False)
+    try:
+        await event.edit(
+            f"👑 **Admin Panel**\n\n"
+            f"**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\n"
+            f"Choose an action:",
+            parse_mode='markdown',
+            buttons=[
+                [Button.inline("➕ Add User", "admin_add")],
+                [Button.inline("➖ Remove User", "admin_remove")],
+                [Button.inline("🔄 Refresh List", "admin_refresh")],
+            ]
+        )
+    except Exception:
+        pass
+
+
+@events.register(events.CallbackQuery(pattern=r"admin_cancel"))
+async def admin_cancel_callback(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    admin_pending_add.pop(event.sender_id, None)
+    await event.answer("Cancelled", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+
 @events.register(events.NewMessage(pattern='/start', incoming=True))
 async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
@@ -1109,6 +1242,12 @@ async def main():
     client = TelegramClient('ultimate_bot_session', API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
 
+    client.add_event_handler(admin_cmd)
+    client.add_event_handler(admin_add_callback)
+    client.add_event_handler(admin_remove_callback)
+    client.add_event_handler(admin_refresh_callback)
+    client.add_event_handler(admin_cancel_callback)
+    client.add_event_handler(admin_input_handler)
     client.add_event_handler(start_cmd)
     client.add_event_handler(dirpy_command)
     client.add_event_handler(pdf_command)
