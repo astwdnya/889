@@ -147,17 +147,16 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
         'Accept': '*/*',
-        'Accept-Encoding': 'identity',  # بدون gzip تا content-length درست باشه
+        'Accept-Encoding': 'identity',
         'Connection': 'keep-alive',
     }
     if referer:
         headers['Referer'] = referer
 
-    # timeout فقط روی connect و read هر chunk - نه کل عملیات
     timeout = ClientTimeout(
-        total=None,        # بدون محدودیت کلی
-        connect=30,        # 30 ثانیه برای connect
-        sock_read=120,     # 120 ثانیه برای هر chunk
+        total=None,
+        connect=30,
+        sock_read=120,
     )
 
     filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
@@ -167,7 +166,6 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             attempt_headers = headers.copy()
-            # Resume از جایی که موند
             if downloaded > 0:
                 attempt_headers['Range'] = f'bytes={downloaded}-'
                 await safe_edit(status_msg, f"🔄 Retry {attempt}/{MAX_RETRIES} — resuming from {human_readable_size(downloaded)}...")
@@ -181,7 +179,6 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                     if total == 0:
                         content_length = int(response.headers.get('content-length', 0))
                         if response.status == 206:
-                            # Range request - total = downloaded + remaining
                             content_range = response.headers.get('content-range', '')
                             m = re.search(r'/(\d+)', content_range)
                             total = int(m.group(1)) if m else content_length + downloaded
@@ -191,7 +188,6 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                         if total > MAX_FILE_SIZE_MB * 1024 * 1024:
                             return None, f"File too large ({human_readable_size(total)})", 0
 
-                        # تشخیص نام فایل
                         cd = response.headers.get('Content-Disposition', '')
                         if 'filename=' in cd:
                             fm = re.search(r'filename="?([^";]+)', cd)
@@ -209,21 +205,19 @@ async def download_direct_with_progress(url: str, status_msg: Message, referer: 
                             downloaded += len(chunk)
                             await progress.update(downloaded)
 
-            # دانلود کامل شد
             await progress.finish(True, "")
             return filepath, None, downloaded
 
         except (aiohttp.ClientError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
             logger.warning(f"Download attempt {attempt} failed at {human_readable_size(downloaded)}: {e}")
             if attempt == MAX_RETRIES:
-                # پاک کردن فایل ناقص
                 try:
                     if os.path.exists(filepath):
                         os.remove(filepath)
                 except Exception:
                     pass
                 return None, f"Download failed after {MAX_RETRIES} retries: {str(e)[:80]}", 0
-            await asyncio.sleep(3)  # صبر قبل از retry
+            await asyncio.sleep(3)
 
         except Exception as e:
             logger.error(f"Unexpected download error: {e}")
@@ -251,13 +245,11 @@ def is_video_url(url: str) -> bool:
         ('luxuretv.com',         lambda u: '.mp4' in u and any(m in u for m in ['media', 'cdn', 'video', 'stream'])),
         ('rule34.xxx',           lambda u: '.mp4' in u or ('video' in u and 'api' not in u)),
         ('rule34video.com',      lambda u: '.mp4' in u),
-        # redtube و pornhub CDN (rdtcdn)
         ('rdtcdn.com',           lambda u: '.mp4' in u),
         ('ev-ph.rdtcdn.com',     lambda u: '.mp4' in u),
         ('redtube.com',          lambda u: '.mp4' in u),
         ('phncdn.com',           lambda u: '.mp4' in u),
         ('pornhub.com',          lambda u: '.mp4' in u and 'cdn' in u),
-        # سایت‌های عمومی
         ('ahrimp4',              lambda u: True),
         ('media4',               lambda u: '.mp4' in u),
     ]
@@ -269,19 +261,15 @@ def is_video_url(url: str) -> bool:
         if domain in u and check(u):
             return True
 
-    # Generic detector: هر URL با .mp4 روی CDN/media server
-    # شبیه همون چیزی که تو network inspector میبینی - فایل‌های بزرگ روی CDN
     GENERIC_CDN_SIGNALS = ['-cdn', 'media', 'video', 'stream', 'content', 'storage', 'ev-', 'cdn-', '.cdn']
     if '.mp4' in u and any(sig in u for sig in GENERIC_CDN_SIGNALS):
         return True
 
-    # فرمت‌های ویدیو دیگه
     for ext in ['.webm', '.m3u8', '.ts', '.mkv']:
         if ext in u and any(sig in u for sig in GENERIC_CDN_SIGNALS):
             return True
 
     return False
-
 
 
 # ====================== LUXURETV DIRECT EXTRACTOR ======================
@@ -347,14 +335,13 @@ async def extract_direct_from_site(video_url: str, status_msg: Message) -> Tuple
 
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, Optional[str]]:
     """
-    دو مرحله:
-    1. صفحه رو از طریق dirpy باز میکنه و response های ویدیویی رو collect میکنه
-    2. اگه چیزی پیدا نشد، مستقیم سایت اصلی رو باز میکنه
-    فقط فایل‌هایی که content-length > 1MB دارن یا URL شون مشخصاً CDN ویدیو هست capture میشن.
+    فقط از Dirpy استفاده میکنه - هیچ وقت به سایت اصلی مراجعه نمیکنه.
+    فیلتر سایز: فقط فایل‌های > 1MB یا CDN‌های شناخته‌شده.
     """
     SKIP = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite',
             'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
-    MIN_SIZE = 1 * 1024 * 1024  # حداقل 1MB برای response-based capture
+    # حداقل سایز برای capture کردن - جلوگیری از گرفتن gif یا thumbnail
+    MIN_SIZE = 2 * 1024 * 1024  # حداقل 2MB
 
     async with async_playwright() as p:
         browser = None
@@ -382,10 +369,9 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 viewport={'width': 1280, 'height': 720}
             )
 
-            async def run_page(target_url: str, label: str):
+            async def run_dirpy_page(target_url: str, label: str):
                 page = await context.new_page()
                 try:
-                    # Response interception - فقط فایل‌های بزرگ
                     async def on_response(response):
                         try:
                             ct = response.headers.get('content-type', '')
@@ -394,18 +380,21 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                             rul = ru.lower()
                             if any(k in rul for k in SKIP):
                                 return
-                            # شرط ۱: content-type ویدیو + حجم بالا
+                            # شرط ۱: content-type ویدیو + حجم بالای MIN_SIZE
                             if ('video/' in ct) and cl > MIN_SIZE:
                                 add_url(ru, f"RESP-CT {label}")
                                 return
-                            # شرط ۲: URL مشخصاً CDN ویدیو هست (حتی اگه content-length نداشت)
+                            # شرط ۲: CDN شناخته‌شده + mp4 + حجم بالا (اگه content-length داشت)
                             is_cdn = any(d in rul for d in [
                                 'rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
                                 'media4.luxuretv', 'media.luxuretv',
                                 'rule34.xxx', 'rule34video',
+                                'kv-ph.', 'ev-ph.', 'di-ph.',
                             ])
                             if is_cdn and '.mp4' in rul:
-                                add_url(ru, f"RESP-CDN {label}")
+                                # اگه content-length داره باید بالای MIN_SIZE باشه
+                                if cl == 0 or cl > MIN_SIZE:
+                                    add_url(ru, f"RESP-CDN {label}")
                         except Exception:
                             pass
 
@@ -419,30 +408,26 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                         await page.wait_for_timeout(8000)
 
                     if not captured_urls:
-                        # scan HTML برای لینک‌های CDN مشخص
+                        # scan HTML برای CDN لینک‌های شناخته‌شده
                         html = await page.content()
                         cdn_domains = ['rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
                                        'media4.luxuretv', 'media.luxuretv',
-                                       'ev-ph.', 'rule34video', 'p300cdn']
+                                       'kv-ph.', 'ev-ph.', 'di-ph.',
+                                       'rule34video', 'p300cdn']
                         for m in re.findall(r"https?://[^\x22\x27<>\s]+\.mp4[^\x22\x27<>\s]*", html):
                             if any(d in m.lower() for d in cdn_domains):
                                 add_url(m, f"HTML-CDN {label}")
                 finally:
                     await page.close()
 
-            # مرحله ۱: از طریق dirpy
+            # فقط از Dirpy - هیچ fallback به سایت اصلی وجود نداره
             await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
-            await run_page(dirpy_url, "DIRPY")
-
-            # مرحله ۲: اگه پیدا نشد، مستقیم سایت اصلی رو باز کن
-            if not captured_urls:
-                await safe_edit(status_msg, "🌐 Trying direct site extraction...")
-                await run_page(video_url, "DIRECT")
+            await run_dirpy_page(dirpy_url, "DIRPY")
 
             if captured_urls:
                 return captured_urls, None
-            return [], "Could not capture direct video link after all attempts"
+            return [], "Could not capture video link via Dirpy"
 
         except Exception as e:
             logger.error(f"Interception error: {e}")
@@ -465,9 +450,8 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=120000)
             except Exception:
-                pass  # ادامه بده حتی اگه timeout خورد
+                pass
 
-            # Age gate bypass - کلیک روی دکمه تایید سن
             try:
                 age_selectors = [
                     'button:has-text("I AM 18")',
@@ -498,7 +482,6 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
                 pass
 
             await safe_edit(status_msg, "📜 Scrolling to load all images...")
-            # اسکرول تدریجی برای trigger کردن lazy load
             await page.evaluate("""
                 async () => {
                     const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -514,7 +497,6 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
                     await delay(500);
                 }
             """)
-            # صبر برای لود شدن عکس‌ها بعد از scroll
             await asyncio.sleep(4)
 
             await safe_edit(status_msg, "📄 Rendering PDF...")
@@ -623,8 +605,6 @@ async def safe_edit(msg: Message, text: str):
         pass
 
 
-# ====================== PROCESS DIRPY REQUEST ======================
-
 # ====================== GET FILE SIZE VIA HEAD ======================
 async def get_file_size(url: str) -> int:
     """حجم فایل رو با HEAD request میگیره."""
@@ -641,14 +621,12 @@ async def get_file_size(url: str) -> int:
 def _url_label(url: str, size: int, index: int) -> str:
     """لیبل دکمه برای هر لینک."""
     u = url.lower()
-    # تشخیص کیفیت از URL
     quality = "Unknown"
     for q in ['2160p', '1080p', '720p', '480p', '360p', '240p', '4k', 'hd', 'sd', 'hq', 'lq']:
         if q in u:
             quality = q.upper()
             break
     sz_str = human_readable_size(size) if size > 0 else "? MB"
-    # اسم دامین
     try:
         from urllib.parse import urlparse
         domain = urlparse(url).netloc.replace('www.', '')[:20]
@@ -709,37 +687,23 @@ async def process_dirpy_request(event, url: str):
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
 
-        await safe_edit(status_msg, "🌐 Opening Dirpy Studio and capturing stream...")
-
-        url_lower = url.lower()
-
-        # برای این سایت‌ها مستقیم از سورس سایت بگیر (نه از dirpy)
-        DIRECT_SITES = ['luxuretv.com', 'redtube.com', 'porn300.com', 'pornhub.com', 'xvideos.com', 'xhamster.com']
-        if any(s in url_lower for s in DIRECT_SITES):
-            found_urls, intercept_err = await extract_direct_from_site(url, status_msg)
-            if not found_urls:
-                await safe_edit(status_msg, "⚠️ Direct failed, trying Dirpy fallback...")
-                found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
-        else:
-            found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
+        # همیشه فقط از Dirpy - برای همه سایت‌ها
+        found_urls, intercept_err = await extract_video_url_smart(url, status_msg)
 
         if not found_urls:
-            await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
+            await safe_edit(status_msg, f"❌ Could not capture video via Dirpy:\n{intercept_err}")
             return
 
-        # اگه فقط یه لینک پیدا شد مستقیم دانلود کن
         if len(found_urls) == 1:
             await do_download_and_send(event, status_msg, found_urls[0], url)
             return
 
-        # چند لینک پیدا شد - حجم هر کدوم رو بگیر و لیست کن
         await safe_edit(status_msg, f"🔍 Found {len(found_urls)} links, checking sizes...")
         sized_urls = []
         for u in found_urls:
             sz = await get_file_size(u)
             sized_urls.append((u, sz))
 
-        # ذخیره لینک‌ها برای callback
         pick_id = f"pick_{event.chat_id}_{int(time.time())}"
         video_cache[pick_id] = {
             "urls": sized_urls,
@@ -747,7 +711,6 @@ async def process_dirpy_request(event, url: str):
             "chat_id": event.chat_id
         }
 
-        # ساخت دکمه‌ها - هر لینک یه دکمه
         buttons = []
         for i, (u, sz) in enumerate(sized_urls):
             label = _url_label(u, sz, i)
@@ -800,7 +763,6 @@ async def check_callback(event):
         del video_cache[video_id]
 
 
-
 @events.register(events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$"))
 async def pickurl_callback(event):
     raw = event.pattern_match.group(1).decode() if isinstance(event.pattern_match.group(1), bytes) else event.pattern_match.group(1)
@@ -822,7 +784,6 @@ async def pickurl_callback(event):
 
     await event.answer(f"Starting download #{idx+1}...", alert=False)
 
-    # حذف پیام انتخاب
     try:
         await event.delete()
     except Exception:
@@ -845,7 +806,7 @@ async def size_input_handler(event):
     if not state or state.get("action") != "wait_for_compression_size":
         return
 
-    raise events.StopPropagation  # جلوگیری از رسیدن به generic_url_handler
+    raise events.StopPropagation
 
     video_id = state["video_id"]
     if video_id not in video_cache:
@@ -1000,7 +961,6 @@ async def html_command(event):
 async def generic_url_handler(event):
     if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith('/'):
         return
-    # اگه کاربر داره size می‌فرسته، این handler نباید اجرا بشه
     if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_compression_size":
         return
     urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
