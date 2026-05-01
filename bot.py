@@ -22,7 +22,7 @@ from aiohttp import ClientTimeout
 from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button
-from telethon.tl.types import Message
+from telethon.tl.types import Message, DocumentAttributeVideo
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -290,6 +290,39 @@ async def dl_cancel_callback(event):
 
 
 # ====================== UPLOAD WITH PROGRESS ======================
+async def get_video_thumbnail(filepath: str) -> Optional[str]:
+    """یه فریم از وسط ویدیو به عنوان thumbnail می‌گیره"""
+    try:
+        thumb_path = filepath + "_thumb.jpg"
+        # مدت ویدیو رو بگیر تا فریم از وسط باشه
+        probe = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', filepath,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await probe.communicate()
+        duration = 0.0
+        try:
+            duration = float(json.loads(stdout.decode()).get('format', {}).get('duration', 0))
+        except Exception:
+            pass
+        seek_time = max(duration / 2, 1) if duration > 2 else 0
+
+        proc = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-y', '-ss', str(seek_time), '-i', filepath,
+            '-vframes', '1', '-q:v', '2',
+            '-vf', 'scale=320:-1',
+            thumb_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
+    except Exception:
+        pass
+    return None
+
+
 async def send_file_with_progress(
     client, chat_id: int, filepath: str, caption: str,
     status_msg: Message, buttons=None, supports_streaming: bool = True
@@ -299,6 +332,10 @@ async def send_file_with_progress(
     last_update = [0.0]
     last_bytes = [0]
     last_time = [start_time]
+
+    # اطلاعات ویدیو برای نمایش درست در تلگرام
+    duration, width, height = await get_video_info(filepath)
+    thumb_path = await get_video_thumbnail(filepath)
 
     async def progress_cb(current: int, total: int):
         now = time.time()
@@ -314,11 +351,30 @@ async def send_file_with_progress(
             await status_msg.edit(text, parse_mode='markdown')
         except Exception: pass
 
-    uploaded = await client.upload_file(filepath, file_size=file_size, progress_callback=progress_cb)
-    await client.send_file(
-        chat_id, uploaded, caption=caption,
-        supports_streaming=supports_streaming, buttons=buttons, parse_mode='markdown',
-    )
+    try:
+        duration_int = int(duration) if duration else 0
+        await client.send_file(
+            chat_id, filepath, caption=caption,
+            supports_streaming=True, buttons=buttons, parse_mode='markdown',
+            progress_callback=progress_cb,
+            attributes=[
+                DocumentAttributeVideo(
+                    duration=duration_int,
+                    w=width if width else 0,
+                    h=height if height else 0,
+                    supports_streaming=True,
+                )
+            ],
+            thumb=thumb_path,
+        )
+    finally:
+        # پاک کردن thumbnail موقت
+        if thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except Exception:
+                pass
+
     try:
         await status_msg.delete()
     except Exception: pass
@@ -364,11 +420,23 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
     ]
     await safe_edit(status_msg, "📤 Uploading...")
     try:
+        # مدت زمان ویدیو رو برای caption بگیر
+        vid_duration, _, _ = await get_video_info(filepath)
+        dur_str = ""
+        if vid_duration and vid_duration > 0:
+            mins, secs = divmod(int(vid_duration), 60)
+            hours, mins = divmod(mins, 60)
+            if hours > 0:
+                dur_str = f"\n⏱ Duration: {hours}:{mins:02d}:{secs:02d}"
+            else:
+                dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
+
         await send_file_with_progress(
             client=event.client, chat_id=event.chat_id, filepath=filepath,
             caption=(
                 f"🎬 **Video Downloaded**\n"
-                f"📦 Size: {human_readable_size(final_size)}\n"
+                f"📦 Size: {human_readable_size(final_size)}"
+                f"{dur_str}\n"
                 f"🔗 [Source]({source_url})\n"
                 f"⬇️ [DW Link]({direct_url})"
             ),
@@ -1187,9 +1255,18 @@ async def generic_url_handler(event):
         return
     await safe_edit(status_msg, "📤 Uploading...")
     try:
+        vid_duration, _, _ = await get_video_info(filepath)
+        dur_str = ""
+        if vid_duration and vid_duration > 0:
+            mins, secs = divmod(int(vid_duration), 60)
+            hours, mins = divmod(mins, 60)
+            if hours > 0:
+                dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
+            else:
+                dur_str = f" | ⏱ {mins}:{secs:02d}"
         await send_file_with_progress(
             client=event.client, chat_id=event.chat_id, filepath=filepath,
-            caption=f"📦 {human_readable_size(size)}", status_msg=status_msg,
+            caption=f"📦 {human_readable_size(size)}{dur_str}", status_msg=status_msg,
         )
     except Exception as e:
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
