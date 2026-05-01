@@ -339,7 +339,8 @@ async def send_file_with_progress(
 
     async def progress_cb(current: int, total: int):
         now = time.time()
-        if now - last_update[0] < 1.5 and current != total:
+        # هر 3 ثانیه یه بار آپدیت — کمتر فشار روی event loop
+        if now - last_update[0] < 3.0 and current != total:
             return
         last_update[0] = now
         dt = now - last_time[0]
@@ -348,7 +349,7 @@ async def send_file_with_progress(
         last_time[0] = now
         text = build_progress_text("📤 Uploading", current, total, speed, start_time)
         try:
-            await status_msg.edit(text, parse_mode='markdown')
+            asyncio.ensure_future(status_msg.edit(text, parse_mode='markdown'))
         except Exception: pass
 
     try:
@@ -1286,7 +1287,13 @@ async def main():
     print("="*60)
 
     start_keep_alive()
-    client = TelegramClient('ultimate_bot_session', API_ID, API_HASH)
+    client = TelegramClient(
+        'ultimate_bot_session', API_ID, API_HASH,
+        # افزایش سرعت آپلود — telethon به صورت پیش‌فرض فقط 1 worker داره
+        connection_retries=5,
+        workers=4,           # thread های موازی برای آپلود
+        upload_workers=4,    # worker های اختصاصی آپلود (telethon >= 1.24)
+    )
     await client.start(bot_token=BOT_TOKEN)
 
     client.add_event_handler(admin_cmd)
