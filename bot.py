@@ -25,7 +25,7 @@ from telethon import TelegramClient, events, Button
 from telethon.tl.types import Message
 
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = "7675664254:AAHL7QhPonc47z0QKRFnB5p_L15SRiLBddc"
+BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
