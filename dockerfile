@@ -34,6 +34,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # کپی کد بات
 COPY bot.py .
+COPY FastTelethon.py .
 
 # ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
