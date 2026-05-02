@@ -119,7 +119,7 @@ async def download_with_controls(
     extra_headers: Optional[dict] = None,
 ) -> Tuple[Optional[str], Optional[str], int]:
     MAX_RETRIES = 3
-    CHUNK_SIZE = 512 * 1024
+    CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks — سرعت دانلود بیشتر
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
@@ -162,7 +162,7 @@ async def download_with_controls(
                     f"🔄 Retry {attempt}/{MAX_RETRIES} — resuming from {human_readable_size(downloaded)}...",
                     buttons=dl_buttons_pause)
 
-            connector = aiohttp.TCPConnector(limit=1, ttl_dns_cache=300, ssl=False)
+            connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False)
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 async with session.get(url, headers=attempt_headers, allow_redirects=True) as response:
                     # FIX: 403 رو به عنوان کد خاص برمیگردونه تا caller تصمیم بگیره
