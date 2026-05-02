@@ -358,7 +358,7 @@ async def send_file_with_progress(
         duration_int = int(duration) if duration else 0
         # FastTelethon: parallel upload — چند connection همزمان به تلگرام
         with open(filepath, 'rb') as f:
-            uploaded = await fast_upload_file(client, f, progress_callback=progress_cb)
+            uploaded = await fast_upload_file(client, f, progress_callback=progress_cb, connection_count=15)
 
         # ساخت media با متادیتای ویدیو
         attributes, mime_type = utils.get_attributes(
@@ -378,6 +378,7 @@ async def send_file_with_progress(
             attributes=attributes,
             thumb=None,
             force_file=False,
+            spoiler=True,  # ویدیو با حالت سانسور — یه بار کلیک برای نمایش
         )
         await client.send_file(
             chat_id, media, caption=caption,
