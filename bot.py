@@ -21,8 +21,10 @@ from aiohttp import ClientTimeout
 
 from playwright.async_api import async_playwright
 
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import Message, DocumentAttributeVideo
+from telethon import TelegramClient, events, Button, utils
+from telethon.tl.types import (Message, DocumentAttributeVideo,
+                                InputMediaUploadedDocument)
+from FastTelethon import upload_file as fast_upload_file
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -354,10 +356,13 @@ async def send_file_with_progress(
 
     try:
         duration_int = int(duration) if duration else 0
-        await client.send_file(
-            chat_id, filepath, caption=caption,
-            supports_streaming=True, buttons=buttons, parse_mode='markdown',
-            progress_callback=progress_cb,
+        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
+        with open(filepath, 'rb') as f:
+            uploaded = await fast_upload_file(client, f, progress_callback=progress_cb)
+
+        # ساخت media با متادیتای ویدیو
+        attributes, mime_type = utils.get_attributes(
+            filepath,
             attributes=[
                 DocumentAttributeVideo(
                     duration=duration_int,
@@ -366,7 +371,17 @@ async def send_file_with_progress(
                     supports_streaming=True,
                 )
             ],
-            thumb=thumb_path,
+        )
+        media = InputMediaUploadedDocument(
+            file=uploaded,
+            mime_type=mime_type,
+            attributes=attributes,
+            thumb=None,
+            force_file=False,
+        )
+        await client.send_file(
+            chat_id, media, caption=caption,
+            buttons=buttons, parse_mode='markdown',
         )
     finally:
         # پاک کردن thumbnail موقت
