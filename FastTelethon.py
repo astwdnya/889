@@ -117,11 +117,12 @@ class ParallelTransferrer:
         self.senders = None
 
     @staticmethod
-    def _get_connection_count(file_size: int, max_count: int = 20,
+    def _get_connection_count(file_size: int, max_count: int = 15,
                               full_size: int = 100 * 1024 * 1024) -> int:
         if file_size > full_size:
             return max_count
-        return math.ceil((file_size / full_size) * max_count)
+        # حداقل 5 connection حتی برای فایل‌های کوچک
+        return max(5, math.ceil((file_size / full_size) * max_count))
 
     async def _init_upload(self, connections: int, file_id: int, part_count: int,
                            big: bool) -> None:
@@ -157,7 +158,8 @@ class ParallelTransferrer:
                           part_size_kb: Optional[float] = None,
                           connection_count: Optional[int] = None) -> Tuple[int, int, bool]:
         connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = (part_size_kb or utils.get_appropriated_part_size(file_size)) * 1024
+        # part_size_kb رو 512KB بذار (حداکثر مجاز تلگرام) برای سرعت بیشتر
+        part_size = (part_size_kb or 512) * 1024
         part_count = (file_size + part_size - 1) // part_size
         is_large = file_size > 10 * 1024 * 1024
         await self._init_upload(connection_count, file_id, part_count, is_large)
@@ -181,14 +183,16 @@ def stream_file(file_to_stream: BinaryIO, chunk_size=1024):
 
 async def _internal_transfer_to_telegram(client: TelegramClient,
                                          response: BinaryIO,
-                                         progress_callback: callable
+                                         progress_callback: callable,
+                                         connection_count: Optional[int] = None,
                                          ) -> Tuple[TypeInputFile, int]:
     file_id = helpers.generate_random_long()
     file_size = os.path.getsize(response.name)
 
     hash_md5 = hashlib.md5()
     uploader = ParallelTransferrer(client)
-    part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
+    part_size, part_count, is_large = await uploader.init_upload(file_id, file_size,
+                                                                  connection_count=connection_count)
     buffer = bytearray()
     for data in stream_file(response):
         if progress_callback:
@@ -221,6 +225,7 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
 async def upload_file(client: TelegramClient,
                       file: BinaryIO,
                       progress_callback: callable = None,
+                      connection_count: Optional[int] = None,
                       ) -> TypeInputFile:
-    res = (await _internal_transfer_to_telegram(client, file, progress_callback))[0]
+    res = (await _internal_transfer_to_telegram(client, file, progress_callback, connection_count))[0]
     return res
