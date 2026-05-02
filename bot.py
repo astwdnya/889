@@ -1289,10 +1289,7 @@ async def main():
     start_keep_alive()
     client = TelegramClient(
         'ultimate_bot_session', API_ID, API_HASH,
-        # افزایش سرعت آپلود — telethon به صورت پیش‌فرض فقط 1 worker داره
         connection_retries=5,
-        workers=4,           # thread های موازی برای آپلود
-        upload_workers=4,    # worker های اختصاصی آپلود (telethon >= 1.24)
     )
     await client.start(bot_token=BOT_TOKEN)
 
