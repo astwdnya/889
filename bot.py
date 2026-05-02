@@ -372,13 +372,18 @@ async def send_file_with_progress(
                 )
             ],
         )
+        # آپلود thumbnail به تلگرام
+        thumb_input = None
+        if thumb_path and os.path.exists(thumb_path):
+            with open(thumb_path, 'rb') as tf:
+                thumb_input = await fast_upload_file(client, tf)
+
         media = InputMediaUploadedDocument(
             file=uploaded,
             mime_type=mime_type,
             attributes=attributes,
-            thumb=None,
+            thumb=thumb_input,
             force_file=False,
-            spoiler=True,  # ویدیو با حالت سانسور — یه بار کلیک برای نمایش
         )
         await client.send_file(
             chat_id, media, caption=caption,
