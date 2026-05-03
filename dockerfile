@@ -24,6 +24,10 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_SKIP_FFMPEG_INSTALL=1
 
+# محدودیت RAM برای Python GC
+ENV PYTHONMALLOC=malloc
+ENV MALLOC_TRIM_THRESHOLD_=65536
+
 WORKDIR /app
 
 # نصب پکیج‌های پایتون
@@ -40,4 +44,7 @@ COPY FastTelethon.py .
 RUN mkdir -p output_files && chmod -R 777 output_files
 
 EXPOSE 10000
+
+# ulimit -v برای محدود کردن virtual memory به 500MB
+# اگه Render از این پشتیبانی نکنه، پایتون خودش resource limit میزنه
 CMD ["python", "-u", "bot.py"]
