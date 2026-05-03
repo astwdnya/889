@@ -1182,72 +1182,25 @@ async def process_pdfimg_request(event, url: str):
             await safe_edit(status, "Could not download any valid images.")
             return
 
-        # ---- مرحله 3: ساخت PDF سه‌ستونه ----
-        await safe_edit(status, f"Building PDF with {len(images)} images...")
-        COLS = 3
-        PAGE_W = 2480
-        MARGIN = 40
-        GAP = 20
-        cell_w = (PAGE_W - 2 * MARGIN - (COLS - 1) * GAP) // COLS
-
-        def make_page(rows):
-            row_heights = []
-            for row in rows:
-                max_h = max(int(im.height * (cell_w / im.width)) for im in row)
-                row_heights.append(max_h)
-            total_h = 2 * MARGIN + sum(row_heights) + (len(rows) - 1) * GAP
-            page = PILImage.new('RGB', (PAGE_W, max(3508, total_h)), (255, 255, 255))
-            y = MARGIN
-            for ri, row in enumerate(rows):
-                x = MARGIN
-                for im in row:
-                    nw = cell_w
-                    nh = int(im.height * (cell_w / im.width))
-                    page.paste(im.resize((nw, nh), PILImage.LANCZOS), (x, y))
-                    x += cell_w + GAP
-                y += row_heights[ri] + GAP
-            return page
-
-        pdf_pages = []
-        row_buf, rows_in_page = [], []
-        for im in images:
-            row_buf.append(im)
-            if len(row_buf) == COLS:
-                rows_in_page.append(row_buf); row_buf = []
-            if len(rows_in_page) == 8:
-                pdf_pages.append(make_page(rows_in_page)); rows_in_page = []
-        if row_buf: rows_in_page.append(row_buf)
-        if rows_in_page: pdf_pages.append(make_page(rows_in_page))
-
-        out_pdf = f"{tmp_dir}/images.pdf"
-        if len(pdf_pages) == 1:
-            pdf_pages[0].save(out_pdf, 'PDF', resolution=300)
-        else:
-            pdf_pages[0].save(out_pdf, 'PDF', resolution=300,
-                              save_all=True, append_images=pdf_pages[1:])
-        size = os.path.getsize(out_pdf)
-
+        # ---- مرحله 3: ذخیره session و نمایش دکمه‌ها ----
         session_key = f"pdfimg_{event.chat_id}_{event.id}"
         pdfimg_sessions[session_key] = {
-            'pdf_path': out_pdf,
             'img_paths': saved_img_paths,
             'tmp_dir': tmp_dir,
             'chat_id': event.chat_id,
         }
 
-        await safe_edit(status, "Uploading PDF...")
-        await event.client.send_file(
-            event.chat_id, out_pdf,
-            caption=f"Image PDF - {len(images)} images - {human_readable_size(size)}",
-            force_document=True, parse_mode='markdown',
-        )
         await status.delete()
         await event.client.send_message(
             event.chat_id,
-            f"{len(images)} images ready:",
+            (
+                f"🖼 **{len(images)} images ready**\n"
+                "Press the button to send all to Telegram:"
+            ),
+            parse_mode='markdown',
             buttons=[
-                [Button.inline(f"Send All Images ({len(images)})", f"pdfimg_send|{session_key}")],
-                [Button.inline("Delete from server", f"pdfimg_del|{session_key}")],
+                [Button.inline(f"📨 Send All Images ({len(images)})", f"pdfimg_send|{session_key}")],
+                [Button.inline("🗑 Delete from server", f"pdfimg_del|{session_key}")],
             ]
         )
 
@@ -1397,7 +1350,7 @@ async def pdf_command(event):
 
 
 
-@events.register(events.CallbackQuery(pattern=b'pdfimg_del|'))
+@events.register(events.CallbackQuery(pattern=rb'pdfimg_del\|'))
 async def pdfimg_del_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
@@ -1411,7 +1364,7 @@ async def pdfimg_del_callback(event):
     await event.answer("🗑 Deleted from server.")
 
 
-@events.register(events.CallbackQuery(pattern=b'pdfimg_send|'))
+@events.register(events.CallbackQuery(pattern=rb'pdfimg_send\|'))
 async def pdfimg_send_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
