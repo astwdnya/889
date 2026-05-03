@@ -1453,41 +1453,44 @@ async def pdfimg_send_callback(event):
     chat_id = session['chat_id']
     total = len(img_paths)
 
-    # ارسال گروهی ۱۰تایی (حداکثر تلگرام)
+    if total == 0:
+        return await event.client.send_message(chat_id, "❌ No images found on server.")
+
     status = await event.client.send_message(chat_id, f"📨 Sending {total} images...")
     sent = 0
-    BATCH = 10
-    for i in range(0, total, BATCH):
-        batch = img_paths[i:i+BATCH]
+
+    # یکی‌یکی بفرست به عنوان عکس
+    for img_path in img_paths:
         try:
             await event.client.send_file(
                 chat_id,
-                batch,
-                # photo=True → ارسال به عنوان عکس نه سند
+                img_path,
+                force_document=False,  # عکس نه سند
             )
-            sent += len(batch)
-            try:
-                await status.edit(f"📨 Sending... {sent}/{total}")
-            except Exception: pass
+            sent += 1
+            if sent % 5 == 0 or sent == total:
+                try:
+                    await status.edit(f"📨 Sending... {sent}/{total}")
+                except Exception: pass
         except Exception as e:
             try:
-                await status.edit(f"⚠️ Error at batch {i//BATCH+1}: {str(e)[:80]}")
+                await status.edit(f"⚠️ Error on image {sent+1}: {str(e)[:80]}")
             except Exception: pass
 
-    # پاک کردن خودکار بعد از ارسال همه عکس‌ها
+    # پاک کردن خودکار
     import shutil
     pdfimg_sessions.pop(session_key, None)
     try:
         shutil.rmtree(session['tmp_dir'], ignore_errors=True)
     except Exception: pass
 
-    # حذف دکمه‌ها از پیام PDF
+    # حذف دکمه‌ها
     try:
         await event.edit(buttons=None)
     except Exception: pass
 
     try:
-        await status.edit(f"✅ Sent {sent}/{total} images! 🗑 Cleaned up from server.")
+        await status.edit(f"✅ Sent {sent}/{total} images! 🗑 Cleaned up.")
     except Exception: pass
 
 @events.register(events.NewMessage(pattern='/pdfimg', incoming=True))
