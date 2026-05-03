@@ -17,7 +17,28 @@ from threading import Thread
 
 import aiohttp
 import aiofiles
+import gc
+import resource
 from aiohttp import ClientTimeout
+
+def _check_memory_mb() -> float:
+    """مصرف RAM فعلی به MB."""
+    try:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return 0.0
+
+async def _assert_memory(threshold_mb: int = 400):
+    """اگه RAM بیشتر از حد مجاز بود، gc میزنه و اگه باز هم زیاد بود exception میزنه."""
+    gc.collect()
+    used = _check_memory_mb()
+    if used > threshold_mb:
+        logger.warning(f"High memory: {used:.0f}MB — forcing GC")
+        gc.collect()
+        used = _check_memory_mb()
+        if used > 480:
+            raise MemoryError(f"RAM usage too high ({used:.0f}MB). Please try again later.")
+
 
 from playwright.async_api import async_playwright
 
@@ -122,7 +143,7 @@ async def download_with_controls(
     extra_headers: Optional[dict] = None,
 ) -> Tuple[Optional[str], Optional[str], int]:
     MAX_RETRIES = 3
-    CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks — سرعت دانلود بیشتر
+    CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
@@ -503,6 +524,24 @@ SKIP_KEYWORDS = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite
                  'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
 MIN_SIZE = 2 * 1024 * 1024  # 2MB
 
+
+def _browser_args() -> list:
+    """آرگومان‌های chromium برای مصرف RAM کم."""
+    return [
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-translate',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--no-first-run',
+        '--js-flags=--max-old-space-size=96',
+    ]
+
 KNOWN_CDN_DOMAINS = [
     'rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
     'media4.luxuretv', 'media.luxuretv',
@@ -519,6 +558,24 @@ def _should_capture(url: str, content_type: str = "", content_length: int = 0) -
         return False
     if 'video/' in content_type and content_length > MIN_SIZE:
         return True
+    is_known_cdn = any(d in ul for d in KNOWN_CDN_DOMAINS)
+def _browser_args() -> list:
+    """آرگومان‌های chromium برای مصرف RAM کم."""
+    return [
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-translate',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--no-first-run',
+        '--js-flags=--max-old-space-size=96',
+    ]
+
     is_known_cdn = any(d in ul for d in KNOWN_CDN_DOMAINS)
     has_video_ext = '.mp4' in ul or '.webm' in ul or 'videoplayback' in ul or '/get_file/' in ul
     if is_known_cdn and has_video_ext:
@@ -617,10 +674,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
         session_headers: dict = {}
 
         try:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            )
+            browser = await p.chromium.launch(headless=True, args=_browser_args())
 
             async def make_context():
                 return await browser.new_context(
@@ -711,10 +765,7 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
     async with async_playwright() as p:
         browser = None
         try:
-            browser = await p.chromium.launch(headless=True, args=[
-                '--no-sandbox', '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-            ])
+            browser = await p.chromium.launch(headless=True, args=_browser_args())
             page = await browser.new_page(viewport={"width": 1280, "height": 900})
             await safe_edit(status_msg, "🌐 Loading page...")
             try:
@@ -769,7 +820,7 @@ async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], O
         browser = None
         try:
             await safe_edit(status_msg, "🌐 Capturing full webpage as MHTML...")
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+            browser = await p.chromium.launch(headless=True, args=_browser_args())
             context = await browser.new_context()
             page = await context.new_page()
             await page.goto(url, wait_until="networkidle", timeout=60000)
@@ -1137,7 +1188,7 @@ async def process_pdfimg_request(event, url: str):
         # ---- مرحله 1: استخراج URL عکس‌ها + لینک post اصلی با playwright ----
         img_data = []  # list of {"thumb": url, "post": url_or_None, "orig": url_or_None}
         async with async_playwright() as p:
-            browser = await p.chromium.launch(args=['--no-sandbox', '--disable-gpu'])
+            browser = await p.chromium.launch(headless=True, args=_browser_args())
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
                 extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
@@ -1216,6 +1267,7 @@ async def process_pdfimg_request(event, url: str):
                             if img.width < 80 or img.height < 80: continue
                             img_path = f"{tmp_dir}/img_{len(saved):04d}.jpg"
                             img.save(img_path, 'JPEG', quality=92)
+                            img.close()
                             saved.append({"path": img_path, "is_gif": False,
                                           "thumb_url": thumb_url, "post_url": post_url, "orig_url": orig_url})
 
@@ -1585,6 +1637,15 @@ async def generic_url_handler(event):
 
 # ====================== MAIN ======================
 async def main():
+    # ===== سقف RAM: 500MB برای کل پروسه =====
+    try:
+        import resource
+        MAX_RAM_BYTES = 500 * 1024 * 1024  # 500MB
+        resource.setrlimit(resource.RLIMIT_AS, (MAX_RAM_BYTES, MAX_RAM_BYTES))
+        logger.info(f"Memory limit set: 500MB")
+    except Exception as e:
+        logger.warning(f"Could not set memory limit: {e}")
+
     print("\n" + "="*60)
     print("🚀 ULTIMATE BOT v5")
     print("   FIX 1: 403 → auto-retry via Dirpy")
