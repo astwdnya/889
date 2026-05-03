@@ -666,6 +666,37 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
             pass
 
 
+
+async def _run_with_playwright(coro_factory, retries: int = 2):
+    """
+    یه coroutine رو با playwright اجرا میکنه.
+    اگه browser کرش کرد (Connection closed) دوباره امتحان میکنه.
+    coro_factory: تابعی که یه coroutine برمیگردونه — هر بار با browser جدید
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=_browser_args())
+                try:
+                    result = await coro_factory(browser)
+                    return result
+                finally:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            if 'connection closed' in err_str or 'target closed' in err_str or 'browser has disconnected' in err_str:
+                logger.warning(f"Browser crash on attempt {attempt}/{retries}: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(2)
+                    continue
+            raise
+    raise last_err
+
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, dict, Optional[str]]:
     async with async_playwright() as p:
         browser = None
@@ -808,10 +839,14 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
                            margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"})
             return filepath, None, os.path.getsize(filepath)
         except Exception as e:
-            return None, f"PDF Error: {str(e)[:80]}", 0
+            err = str(e)
+            if 'connection closed' in err.lower() or 'browser' in err.lower():
+                return None, "PDF Error: Browser crashed. Please try again.", 0
+            return None, f"PDF Error: {err[:80]}", 0
         finally:
             if browser:
-                await browser.close()
+                try: await browser.close()
+                except Exception: pass
 
 
 # ====================== CAPTURE MHTML ======================
@@ -1009,7 +1044,11 @@ async def process_dirpy_request(event, url: str):
         await status_msg.delete()
     except Exception as e:
         logger.error(f"Dirpy process error: {e}", exc_info=True)
-        await safe_edit(status_msg, f"❌ Unexpected error: {str(e)[:120]}")
+        err_str = str(e)
+        if 'connection closed' in err_str.lower() or 'browser' in err_str.lower():
+            await safe_edit(status_msg, "❌ Browser crashed. Please try again.")
+        else:
+            await safe_edit(status_msg, f"❌ Error: {err_str[:120]}")
     finally:
         processing_messages.discard(msg_id)
 
@@ -1310,7 +1349,11 @@ async def process_pdfimg_request(event, url: str):
 
     except Exception as e:
         logger.error(f"pdfimg error: {e}", exc_info=True)
-        await safe_edit(status, f"Error: {str(e)[:200]}")
+        err = str(e)
+        if 'connection closed' in err.lower() or 'browser' in err.lower():
+            await safe_edit(status, "❌ Browser crashed. Please try again.")
+        else:
+            await safe_edit(status, f"❌ Error: {err[:200]}")
     finally:
         processing_messages.discard(msg_id)
 
