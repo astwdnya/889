@@ -1267,15 +1267,19 @@ async def process_pdfimg_request(event, url: str):
         await safe_edit(status, "📤 Uploading PDF...")
         await event.client.send_file(
             event.chat_id, out_pdf,
-            caption=(f"🖼 **Image PDF**\n"
-                    f"📊 {len(images)} images • {human_readable_size(size)}"),
+            caption=f"🖼 **Image PDF** • {len(images)} images • {human_readable_size(size)}",
             force_document=True, parse_mode='markdown',
-            buttons=[
-                [Button.inline(f"📨 Send All Images ({len(images)})", f"pdfimg_send|{session_key}")],
-                [Button.inline("🗑 Delete PDF from server", f"pdfimg_del|{session_key}")],
-            ]
         )
         await status.delete()
+        # دکمه‌ها رو جداگانه بفرست (force_document با buttons همزمان کار نمیکنه)
+        await event.client.send_message(
+            event.chat_id,
+            "چیکار کنم؟",
+            buttons=[
+                [Button.inline(f"📨 Send All Images ({len(images)})", f"pdfimg_send|{session_key}")],
+                [Button.inline("🗑 Delete from server", f"pdfimg_del|{session_key}")],
+            ]
+        )
 
     except Exception as e:
         await safe_edit(status, f"❌ Error: {str(e)[:150]}")
