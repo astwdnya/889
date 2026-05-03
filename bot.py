@@ -1102,8 +1102,28 @@ async def size_input_handler(event):
 
 # ====================== PDF & HTML COMMANDS ======================
 
+async def _fetch_hd_url(post_url: str, thumb_url: str, session: aiohttp.ClientSession) -> str:
+    """برای یه post URL لینک عکس اصلی رو میگیره (برای سایت‌هایی مثل rule34)."""
+    try:
+        async with session.get(post_url, timeout=ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return thumb_url
+            html = await resp.text()
+            # rule34: id="image" src="..."
+            m = re.search(r'id=[\x22\x27]image[\x22\x27][^>]*src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', html)
+            if not m:
+                m = re.search(r'src=[\x22\x27]([^\x22\x27]+)[\x22\x27][^>]*id=[\x22\x27]image[\x22\x27]', html)
+            if m:
+                src = m.group(1)
+                if src.startswith('//'): src = 'https:' + src
+                return src
+    except Exception:
+        pass
+    return thumb_url
+
+
 async def process_pdfimg_request(event, url: str):
-    """عکس‌های صفحه رو دانلود، PDF سه‌ستونه میسازه و دکمه send all داره"""
+    """عکس‌های صفحه رو دانلود، grid preview میسازه، دو دکمه Send All / Send All HD داره."""
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
@@ -1114,8 +1134,8 @@ async def process_pdfimg_request(event, url: str):
         if not url.startswith(('http://', 'https://')): url = 'https://' + url
         os.makedirs(tmp_dir, exist_ok=True)
 
-        # ---- مرحله 1: استخراج URL عکس‌ها با playwright ----
-        img_urls = []
+        # ---- مرحله 1: استخراج URL عکس‌ها + لینک post اصلی با playwright ----
+        img_data = []  # list of {"thumb": url, "post": url_or_None, "orig": url_or_None}
         async with async_playwright() as p:
             browser = await p.chromium.launch(args=['--no-sandbox', '--disable-gpu'])
             context = await browser.new_context(
@@ -1132,79 +1152,112 @@ async def process_pdfimg_request(event, url: str):
             await page.wait_for_timeout(1500)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1500)
-            img_urls = await page.evaluate("""() => {
-                const imgs = Array.from(document.querySelectorAll('img'));
-                return imgs
-                    .map(img => img.src || img.getAttribute('data-src') ||
+
+            img_data = await page.evaluate("""() => {
+                const results = [];
+                const seen = new Set();
+                document.querySelectorAll('img').forEach(img => {
+                    const src = img.src || img.getAttribute('data-src') ||
                                 img.getAttribute('data-original') ||
-                                img.getAttribute('data-lazy') || '')
-                    .filter(src => src && src.startsWith('http'));
+                                img.getAttribute('data-lazy') || '';
+                    if (!src || !src.startsWith('http') || seen.has(src)) return;
+                    seen.add(src);
+                    // لینک post والد (a tag)
+                    const a = img.closest('a');
+                    const postUrl = a ? a.href : null;
+                    // عکس اصلی اگه مستقیم در دسترسه (data-original-url و ...)
+                    const origSrc = img.getAttribute('data-original-url') ||
+                                    img.getAttribute('data-full') || null;
+                    results.push({thumb: src, post: postUrl, orig: origSrc});
+                });
+                return results;
             }""")
             await browser.close()
 
-        all_urls = list(dict.fromkeys(img_urls))
-        if not all_urls:
+        if not img_data:
             await safe_edit(status, "No images found on this page.")
             return
 
-        await safe_edit(status, f"Downloading {len(all_urls)} images...")
+        await safe_edit(status, f"Found {len(img_data)} images. Downloading...")
 
-        # ---- مرحله 2: دانلود عکس‌ها ----
-        from PIL import Image as PILImage
+        # ---- مرحله 2: دانلود thumbnail ها (JPG/PNG) + ذخیره GIF به همان فرمت ----
         import io as _io
+        from PIL import Image as PILImage
 
-        images = []
-        saved_img_paths = []
+        saved = []   # list of {"path": str, "is_gif": bool, "thumb_url": str, "post_url": str|None}
         dl_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0',
             'Referer': url,
         }
         connector = aiohttp.TCPConnector(ssl=False, limit=8)
         async with aiohttp.ClientSession(connector=connector, headers=dl_headers,
                                          timeout=ClientTimeout(total=20)) as http:
-            for i, img_url in enumerate(all_urls[:300]):
+            for i, item in enumerate(img_data[:300]):
+                thumb_url = item["thumb"]
+                post_url = item.get("post")
+                orig_url = item.get("orig")
                 try:
-                    async with http.get(img_url) as resp:
+                    async with http.get(thumb_url) as resp:
                         if resp.status != 200: continue
                         data = await resp.read()
-                        img = PILImage.open(_io.BytesIO(data)).convert('RGB')
-                        if img.width < 100 or img.height < 100: continue
-                        img_path = f"{tmp_dir}/img_{len(images):04d}.jpg"
-                        img.save(img_path, 'JPEG', quality=95)
-                        saved_img_paths.append(img_path)
-                        images.append(img)
-                        if len(images) % 10 == 0:
-                            await safe_edit(status, f"Downloaded {len(images)} images...")
+                        ct = resp.content_type or ""
+
+                        is_gif = ct == "image/gif" or thumb_url.lower().endswith(".gif")
+
+                        if is_gif:
+                            # GIF رو همون‌طور ذخیره کن
+                            gif_path = f"{tmp_dir}/img_{len(saved):04d}.gif"
+                            async with aiofiles.open(gif_path, 'wb') as f:
+                                await f.write(data)
+                            saved.append({"path": gif_path, "is_gif": True,
+                                          "thumb_url": thumb_url, "post_url": post_url, "orig_url": orig_url})
+                        else:
+                            img = PILImage.open(_io.BytesIO(data)).convert('RGB')
+                            if img.width < 80 or img.height < 80: continue
+                            img_path = f"{tmp_dir}/img_{len(saved):04d}.jpg"
+                            img.save(img_path, 'JPEG', quality=92)
+                            saved.append({"path": img_path, "is_gif": False,
+                                          "thumb_url": thumb_url, "post_url": post_url, "orig_url": orig_url})
+
+                        if len(saved) % 10 == 0:
+                            await safe_edit(status, f"Downloaded {len(saved)} images...")
                 except Exception:
                     continue
 
-        if not images:
+        if not saved:
             await safe_edit(status, "Could not download any valid images.")
             return
 
         # ---- مرحله 3: ذخیره session و نمایش دکمه‌ها ----
         session_key = f"pdfimg_{event.chat_id}_{event.id}"
         pdfimg_sessions[session_key] = {
-            'img_paths': saved_img_paths,
+            'items': saved,
             'tmp_dir': tmp_dir,
             'chat_id': event.chat_id,
+            'source_url': url,
         }
+
+        n = len(saved)
+        n_gif = sum(1 for s in saved if s["is_gif"])
+        info = f"🖼 **{n} media ready**"
+        if n_gif:
+            info += f" ({n_gif} GIF)"
+        info += "\nChoose how to send:"
 
         await status.delete()
         await event.client.send_message(
             event.chat_id,
-            (
-                f"🖼 **{len(images)} images ready**\n"
-                "Press the button to send all to Telegram:"
-            ),
+            info,
             parse_mode='markdown',
             buttons=[
-                [Button.inline(f"📨 Send All Images ({len(images)})", f"pdfimg_send|{session_key}")],
+                [Button.inline(f"📨 Send All ({n})", f"pdfimg_send|{session_key}"),
+                 Button.inline(f"🔷 Send All HD ({n})", f"pdfimg_hd|{session_key}")],
                 [Button.inline("🗑 Delete from server", f"pdfimg_del|{session_key}")],
             ]
         )
 
     except Exception as e:
+        logger.error(f"pdfimg error: {e}", exc_info=True)
         await safe_edit(status, f"Error: {str(e)[:200]}")
     finally:
         processing_messages.discard(msg_id)
@@ -1357,65 +1410,112 @@ async def pdfimg_del_callback(event):
     session = pdfimg_sessions.pop(session_key, None)
     if session:
         import shutil
-        try:
-            shutil.rmtree(session['tmp_dir'], ignore_errors=True)
+        try: shutil.rmtree(session['tmp_dir'], ignore_errors=True)
         except Exception: pass
     await event.edit(buttons=None)
     await event.answer("🗑 Deleted from server.")
+
+
+async def _do_send_pdfimg(event, session_key: str, hd: bool):
+    """ارسال عکس‌ها — normal: thumbnail، HD: لینک اصلی از صفحه post"""
+    session = pdfimg_sessions.get(session_key)
+    if not session:
+        return await event.answer("❌ Session expired. Run /pdfimg again.", alert=True)
+
+    await event.answer("📨 Sending..." if not hd else "🔷 Fetching HD...", alert=False)
+    items = [it for it in session['items'] if os.path.exists(it['path'])]
+    chat_id = session['chat_id']
+    source_url = session.get('source_url', '')
+    total = len(items)
+
+    if total == 0:
+        return await event.client.send_message(chat_id, "❌ No images found on server.")
+
+    label = "HD" if hd else "normal"
+    status = await event.client.send_message(chat_id, f"📨 Sending {total} files ({label})...")
+    sent = 0
+
+    dl_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': source_url}
+    connector = aiohttp.TCPConnector(ssl=False, limit=4)
+    import io as _io
+    from PIL import Image as PILImage
+
+    async with aiohttp.ClientSession(connector=connector, headers=dl_headers,
+                                     timeout=ClientTimeout(total=30)) as http:
+        for item in items:
+            try:
+                send_path = item['path']
+
+                if hd:
+                    # پیدا کردن لینک اصلی
+                    hd_url = item.get('orig_url') or item['thumb_url']
+
+                    # اگه post_url داره، برو صفحه پست و عکس اصلی رو بگیر
+                    post_url = item.get('post_url')
+                    if post_url and post_url.startswith('http'):
+                        fetched = await _fetch_hd_url(post_url, hd_url, http)
+                        if fetched != hd_url:
+                            hd_url = fetched
+
+                    # دانلود HD
+                    async with http.get(hd_url) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            ct = resp.content_type or ""
+                            is_gif = ct == "image/gif" or hd_url.lower().endswith(".gif")
+                            ext = ".gif" if is_gif else ".jpg"
+                            hd_path = item['path'].replace('.jpg', '_hd' + ext).replace('.gif', '_hd' + ext)
+                            if not is_gif:
+                                # convert به JPEG
+                                img = PILImage.open(_io.BytesIO(data)).convert('RGB')
+                                img.save(hd_path, 'JPEG', quality=97)
+                            else:
+                                async with aiofiles.open(hd_path, 'wb') as f:
+                                    await f.write(data)
+                            send_path = hd_path
+
+                await event.client.send_file(
+                    chat_id, send_path,
+                    force_document=False,
+                )
+                sent += 1
+                if sent % 5 == 0 or sent == total:
+                    try: await status.edit(f"📨 Sending... {sent}/{total}")
+                    except Exception: pass
+
+                # پاک کردن HD temp
+                if hd and send_path != item['path'] and os.path.exists(send_path):
+                    try: os.remove(send_path)
+                    except Exception: pass
+
+            except Exception as e:
+                logger.warning(f"pdfimg send error: {e}")
+                try: await status.edit(f"⚠️ Error on {sent+1}: {str(e)[:60]}")
+                except Exception: pass
+
+    # cleanup
+    import shutil
+    pdfimg_sessions.pop(session_key, None)
+    try: shutil.rmtree(session['tmp_dir'], ignore_errors=True)
+    except Exception: pass
+    try: await event.edit(buttons=None)
+    except Exception: pass
+    try: await status.edit(f"✅ Sent {sent}/{total} files!")
+    except Exception: pass
 
 
 @events.register(events.CallbackQuery(pattern=rb'pdfimg_send\|'))
 async def pdfimg_send_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
-    session = pdfimg_sessions.get(session_key)
-    if not session:
-        return await event.answer("❌ Session expired. Run /pdfimg again.")
+    await _do_send_pdfimg(event, session_key, hd=False)
 
-    await event.answer("📨 Sending images...")
-    img_paths = [p for p in session['img_paths'] if os.path.exists(p)]
-    chat_id = session['chat_id']
-    total = len(img_paths)
 
-    if total == 0:
-        return await event.client.send_message(chat_id, "❌ No images found on server.")
-
-    status = await event.client.send_message(chat_id, f"📨 Sending {total} images...")
-    sent = 0
-
-    # یکی‌یکی بفرست به عنوان عکس
-    for img_path in img_paths:
-        try:
-            await event.client.send_file(
-                chat_id,
-                img_path,
-                force_document=False,  # عکس نه سند
-            )
-            sent += 1
-            if sent % 5 == 0 or sent == total:
-                try:
-                    await status.edit(f"📨 Sending... {sent}/{total}")
-                except Exception: pass
-        except Exception as e:
-            try:
-                await status.edit(f"⚠️ Error on image {sent+1}: {str(e)[:80]}")
-            except Exception: pass
-
-    # پاک کردن خودکار
-    import shutil
-    pdfimg_sessions.pop(session_key, None)
-    try:
-        shutil.rmtree(session['tmp_dir'], ignore_errors=True)
-    except Exception: pass
-
-    # حذف دکمه‌ها
-    try:
-        await event.edit(buttons=None)
-    except Exception: pass
-
-    try:
-        await status.edit(f"✅ Sent {sent}/{total} images! 🗑 Cleaned up.")
-    except Exception: pass
+@events.register(events.CallbackQuery(pattern=rb'pdfimg_hd\|'))
+async def pdfimg_hd_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
+    session_key = event.data.decode().split('|', 1)[1]
+    await _do_send_pdfimg(event, session_key, hd=True)
 
 @events.register(events.NewMessage(pattern='/pdfimg', incoming=True))
 async def pdfimg_command(event):
@@ -1512,6 +1612,7 @@ async def main():
     client.add_event_handler(pdfimg_command)
     client.add_event_handler(pdfimg_del_callback)
     client.add_event_handler(pdfimg_send_callback)
+    client.add_event_handler(pdfimg_hd_callback)
     client.add_event_handler(html_command)
     client.add_event_handler(compress_callback)
     client.add_event_handler(check_callback)
