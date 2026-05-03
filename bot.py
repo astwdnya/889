@@ -18,26 +18,7 @@ from threading import Thread
 import aiohttp
 import aiofiles
 import gc
-import resource
 from aiohttp import ClientTimeout
-
-def _check_memory_mb() -> float:
-    """مصرف RAM فعلی به MB."""
-    try:
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-    except Exception:
-        return 0.0
-
-async def _assert_memory(threshold_mb: int = 400):
-    """اگه RAM بیشتر از حد مجاز بود، gc میزنه و اگه باز هم زیاد بود exception میزنه."""
-    gc.collect()
-    used = _check_memory_mb()
-    if used > threshold_mb:
-        logger.warning(f"High memory: {used:.0f}MB — forcing GC")
-        gc.collect()
-        used = _check_memory_mb()
-        if used > 480:
-            raise MemoryError(f"RAM usage too high ({used:.0f}MB). Please try again later.")
 
 
 from playwright.async_api import async_playwright
@@ -666,36 +647,6 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
             pass
 
 
-
-async def _run_with_playwright(coro_factory, retries: int = 2):
-    """
-    یه coroutine رو با playwright اجرا میکنه.
-    اگه browser کرش کرد (Connection closed) دوباره امتحان میکنه.
-    coro_factory: تابعی که یه coroutine برمیگردونه — هر بار با browser جدید
-    """
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=_browser_args())
-                try:
-                    result = await coro_factory(browser)
-                    return result
-                finally:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-        except Exception as e:
-            last_err = e
-            err_str = str(e).lower()
-            if 'connection closed' in err_str or 'target closed' in err_str or 'browser has disconnected' in err_str:
-                logger.warning(f"Browser crash on attempt {attempt}/{retries}: {e}")
-                if attempt < retries:
-                    await asyncio.sleep(2)
-                    continue
-            raise
-    raise last_err
 
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, dict, Optional[str]]:
     async with async_playwright() as p:
@@ -1680,15 +1631,6 @@ async def generic_url_handler(event):
 
 # ====================== MAIN ======================
 async def main():
-    # ===== سقف RAM: 500MB برای کل پروسه =====
-    try:
-        import resource
-        MAX_RAM_BYTES = 500 * 1024 * 1024  # 500MB
-        resource.setrlimit(resource.RLIMIT_AS, (MAX_RAM_BYTES, MAX_RAM_BYTES))
-        logger.info(f"Memory limit set: 500MB")
-    except Exception as e:
-        logger.warning(f"Could not set memory limit: {e}")
-
     print("\n" + "="*60)
     print("🚀 ULTIMATE BOT v5")
     print("   FIX 1: 403 → auto-retry via Dirpy")
