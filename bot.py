@@ -44,6 +44,7 @@ video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
 admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
+pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 
 # ====================== LOGGING ======================
 logging.basicConfig(format='%(asctime)s | %(levelname)s | %(message)s', level=logging.INFO)
@@ -1100,6 +1101,187 @@ async def size_input_handler(event):
 
 
 # ====================== PDF & HTML COMMANDS ======================
+
+async def process_pdfimg_request(event, url: str):
+    """عکس‌ها و GIF‌های صفحه رو دانلود و تو PDF سه‌ستونه میذاره"""
+    msg_id = f"{event.chat_id}_{event.id}"
+    if msg_id in processing_messages: return
+    processing_messages.add(msg_id)
+    status = await event.reply("🖼 Extracting images from page...", parse_mode='markdown')
+    out_pdf = None
+    tmp_dir = f"/app/output_files/pdfimg_{event.chat_id}_{event.id}"
+
+    try:
+        if not url.startswith(('http://', 'https://')): url = 'https://' + url
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        # ---- مرحله ۱: استخراج URL عکس‌ها با playwright ----
+        await safe_edit(status, "🌐 Loading page...")
+        img_urls = []
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(args=['--no-sandbox', '--disable-gpu'])
+            page = await browser.new_page()
+            await page.goto(url, wait_until='networkidle', timeout=60000)
+            await page.wait_for_timeout(2000)
+            # تمام عکس‌ها و GIF‌های تو صفحه
+            img_urls = await page.evaluate("""() => {
+                const imgs = Array.from(document.querySelectorAll('img'));
+                return imgs
+                    .map(img => img.src || img.getAttribute('data-src') || '')
+                    .filter(src => src && src.startsWith('http') && src.length > 10);
+            }""")
+            # CSS background-image هم بگیر
+            bg_urls = await page.evaluate("""() => {
+                const all = Array.from(document.querySelectorAll('*'));
+                const urls = [];
+                all.forEach(el => {
+                    const bg = window.getComputedStyle(el).backgroundImage;
+                    const m = bg.match(/url\(["'\s]*(https?:[^"'\s)]+)/);
+                    if (m) urls.push(m[1]);
+                });
+                return urls;
+            }""")
+            await browser.close()
+
+        all_urls = list(dict.fromkeys(img_urls + bg_urls))  # dedup
+        if not all_urls:
+            await safe_edit(status, "❌ No images found on this page.")
+            return
+
+        await safe_edit(status, f"⬇️ Downloading {len(all_urls)} images...")
+
+        # ---- مرحله ۲: دانلود عکس‌ها ----
+        from PIL import Image as PILImage
+        import io
+
+        images = []
+        connector = aiohttp.TCPConnector(ssl=False)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36'}
+        async with aiohttp.ClientSession(connector=connector, headers=headers,
+                                         timeout=ClientTimeout(total=30)) as session:
+            for i, img_url in enumerate(all_urls[:200]):  # حداکثر ۲۰۰ عکس
+                try:
+                    async with session.get(img_url) as resp:
+                        if resp.status != 200: continue
+                        data = await resp.read()
+                        img = PILImage.open(io.BytesIO(data)).convert('RGB')
+                        # عکس‌های خیلی کوچیک (آیکون و...) رو نگیر
+                        if img.width < 100 or img.height < 100: continue
+                        images.append(img)
+                except Exception:
+                    continue
+
+        if not images:
+            await safe_edit(status, "❌ Could not download any valid images.")
+            return
+
+        await safe_edit(status, f"📄 Building PDF with {len(images)} images...")
+
+        # ---- مرحله ۳: ساخت PDF سه‌ستونه ----
+        COLS = 3
+        PAGE_W = 2480   # A4 at 300dpi
+        PAGE_H = 3508
+        MARGIN = 40
+        GAP = 20
+        cell_w = (PAGE_W - 2 * MARGIN - (COLS - 1) * GAP) // COLS
+
+        pdf_pages = []
+        row_imgs = []
+
+        def make_page(rows):
+            """یه صفحه از لیست ردیف‌ها می‌سازه"""
+            rows_count = len(rows)
+            # ارتفاع هر ردیف رو از بلندترین عکسش بگیر
+            row_heights = []
+            for row in rows:
+                max_h = 0
+                for img in row:
+                    ratio = cell_w / img.width
+                    max_h = max(max_h, int(img.height * ratio))
+                row_heights.append(max_h)
+
+            total_h = 2 * MARGIN + sum(row_heights) + (rows_count - 1) * GAP
+            page_h = max(PAGE_H, total_h)
+            page = PILImage.new('RGB', (PAGE_W, page_h), (255, 255, 255))
+
+            y = MARGIN
+            for ri, row in enumerate(rows):
+                x = MARGIN
+                rh = row_heights[ri]
+                for img in row:
+                    ratio = cell_w / img.width
+                    new_w = cell_w
+                    new_h = int(img.height * ratio)
+                    resized = img.resize((new_w, new_h), PILImage.LANCZOS)
+                    page.paste(resized, (x, y))
+                    x += cell_w + GAP
+                y += rh + GAP
+            return page
+
+        # تقسیم به ردیف‌های ۳تایی و صفحه‌های A4
+        MAX_ROWS_PER_PAGE = 8
+        row_buffer = []
+        rows_in_page = []
+
+        for idx, img in enumerate(images):
+            row_buffer.append(img)
+            if len(row_buffer) == COLS:
+                rows_in_page.append(row_buffer)
+                row_buffer = []
+            if len(rows_in_page) == MAX_ROWS_PER_PAGE:
+                pdf_pages.append(make_page(rows_in_page))
+                rows_in_page = []
+
+        if row_buffer:
+            rows_in_page.append(row_buffer)
+        if rows_in_page:
+            pdf_pages.append(make_page(rows_in_page))
+
+        # ذخیره عکس‌ها به صورت فایل برای send all
+        await safe_edit(status, "💾 Saving images...")
+        saved_img_paths = []
+        for i, img in enumerate(images):
+            img_path = f"{tmp_dir}/img_{i:04d}.jpg"
+            img.save(img_path, 'JPEG', quality=92)
+            saved_img_paths.append(img_path)
+
+        # ذخیره PDF
+        out_pdf = f"{tmp_dir}/images.pdf"
+        if len(pdf_pages) == 1:
+            pdf_pages[0].save(out_pdf, 'PDF', resolution=300)
+        else:
+            pdf_pages[0].save(out_pdf, 'PDF', resolution=300,
+                              save_all=True, append_images=pdf_pages[1:])
+
+        size = os.path.getsize(out_pdf)
+
+        # ذخیره session برای دکمه‌ها
+        session_key = f"pdfimg_{event.chat_id}_{event.id}"
+        pdfimg_sessions[session_key] = {
+            'pdf_path': out_pdf,
+            'img_paths': saved_img_paths,
+            'tmp_dir': tmp_dir,
+            'chat_id': event.chat_id,
+        }
+
+        await safe_edit(status, "📤 Uploading PDF...")
+        await event.client.send_file(
+            event.chat_id, out_pdf,
+            caption=(f"🖼 **Image PDF**\n"
+                    f"📊 {len(images)} images • {human_readable_size(size)}"),
+            force_document=True, parse_mode='markdown',
+            buttons=[
+                [Button.inline(f"📨 Send All Images ({len(images)})", f"pdfimg_send|{session_key}")],
+                [Button.inline("🗑 Delete PDF from server", f"pdfimg_del|{session_key}")],
+            ]
+        )
+        await status.delete()
+
+    except Exception as e:
+        await safe_edit(status, f"❌ Error: {str(e)[:150]}")
+    finally:
+        processing_messages.discard(msg_id)
+
 async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
@@ -1239,6 +1421,79 @@ async def pdf_command(event):
     await process_pdf_request(event, parts[1].strip())
 
 
+
+@events.register(events.CallbackQuery(pattern=b'pdfimg_del|'))
+async def pdfimg_del_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
+    session_key = event.data.decode().split('|', 1)[1]
+    session = pdfimg_sessions.pop(session_key, None)
+    if session:
+        import shutil
+        try:
+            shutil.rmtree(session['tmp_dir'], ignore_errors=True)
+        except Exception: pass
+    await event.edit(buttons=None)
+    await event.answer("🗑 Deleted from server.")
+
+
+@events.register(events.CallbackQuery(pattern=b'pdfimg_send|'))
+async def pdfimg_send_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
+    session_key = event.data.decode().split('|', 1)[1]
+    session = pdfimg_sessions.get(session_key)
+    if not session:
+        return await event.answer("❌ Session expired. Run /pdfimg again.")
+
+    await event.answer("📨 Sending images...")
+    img_paths = [p for p in session['img_paths'] if os.path.exists(p)]
+    chat_id = session['chat_id']
+    total = len(img_paths)
+
+    # ارسال گروهی ۱۰تایی (حداکثر تلگرام)
+    status = await event.client.send_message(chat_id, f"📨 Sending {total} images...")
+    sent = 0
+    BATCH = 10
+    for i in range(0, total, BATCH):
+        batch = img_paths[i:i+BATCH]
+        try:
+            await event.client.send_file(
+                chat_id,
+                batch,
+                # photo=True → ارسال به عنوان عکس نه سند
+            )
+            sent += len(batch)
+            try:
+                await status.edit(f"📨 Sending... {sent}/{total}")
+            except Exception: pass
+        except Exception as e:
+            try:
+                await status.edit(f"⚠️ Error at batch {i//BATCH+1}: {str(e)[:80]}")
+            except Exception: pass
+
+    # پاک کردن خودکار بعد از ارسال همه عکس‌ها
+    import shutil
+    pdfimg_sessions.pop(session_key, None)
+    try:
+        shutil.rmtree(session['tmp_dir'], ignore_errors=True)
+    except Exception: pass
+
+    # حذف دکمه‌ها از پیام PDF
+    try:
+        await event.edit(buttons=None)
+    except Exception: pass
+
+    try:
+        await status.edit(f"✅ Sent {sent}/{total} images! 🗑 Cleaned up from server.")
+    except Exception: pass
+
+@events.register(events.NewMessage(pattern='/pdfimg', incoming=True))
+async def pdfimg_command(event):
+    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2: return await event.reply("❌ Usage: `/pdfimg <url>`", parse_mode='markdown')
+    await process_pdfimg_request(event, parts[1].strip())
+
+
 @events.register(events.NewMessage(pattern='/html', incoming=True))
 async def html_command(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
@@ -1323,6 +1578,9 @@ async def main():
     client.add_event_handler(start_cmd)
     client.add_event_handler(dirpy_command)
     client.add_event_handler(pdf_command)
+    client.add_event_handler(pdfimg_command)
+    client.add_event_handler(pdfimg_del_callback)
+    client.add_event_handler(pdfimg_send_callback)
     client.add_event_handler(html_command)
     client.add_event_handler(compress_callback)
     client.add_event_handler(check_callback)
