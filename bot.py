@@ -138,6 +138,9 @@ async def maybe_upload_github(client, chat_id: int, filepath: str, file_size: in
     except Exception as e:
         logger.warning(f"GitHub upload exception: {e}")
     return ""
+
+
+async def safe_edit(msg, text: str, buttons=None):
     try:
         if buttons is not None:
             await msg.edit(text, parse_mode='markdown', buttons=buttons)
@@ -145,6 +148,7 @@ async def maybe_upload_github(client, chat_id: int, filepath: str, file_size: in
             await msg.edit(text, parse_mode='markdown')
     except Exception:
         pass
+
 
 def build_progress_text(operation: str, current: int, total: int, speed: float, start_time: float) -> str:
     eta = (total - current) / speed if speed > 0 else 0
