@@ -27,6 +27,7 @@ from telethon import TelegramClient, events, Button, utils
 from telethon.tl.types import (Message, DocumentAttributeVideo,
                                 InputMediaUploadedDocument)
 from FastTelethon import upload_file as fast_upload_file
+from github import upload_to_github, github_configured, GITHUB_MAX_MB
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -456,6 +457,17 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
             else:
                 dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
 
+        # آپلود به GitHub اگه configure شده و فایل در محدوده سایز باشه
+        gh_line = ""
+        if github_configured() and final_size <= GITHUB_MAX_MB * 1024 * 1024:
+            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+            gh_ok, gh_msg, gh_url = await upload_to_github(filepath)
+            if gh_ok and gh_url:
+                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+                logger.info(f"GitHub upload OK: {gh_url}")
+            else:
+                logger.warning(f"GitHub upload failed: {gh_msg}")
+
         await send_file_with_progress(
             client=event.client, chat_id=event.chat_id, filepath=filepath,
             caption=(
@@ -464,6 +476,7 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
                 f"{dur_str}\n"
                 f"🔗 [Source]({source_url})\n"
                 f"⬇️ [DW Link]({direct_url})"
+                f"{gh_line}"
             ),
             status_msg=status_msg, buttons=after_buttons, supports_streaming=True
         )
@@ -1417,6 +1430,36 @@ async def admin_cancel_callback(event):
     except Exception: pass
 
 
+
+@events.register(events.NewMessage(pattern='/github', incoming=True))
+async def github_cmd(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.reply("⛔ Unauthorized")
+
+    from github import GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH, GITHUB_BASE_DIR, github_configured
+    if github_configured():
+        await event.reply(
+            f"☁️ **GitHub Status: ✅ Connected**\n\n"
+            f"📁 Repo: `{GITHUB_REPO}`\n"
+            f"🌿 Branch: `{GITHUB_BRANCH}`\n"
+            f"📂 Base dir: `{GITHUB_BASE_DIR}`\n"
+            f"📦 Max file size: `{GITHUB_MAX_MB}MB`\n\n"
+            f"Files are auto-uploaded after each download.\n"
+            f"Set via environment variables:\n"
+            f"`GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_BASE_DIR`",
+            parse_mode='markdown'
+        )
+    else:
+        await event.reply(
+            "☁️ **GitHub Status: ❌ Not configured**\n\n"
+            "Set these environment variables:\n"
+            "`GITHUB_TOKEN` — Personal Access Token\n"
+            "`GITHUB_REPO` — e.g. `username/myrepo`\n"
+            "`GITHUB_BRANCH` — default: `main`\n"
+            "`GITHUB_BASE_DIR` — default: `files`",
+            parse_mode='markdown'
+        )
+
 @events.register(events.NewMessage(pattern='/start', incoming=True))
 async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
@@ -1425,7 +1468,7 @@ async def start_cmd(event):
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
         "• `/pdf <url>` → Webpage to PDF\n"
-        "• `/html <url>` → Save as MHTML\n\n"
+        "• `/html <url>` → Save as MHTML\n• `/github` → GitHub upload status\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode='markdown'
@@ -1646,6 +1689,7 @@ async def main():
     )
     await client.start(bot_token=BOT_TOKEN)
 
+    client.add_event_handler(github_cmd)
     client.add_event_handler(admin_cmd)
     client.add_event_handler(admin_add_callback)
     client.add_event_handler(admin_remove_callback)
