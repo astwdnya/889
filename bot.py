@@ -597,24 +597,6 @@ def _should_capture(url: str, content_type: str = "", content_length: int = 0) -
     if 'video/' in content_type and content_length > MIN_SIZE:
         return True
     is_known_cdn = any(d in ul for d in KNOWN_CDN_DOMAINS)
-def _browser_args() -> list:
-    """آرگومان‌های chromium برای مصرف RAM کم."""
-    return [
-        '--no-sandbox',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--disable-software-rasterizer',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-sync',
-        '--disable-translate',
-        '--hide-scrollbars',
-        '--mute-audio',
-        '--no-first-run',
-        '--js-flags=--max-old-space-size=96',
-    ]
-
-    is_known_cdn = any(d in ul for d in KNOWN_CDN_DOMAINS)
     has_video_ext = '.mp4' in ul or '.webm' in ul or 'videoplayback' in ul or '/get_file/' in ul
     if is_known_cdn and has_video_ext:
         if 'rdtcdn.com' in ul or 'phncdn.com' in ul:
