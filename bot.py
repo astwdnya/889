@@ -1792,9 +1792,16 @@ async def generic_url_handler(event):
                 dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
             else:
                 dur_str = f" | ⏱ {mins}:{secs:02d}"
+        gh_line = ""
+        if GITHUB_ENABLED:
+            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, size)
+            if gh_url:
+                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+            await safe_edit(status_msg, "📤 Uploading...")
         await send_file_with_progress(
             client=event.client, chat_id=event.chat_id, filepath=filepath,
-            caption=f"📦 {human_readable_size(size)}{dur_str}", status_msg=status_msg,
+            caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}", status_msg=status_msg,
         )
     except Exception as e:
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
