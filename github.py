@@ -16,12 +16,12 @@ from aiohttp import ClientTimeout
 
 logger = logging.getLogger("GitHubUploader")
 
-# ====================== CONFIGURATION (ویرایش شده با اطلاعات شما) ======================
-GITHUB_TOKEN    = "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"  # توکن شما
-GITHUB_REPO     = "astwdnya/upanddown"                          # نام مخزن
-GITHUB_BRANCH   = "main"                                         # شاخه اصلی
-GITHUB_BASE_DIR = "files"                                        # پوشه ریشه در مخزن
-GITHUB_MAX_MB   = 50                                             # حداکثر حجم (همان محدودیت API)
+# ====================== CONFIGURATION ======================
+GITHUB_TOKEN    = "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"
+GITHUB_REPO     = "astwdnya/upanddown"
+GITHUB_BRANCH   = "main"
+GITHUB_BASE_DIR = "files"
+GITHUB_MAX_MB   = 50
 
 # ====================== HELPERS ======================
 
@@ -108,7 +108,6 @@ async def upload_to_github(
 
     timeout = ClientTimeout(total=120, connect=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # Check existence to get sha
         async with session.get(api_url, headers=headers) as check_resp:
             if check_resp.status == 200:
                 existing = await check_resp.json()
@@ -118,11 +117,11 @@ async def upload_to_github(
             body = await resp.json()
             if resp.status in (200, 201):
                 raw_url = _raw_url(repo, branch, gh_path)
-                logger.info(f"[GitHub] Uploaded: {gh_path} → {raw_url}")
+                logger.info(f"[GitHub] Uploaded: {gh_path} -> {raw_url}")
                 return True, f"Uploaded to `{gh_path}`", raw_url
             else:
                 msg = body.get("message", str(body))
-                logger.error(f"[GitHub] Upload failed: {resp.status} — {msg}")
+                logger.error(f"[GitHub] Upload failed: {resp.status} - {msg}")
                 return False, f"GitHub error {resp.status}: {msg[:200]}", ""
 
 def github_configured() -> bool:
