@@ -1244,42 +1244,77 @@ async def process_pdfimg_request(event, url: str):
 
         # ---- مرحله 1: استخراج URL عکس‌ها + لینک post اصلی با playwright ----
         img_data = []  # list of {"thumb": url, "post": url_or_None, "orig": url_or_None}
+
+        JS_EXTRACT = """() => {
+            const results = [];
+            const seen = new Set();
+            document.querySelectorAll('img').forEach(img => {
+                const src = img.src || img.getAttribute('data-src') ||
+                            img.getAttribute('data-original') ||
+                            img.getAttribute('data-lazy') || '';
+                if (!src || !src.startsWith('http') || seen.has(src)) return;
+                seen.add(src);
+                const a = img.closest('a');
+                const postUrl = a ? a.href : null;
+                const origSrc = img.getAttribute('data-original-url') ||
+                                img.getAttribute('data-full') || null;
+                results.push({thumb: src, post: postUrl, orig: origSrc});
+            });
+            return results;
+        }"""
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=_browser_args())
             context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
+                    'Sec-Ch-Ua-Mobile': '?0',
+                    'Sec-Ch-Ua-Platform': '"Windows"',
+                },
+                java_script_enabled=True,
+                bypass_csp=True,
             )
             page = await context.new_page()
-            try:
-                await page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            except Exception:
-                await page.goto(url, wait_until='commit', timeout=30000)
+            page.on('dialog', lambda d: asyncio.ensure_future(d.dismiss()))
+
+            await safe_edit(status, "🌐 Opening page...")
+            load_ok = False
+            for wait_mode in ('domcontentloaded', 'commit'):
+                try:
+                    await page.goto(url, wait_until=wait_mode, timeout=45000)
+                    load_ok = True
+                    break
+                except Exception as _e:
+                    logger.warning(f"[PDFIMG] goto({wait_mode}) failed: {_e}")
+
+            if not load_ok:
+                await browser.close()
+                await safe_edit(status, "❌ Could not load the page (timeout or blocked).")
+                return
+
             await page.wait_for_timeout(3000)
+
+            # Cloudflare challenge detection
+            for _cf_attempt in range(6):
+                title = await page.title()
+                if 'just a moment' in title.lower() or 'checking your browser' in title.lower() or 'please wait' in title.lower():
+                    await safe_edit(status, f"⏳ Bypassing protection... ({_cf_attempt+1}/6)")
+                    await page.wait_for_timeout(5000)
+                else:
+                    break
+
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
             await page.wait_for_timeout(1500)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1500)
 
-            img_data = await page.evaluate("""() => {
-                const results = [];
-                const seen = new Set();
-                document.querySelectorAll('img').forEach(img => {
-                    const src = img.src || img.getAttribute('data-src') ||
-                                img.getAttribute('data-original') ||
-                                img.getAttribute('data-lazy') || '';
-                    if (!src || !src.startsWith('http') || seen.has(src)) return;
-                    seen.add(src);
-                    // لینک post والد (a tag)
-                    const a = img.closest('a');
-                    const postUrl = a ? a.href : null;
-                    // عکس اصلی اگه مستقیم در دسترسه (data-original-url و ...)
-                    const origSrc = img.getAttribute('data-original-url') ||
-                                    img.getAttribute('data-full') || null;
-                    results.push({thumb: src, post: postUrl, orig: origSrc});
-                });
-                return results;
-            }""")
+            img_data = await page.evaluate(JS_EXTRACT)
             await browser.close()
 
         if not img_data:
