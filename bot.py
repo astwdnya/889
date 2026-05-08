@@ -48,18 +48,15 @@ video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
 admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
-pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
+pdfimg_sessions: Dict[str, Dict] = {}
 
-# آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
 
-# نگه‌داری فایل‌های ویدیویی که کاربر فرستاده و منتظر تأیید گیتهاب هستن
 video_github_pending: Dict[str, Dict] = {}
 
 # ====================== LOGGING ======================
 import sys as _sys
 
-# ===== LOGGING: همه چیز به stdout میره تا توی Render logs دیده بشه =====
 _log_formatter = logging.Formatter(
     fmt='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
     datefmt='%H:%M:%S'
@@ -71,7 +68,6 @@ _stdout_handler.setLevel(logging.DEBUG)
 logging.root.setLevel(logging.DEBUG)
 logging.root.addHandler(_stdout_handler)
 
-# کم‌حرف کردن کتابخونه‌های پرسروصدا
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -104,7 +100,6 @@ def safe_filename(title: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', title.strip()[:80]) or f"file_{int(time.time())}"
 
 def parse_size_input(text: str) -> Optional[int]:
-    # FIX: regex محکم‌تر — فقط عدد+واحد
     text = text.strip().lower().replace(" ", "")
     match = re.match(r'^(\d+\.?\d*)([kmg]?)b?$', text)
     if not match:
@@ -119,14 +114,12 @@ def parse_size_input(text: str) -> Optional[int]:
 async def maybe_upload_github(client, chat_id: int, filepath: str, file_size: int) -> str:
     """
     اگه GITHUB_ENABLED فعال باشه فایل رو آپلود میکنه و لینک رو برمیگردونه.
-    در غیر اینصورت رشته خالی برمیگردونه.
+    چک سایز حذف شد — github.py خودش با GITHUB_MAX_MB=2000 چک میکنه.
     """
     global GITHUB_ENABLED
     if not GITHUB_ENABLED:
         return ""
     if not github_configured():
-        return ""
-    if file_size > GITHUB_MAX_MB * 1024 * 1024:
         return ""
     try:
         gh_ok, gh_msg, gh_url = await upload_to_github(filepath)
@@ -177,7 +170,7 @@ async def download_with_controls(
     extra_headers: Optional[dict] = None,
 ) -> Tuple[Optional[str], Optional[str], int]:
     MAX_RETRIES = 3
-    CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
+    CHUNK_SIZE = 2 * 1024 * 1024
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
@@ -225,7 +218,6 @@ async def download_with_controls(
             connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False)
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 async with session.get(url, headers=attempt_headers, allow_redirects=True) as response:
-                    # FIX: 403 رو به عنوان کد خاص برمیگردونه تا caller تصمیم بگیره
                     if response.status == 403:
                         return None, "HTTP_403", 0
                     if response.status not in (200, 206):
@@ -317,8 +309,6 @@ async def download_with_controls(
 
 
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
-# FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
-
 async def dl_pause_callback(event):
     dl_id = event.data.decode().replace("dlpause_", "")
     if dl_id not in active_downloads:
@@ -349,10 +339,8 @@ async def dl_cancel_callback(event):
 
 # ====================== UPLOAD WITH PROGRESS ======================
 async def get_video_thumbnail(filepath: str) -> Optional[str]:
-    """یه فریم از وسط ویدیو به عنوان thumbnail می‌گیره"""
     try:
         thumb_path = filepath + "_thumb.jpg"
-        # مدت ویدیو رو بگیر تا فریم از وسط باشه
         probe = await asyncio.create_subprocess_exec(
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
             '-show_format', filepath,
@@ -391,13 +379,11 @@ async def send_file_with_progress(
     last_bytes = [0]
     last_time = [start_time]
 
-    # اطلاعات ویدیو برای نمایش درست در تلگرام
     duration, width, height = await get_video_info(filepath)
     thumb_path = await get_video_thumbnail(filepath)
 
     async def progress_cb(current: int, total: int):
         now = time.time()
-        # هر 3 ثانیه یه بار آپدیت — کمتر فشار روی event loop
         if now - last_update[0] < 3.0 and current != total:
             return
         last_update[0] = now
@@ -412,11 +398,9 @@ async def send_file_with_progress(
 
     try:
         duration_int = int(duration) if duration else 0
-        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
         with open(filepath, 'rb') as f:
             uploaded = await fast_upload_file(client, f, progress_callback=progress_cb, connection_count=15)
 
-        # ساخت media با متادیتای ویدیو
         attributes, mime_type = utils.get_attributes(
             filepath,
             attributes=[
@@ -428,7 +412,6 @@ async def send_file_with_progress(
                 )
             ],
         )
-        # آپلود thumbnail به تلگرام
         thumb_input = None
         if thumb_path and os.path.exists(thumb_path):
             with open(thumb_path, 'rb') as tf:
@@ -446,7 +429,6 @@ async def send_file_with_progress(
             buttons=buttons, parse_mode='markdown',
         )
     finally:
-        # پاک کردن thumbnail موقت
         if thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
@@ -467,7 +449,6 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
         direct_url, status_msg, dl_id, referer=source_url, extra_headers=extra_headers
     )
 
-    # FIX: 403 → auto-retry via dirpy
     if dl_error == "HTTP_403":
         await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
         found_urls, session_headers, intercept_err = await extract_video_url_smart(source_url, status_msg)
@@ -498,7 +479,6 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
     ]
     await safe_edit(status_msg, "📤 Uploading...")
     try:
-        # مدت زمان ویدیو رو برای caption بگیر
         vid_duration, _, _ = await get_video_info(filepath)
         dur_str = ""
         if vid_duration and vid_duration > 0:
@@ -509,7 +489,6 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
             else:
                 dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
 
-        # آپلود به GitHub اگه configure شده و فایل در محدوده سایز باشه
         gh_line = ""
         if GITHUB_ENABLED:
             await safe_edit(status_msg, "☁️ Uploading to GitHub...")
@@ -564,11 +543,10 @@ def _url_label(url: str, size: int, index: int) -> str:
 # ====================== VIDEO URL EXTRACTOR ======================
 SKIP_KEYWORDS = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite',
                  'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
-MIN_SIZE = 2 * 1024 * 1024  # 2MB
+MIN_SIZE = 2 * 1024 * 1024
 
 
 def _browser_args() -> list:
-    """آرگومان‌های chromium برای مصرف RAM کم."""
     return [
         '--no-sandbox',
         '--disable-gpu',
@@ -690,7 +668,6 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
             pass
 
 
-
 async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, dict, Optional[str]]:
     async with async_playwright() as p:
         browser = None
@@ -708,7 +685,6 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                     viewport={'width': 1280, 'height': 720}
                 )
 
-            # مرحله ۱: Dirpy
             await safe_edit(status_msg, "🔗 Opening Dirpy Studio...")
             ctx1 = await make_context()
             page1 = await ctx1.new_page()
@@ -725,7 +701,6 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 await page1.close()
                 await ctx1.close()
 
-            # مرحله ۲: Direct site fallback
             if not captured_urls:
                 await safe_edit(status_msg, "🌐 Dirpy failed — trying direct site extraction...")
                 ctx2 = await make_context()
@@ -924,9 +899,6 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
         video_bitrate_bps = max(total_bitrate_bps - audio_bitrate_bps, 10_000)
         audio_bitrate_k = audio_bitrate_bps // 1000
 
-        # FIX: scale + format=yuv420p + noautorotate
-        # - format=yuv420p: مطمئن میشه pixel format با libx264 سازگاره
-        # - noautorotate: جلوگیری از تداخل rotation metadata با scale filter
         SCALE_VF = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
         COMMON_INPUT = ['-noautorotate', '-i', input_path]
 
@@ -1059,7 +1031,6 @@ async def compress_callback(event):
     if video_id not in video_cache:
         return await event.answer("Video not found or expired.", alert=True)
     await event.answer("Send desired size (e.g: 15mb or 800kb)", alert=False)
-    # FIX: chat_id رو ذخیره میکنیم (نه sender_id) — در private chat یکیه ولی در گروه فرق دارن
     user_state[event.chat_id] = {"action": "wait_for_compression_size", "video_id": video_id}
 
 
@@ -1131,7 +1102,6 @@ async def admin_input_handler(event):
 async def size_input_handler(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return
-    # FIX: chat_id (نه sender_id) — اصلاح اصلی برای "Invalid size format" bug
     state = user_state.get(event.chat_id)
     if not state or state.get("action") != "wait_for_compression_size":
         return
@@ -1154,7 +1124,6 @@ async def size_input_handler(event):
         await event.reply("❌ Target size must be smaller than original size.", parse_mode='markdown')
         raise events.StopPropagation
 
-    # state رو قبل از شروع پاک کن — جلوگیری از double-trigger
     user_state.pop(event.chat_id, None)
 
     status_msg = await event.reply(f"⚙️ Starting compression → {human_readable_size(target_bytes)}...")
@@ -1196,13 +1165,11 @@ async def size_input_handler(event):
 # ====================== PDF & HTML COMMANDS ======================
 
 async def _fetch_hd_url(post_url: str, thumb_url: str, session: aiohttp.ClientSession) -> str:
-    """برای یه post URL لینک عکس اصلی رو میگیره (برای سایت‌هایی مثل rule34)."""
     try:
         async with session.get(post_url, timeout=ClientTimeout(total=15)) as resp:
             if resp.status != 200:
                 return thumb_url
             html = await resp.text()
-            # rule34: id="image" src="..."
             m = re.search(r'id=[\x22\x27]image[\x22\x27][^>]*src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', html)
             if not m:
                 m = re.search(r'src=[\x22\x27]([^\x22\x27]+)[\x22\x27][^>]*id=[\x22\x27]image[\x22\x27]', html)
@@ -1216,7 +1183,6 @@ async def _fetch_hd_url(post_url: str, thumb_url: str, session: aiohttp.ClientSe
 
 
 async def process_pdfimg_request(event, url: str):
-    """عکس‌های صفحه رو دانلود، grid preview میسازه، دو دکمه Send All / Send All HD داره."""
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
@@ -1228,8 +1194,7 @@ async def process_pdfimg_request(event, url: str):
         if not url.startswith(('http://', 'https://')): url = 'https://' + url
         os.makedirs(tmp_dir, exist_ok=True)
 
-        # ---- مرحله 1: استخراج URL عکس‌ها + لینک post اصلی با playwright ----
-        img_data = []  # list of {"thumb": url, "post": url_or_None, "orig": url_or_None}
+        img_data = []
 
         JS_EXTRACT = """() => {
             const results = [];
@@ -1286,7 +1251,6 @@ async def process_pdfimg_request(event, url: str):
 
             await page.wait_for_timeout(3000)
 
-            # Cloudflare challenge detection
             for _cf_attempt in range(6):
                 title = await page.title()
                 if 'just a moment' in title.lower() or 'checking your browser' in title.lower() or 'please wait' in title.lower():
@@ -1311,11 +1275,10 @@ async def process_pdfimg_request(event, url: str):
         logger.info(f"[PDFIMG] Found {len(img_data)} images on page | chat={event.chat_id}")
         await safe_edit(status, f"Found {len(img_data)} images. Downloading...")
 
-        # ---- مرحله 2: دانلود thumbnail ها (JPG/PNG) + ذخیره GIF به همان فرمت ----
         import io as _io
         from PIL import Image as PILImage
 
-        saved = []   # list of {"path": str, "is_gif": bool, "thumb_url": str, "post_url": str|None}
+        saved = []
         dl_headers = {
             'User-Agent': 'Mozilla/5.0',
             'Referer': url,
@@ -1336,7 +1299,6 @@ async def process_pdfimg_request(event, url: str):
                         is_gif = ct == "image/gif" or thumb_url.lower().endswith(".gif")
 
                         if is_gif:
-                            # GIF رو همون‌طور ذخیره کن
                             gif_path = f"{tmp_dir}/img_{len(saved):04d}.gif"
                             async with aiofiles.open(gif_path, 'wb') as f:
                                 await f.write(data)
@@ -1360,7 +1322,6 @@ async def process_pdfimg_request(event, url: str):
             await safe_edit(status, "Could not download any valid images.")
             return
 
-        # ---- مرحله 3: ذخیره session و نمایش دکمه‌ها ----
         session_key = f"pdfimg_{event.chat_id}_{event.id}"
         pdfimg_sessions[session_key] = {
             'items': saved,
@@ -1524,7 +1485,6 @@ async def admin_cancel_callback(event):
     except Exception: pass
 
 
-
 async def startgithub_cmd(event):
     global GITHUB_ENABLED
     logger.info(f"[CMD] /startgithub from user={event.sender_id}")
@@ -1614,7 +1574,6 @@ async def pdf_command(event):
     await process_pdf_request(event, parts[1].strip())
 
 
-
 async def pdfimg_del_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
@@ -1628,7 +1587,6 @@ async def pdfimg_del_callback(event):
 
 
 async def _do_send_pdfimg(event, session_key: str, hd: bool):
-    """ارسال عکس‌ها — normal: thumbnail، HD: لینک اصلی از صفحه post"""
     session = pdfimg_sessions.get(session_key)
     if not session:
         return await event.answer("❌ Session expired. Run /pdfimg again.", alert=True)
@@ -1658,17 +1616,13 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                 send_path = item['path']
 
                 if hd:
-                    # پیدا کردن لینک اصلی
                     hd_url = item.get('orig_url') or item['thumb_url']
-
-                    # اگه post_url داره، برو صفحه پست و عکس اصلی رو بگیر
                     post_url = item.get('post_url')
                     if post_url and post_url.startswith('http'):
                         fetched = await _fetch_hd_url(post_url, hd_url, http)
                         if fetched != hd_url:
                             hd_url = fetched
 
-                    # دانلود HD
                     async with http.get(hd_url) as resp:
                         if resp.status == 200:
                             data = await resp.read()
@@ -1677,7 +1631,6 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                             ext = ".gif" if is_gif else ".jpg"
                             hd_path = item['path'].replace('.jpg', '_hd' + ext).replace('.gif', '_hd' + ext)
                             if not is_gif:
-                                # convert به JPEG
                                 img = PILImage.open(_io.BytesIO(data)).convert('RGB')
                                 img.save(hd_path, 'JPEG', quality=97)
                             else:
@@ -1691,7 +1644,6 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                 )
                 sent += 1
 
-                # آپلود به گیتهاب اگه فعاله
                 if GITHUB_ENABLED:
                     try:
                         img_size = os.path.getsize(send_path)
@@ -1705,7 +1657,6 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                     try: await status.edit(f"📨 Sending... {sent}/{total}")
                     except Exception: pass
 
-                # پاک کردن HD temp
                 if hd and send_path != item['path'] and os.path.exists(send_path):
                     try: os.remove(send_path)
                     except Exception: pass
@@ -1715,7 +1666,6 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                 try: await status.edit(f"⚠️ Error on {sent+1}: {str(e)[:60]}")
                 except Exception: pass
 
-    # cleanup
     import shutil
     pdfimg_sessions.pop(session_key, None)
     try: shutil.rmtree(session['tmp_dir'], ignore_errors=True)
@@ -1769,7 +1719,6 @@ async def generic_url_handler(event):
 
     filepath, error, size = await download_with_controls(target_url, status_msg, dl_id, referer=target_url)
 
-    # FIX: 403 → auto-dirpy
     if error == "HTTP_403":
         await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
         await process_dirpy_request(event, target_url)
@@ -1813,22 +1762,19 @@ async def generic_url_handler(event):
 # ====================== VIDEO RECEIVE → GITHUB OFFER ======================
 
 async def video_receive_handler(event):
-    """وقتی کاربر ویدیو میفرسته و GITHUB_ENABLED فعاله، یه دکمه پیشنهاد آپلود به گیتهاب میده."""
     if event.sender_id not in AUTHORIZED_USERS:
         return
     if not GITHUB_ENABLED:
         return
-    # فقط ویدیو — document های غیر ویدیو رو رد کن
     media = event.video or event.document
     if not media:
         return
-    # بررسی mime type
     mime = getattr(media, 'mime_type', '') or ''
     if not mime.startswith('video/') and not (event.video):
         return
     file_size = getattr(media, 'size', 0) or 0
     if file_size == 0 or file_size > GITHUB_MAX_MB * 1024 * 1024:
-        return  # بزرگتر از حد مجاز — نادیده بگیر
+        return
 
     pending_id = f"vgh_{event.chat_id}_{event.id}_{int(time.time())}"
     video_github_pending[pending_id] = {
@@ -1860,14 +1806,10 @@ async def vgh_yes_callback(event):
 
     await event.answer("⏳ Downloading and uploading...", alert=False)
     try:
-        await event.edit(
-            "⏳ Downloading video from Telegram...",
-            buttons=None
-        )
+        await event.edit("⏳ Downloading video from Telegram...", buttons=None)
     except Exception:
         pass
 
-    # دانلود ویدیو از تلگرام
     tmp_path = os.path.join(OUTPUT_FOLDER, f"vgh_{int(time.time())}.mp4")
     try:
         msg = await event.client.get_messages(data["chat_id"], ids=data["message_id"])
@@ -1938,6 +1880,7 @@ async def main():
     print("   FIX 4: pause/resume split callbacks")
     print("   FIX 5: command pattern conflict resolved")
     print("   FIX 6: detailed logging enabled")
+    print("   FIX 7: GitHub → Release Assets (2GB limit)")
     print("="*60)
     logger.info("[BOOT] Starting bot...")
 
@@ -1986,7 +1929,7 @@ async def main():
     client.add_event_handler(pdfimg_command,  events.NewMessage(pattern=r'^/pdfimg(\s|$)',      incoming=True))
     client.add_event_handler(html_command,    events.NewMessage(pattern=r'^/html(\s|$)',        incoming=True))
 
-    # ===== Message handlers (order matters - specific before generic) =====
+    # ===== Message handlers =====
     client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
     client.add_event_handler(size_input_handler,  events.NewMessage(incoming=True))
     client.add_event_handler(video_receive_handler, events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)))
