@@ -1,13 +1,13 @@
-"""
-github.py — آپلود فایل به GitHub از طریق Release Assets (حداکثر ۲GB)
-"""
+import asyncio
+import base64
 import logging
 import os
 import time
 import re
 from typing import Optional, Tuple
-import aiohttp
+
 import aiofiles
+import aiohttp
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 
@@ -15,69 +15,64 @@ load_dotenv()
 
 logger = logging.getLogger("GitHubUploader")
 
-# ====================== CONFIGURATION ======================
-GITHUB_TOKEN       = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO        = os.getenv("GITHUB_REPO", "astwdnya/upanddown")
-GITHUB_BRANCH      = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_BASE_DIR    = os.getenv("GITHUB_BASE_DIR", "files")
-GITHUB_MAX_MB      = int(os.getenv("GITHUB_MAX_MB", "2000"))          # ← 2GB
-GITHUB_RELEASE_TAG = os.getenv("GITHUB_RELEASE_TAG", "bot-uploads")   # tag ثابت
+# ====================== CONFIG ======================
+GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO     = os.getenv("GITHUB_REPO", "astwdnya/upanddown")
+GITHUB_BRANCH   = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_BASE_DIR = os.getenv("GITHUB_BASE_DIR", "files")
+GITHUB_MAX_MB   = int(os.getenv("GITHUB_MAX_MB", "100"))   # حداکثر ۱۰۰ مگابایت برای Raw
 
-# ====================== HELPERS ======================
+def _raw_url(repo: str, branch: str, path: str) -> str:
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+
+def _api_url(repo: str, path: str) -> str:
+    return f"https://api.github.com/repos/{repo}/contents/{path}"
+
 def _safe_name(filename: str) -> str:
-    name = re.sub(r'[^\w.\-]', '_', filename)
+    name = re.sub(r'[^\w.\-() ]', '_', filename)
     return name[:200] or f"file_{int(time.time())}"
 
-def _api_base(repo: str) -> str:
-    return f"https://api.github.com/repos/{repo}"
+def _subfolder_for(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    
+    # ==================== همه فرمت‌های درخواستی ====================
+    video_ext = {'.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.mpeg','.mpg','.m4v','.3gp','.vob',
+                 '.ts','.mts','.ogv','.rmvb','.asf','.f4v','.swf','.dv','.mxf','.avchd','.prores'}
+    
+    image_ext = {'.jpg','.jpeg','.png','.gif','.webp','.bmp','.tiff','.svg','.ico','.heic','.heif','.raw',
+                 '.cr2','.nef','.arw','.dng','.psd','.ai','.eps'}
+    
+    document_ext = {'.pdf','.xps','.epub','.mobi','.azw3','.cbr','.cbz','.doc','.docx','.xls','.xlsx',
+                    '.ppt','.pptx','.txt','.rtf','.csv','.json','.xml','.yaml','.html','.css','.js','.ts',
+                    '.jsx','.tsx','.php','.py','.java','.cpp','.c','.cs','.go','.rs','.swift','.kt','.sh',
+                    '.bat','.cmd','.ps1'}
+    
+    archive_ext = {'.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.cab','.tgz','.jar','.war','.ear'}
+    
+    audio_ext = {'.mp3','.wav','.aac','.flac','.ogg','.opus','.m4a','.wma','.amr','.midi','.ape','.alac','.caf'}
+    
+    app_ext = {'.apk','.xapk','.ipa','.deb','.dylib','.framework','.app','.pkg','.aab','.exe','.msi','.dll',
+               '.sys','.bin','.iso','.img','.dmg','.vhd','.vmdk','.qcow2','.nds','.rom','.cso','.nsp','.xci',
+               '.cia','.rvz','.wbfs','.pak','.obb','.unitypackage','.asset','.blend','.fbx','.obj','.stl',
+               '.gltf','.usdz'}
+    
+    cert_ext = {'.tor','.pem','.key','.cer','.p12','.mobileprovision','.keystore','.har','.pcap','.cap',
+                '.apkm','.apks','.dysm','.xcarchive','.xcodeproj'}
 
-# ====================== RELEASE MANAGEMENT ======================
-async def _get_or_create_release(session, repo, tag, branch):
-    """Release با tag مشخص رو پیدا یا بساز. Returns: (release_id, upload_url_base)"""
-    base = _api_base(repo)
+    if ext in video_ext: return 'videos'
+    if ext in image_ext: return 'images'
+    if ext in document_ext: return 'documents'
+    if ext in archive_ext: return 'archives'
+    if ext in audio_ext: return 'audio'
+    if ext in app_ext: return 'apps'
+    if ext in cert_ext: return 'certificates'
+    
+    return 'misc'
 
-    async with session.get(f"{base}/releases/tags/{tag}") as resp:
-        if resp.status == 200:
-            data = await resp.json()
-            upload_url = data["upload_url"].split("{")[0]
-            logger.info(f"[GitHub] Found existing release: {tag} (id={data['id']})")
-            return data["id"], upload_url
 
-    payload = {
-        "tag_name": tag,
-        "target_commitish": branch,
-        "name": "Bot Uploads",
-        "body": "Auto-generated release for bot file uploads.",
-        "draft": False,
-        "prerelease": False,
-    }
-    async with session.post(f"{base}/releases", json=payload) as resp:
-        if resp.status == 201:
-            data = await resp.json()
-            upload_url = data["upload_url"].split("{")[0]
-            logger.info(f"[GitHub] Created new release: {tag} (id={data['id']})")
-            return data["id"], upload_url
-        body = await resp.text()
-        logger.error(f"[GitHub] Create release failed: {resp.status} - {body[:300]}")
-        return None, None
-
-async def _delete_existing_asset(session, repo, release_id, filename):
-    """اگه asset با همین نام وجود داره حذفش کن."""
-    base = _api_base(repo)
-    async with session.get(f"{base}/releases/{release_id}/assets") as resp:
-        if resp.status != 200:
-            return
-        assets = await resp.json()
-    for asset in assets:
-        if asset["name"] == filename:
-            async with session.delete(f"{base}/releases/assets/{asset['id']}") as del_resp:
-                if del_resp.status == 204:
-                    logger.info(f"[GitHub] Deleted old asset: {filename}")
-            break
-
-# ====================== MAIN UPLOAD FUNCTION ======================
 async def upload_to_github(
     filepath: str,
+    status_msg=None,           # برای نمایش پیشرفت
     subfolder: Optional[str] = None,
     filename: Optional[str] = None,
     token: Optional[str] = None,
@@ -85,66 +80,83 @@ async def upload_to_github(
     branch: Optional[str] = None,
     base_dir: Optional[str] = None,
 ) -> Tuple[bool, str, str]:
-    """Returns: (success, message, download_url)"""
-    token  = token  or GITHUB_TOKEN
-    repo   = repo   or GITHUB_REPO
+    
+    token = token or GITHUB_TOKEN
+    repo = repo or GITHUB_REPO
     branch = branch or GITHUB_BRANCH
+    base_dir = base_dir or GITHUB_BASE_DIR
 
-    if not token:
-        return False, "GITHUB_TOKEN is not set.", ""
-    if not repo:
-        return False, "GITHUB_REPO is not set.", ""
+    if not token or not repo:
+        return False, "GitHub token or repo not configured", ""
+
     if not os.path.exists(filepath):
-        return False, f"File not found: {filepath}", ""
+        return False, "File not found", ""
 
     file_size = os.path.getsize(filepath)
-    max_bytes = GITHUB_MAX_MB * 1024 * 1024
-    if file_size > max_bytes:
-        return False, f"File too large ({file_size/1024/1024:.1f}MB > {GITHUB_MAX_MB}MB)", ""
+    if file_size > GITHUB_MAX_MB * 1024 * 1024:
+        return False, f"File too large (max {GITHUB_MAX_MB}MB for Raw)", ""
 
-    orig_name  = filename or os.path.basename(filepath)
-    safe_name  = _safe_name(orig_name)
+    orig_name = filename or os.path.basename(filepath)
+    safe_name = _safe_name(orig_name)
+    sub = subfolder or _subfolder_for(safe_name)
+
     name_noext, ext = os.path.splitext(safe_name)
     final_name = f"{name_noext}_{int(time.time())}{ext}"
+    gh_path = f"{base_dir}/{sub}/{final_name}"
+
+    # ====================== PROGRESS BAR ======================
+    async def update_progress(percent: int, status: str = "Uploading"):
+        if status_msg:
+            try:
+                bar = '█' * (percent // 5) + '░' * (20 - percent // 5)
+                await status_msg.edit(f"☁️ **{status} to GitHub**\n`[{bar}]` **{percent}%**")
+            except:
+                pass
+
+    await update_progress(10, "Reading file")
+
+    async with aiofiles.open(filepath, 'rb') as f:
+        raw = await f.read()
+
+    await update_progress(40, "Encoding...")
+
+    content_b64 = base64.b64encode(raw).decode()
+
+    await update_progress(60, "Connecting...")
 
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "GitHub-Uploader-Bot/2.0",
+        "User-Agent": "GitHub-Uploader-Bot",
     }
-    timeout = ClientTimeout(total=3600, connect=30, sock_read=300)
 
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        release_id, upload_url_base = await _get_or_create_release(
-            session, repo, GITHUB_RELEASE_TAG, branch
-        )
-        if not release_id or not upload_url_base:
-            return False, "Could not get or create GitHub release.", ""
+    payload = {
+        "message": f"Upload {final_name}",
+        "content": content_b64,
+        "branch": branch,
+    }
 
-        await _delete_existing_asset(session, repo, release_id, final_name)
+    api_url = _api_url(repo, gh_path)
 
-        upload_url = f"{upload_url_base}?name={final_name}"
-        upload_headers = {
-            **headers,
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(file_size),
-        }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # چک وجود فایل
+        async with session.get(api_url) as check:
+            if check.status == 200:
+                data = await check.json()
+                payload["sha"] = data.get("sha")
 
-        logger.info(f"[GitHub] Uploading {final_name} ({file_size/1024/1024:.1f}MB)...")
+        await update_progress(80, "Uploading to GitHub")
 
-        async with aiofiles.open(filepath, "rb") as f:
-            file_data = await f.read()
+        async with session.put(api_url, json=payload) as resp:
+            if resp.status in (200, 201):
+                raw_url = _raw_url(repo, branch, gh_path)
+                await update_progress(100, "✅ Uploaded Successfully")
+                logger.info(f"[GitHub] Uploaded: {gh_path} → {raw_url}")
+                return True, "Uploaded successfully", raw_url
+            else:
+                body = await resp.text()
+                logger.error(f"GitHub Error {resp.status}: {body[:300]}")
+                await update_progress(100, "❌ Upload Failed")
+                return False, f"GitHub Error {resp.status}", ""
 
-        async with session.post(upload_url, data=file_data, headers=upload_headers) as resp:
-            if resp.status == 201:
-                data = await resp.json()
-                download_url = data["browser_download_url"]
-                logger.info(f"[GitHub] Done: {download_url}")
-                return True, f"Uploaded as `{final_name}`", download_url
-            body = await resp.text()
-            logger.error(f"[GitHub] Upload failed: {resp.status} - {body[:300]}")
-            return False, f"GitHub error {resp.status}: {body[:200]}", ""
-
-
-def github_configured() -> bool:
-    return bool(GITHUB_TOKEN and GITHUB_REPO)
+    return False, "Unknown error", ""
