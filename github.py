@@ -1,5 +1,6 @@
 """
 github.py — آپلود فایل به GitHub repository و گرفتن لینک مستقیم دانلود
+(نسخه ایمن با استفاده از متغیرهای محیطی)
 """
 
 import asyncio
@@ -13,16 +14,20 @@ from typing import Optional, Tuple
 import aiohttp
 import aiofiles
 from aiohttp import ClientTimeout
+from dotenv import load_dotenv   # <-- اضافه شد
+
+# بارگذاری متغیرهای محیطی از فایل .env (در صورتی که وجود داشته باشد)
+load_dotenv()
 
 logger = logging.getLogger("GitHubUploader")
 
 # ====================== CONFIGURATION ======================
-# 🔐 توکن جدید و معتبر را اینجا وارد کنید (توکنی که در curl جواب داد)
-GITHUB_TOKEN    = "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"
-GITHUB_REPO     = "astwdnya/upanddown"
-GITHUB_BRANCH   = "main"
-GITHUB_BASE_DIR = "files"
-GITHUB_MAX_MB   = 50
+# مقادیر از متغیرهای محیطی خوانده می‌شوند (در صورت نبود، پیش‌فرض None)
+GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")      # دیگر هاردکد نیست!
+GITHUB_REPO     = os.getenv("GITHUB_REPO", "astwdnya/upanddown")
+GITHUB_BRANCH   = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_BASE_DIR = os.getenv("GITHUB_BASE_DIR", "files")
+GITHUB_MAX_MB   = int(os.getenv("GITHUB_MAX_MB", "50"))
 
 # ====================== HELPERS ======================
 
@@ -69,15 +74,16 @@ async def upload_to_github(
     base_dir = base_dir or GITHUB_BASE_DIR
 
     if not token:
-        return False, "GITHUB_TOKEN not set.", ""
+        return False, "GITHUB_TOKEN is not set in environment variables.", ""
     if not repo:
-        return False, "GITHUB_REPO not set.", ""
+        return False, "GITHUB_REPO is not set.", ""
 
     if not os.path.exists(filepath):
         return False, f"File not found: {filepath}", ""
 
     file_size = os.path.getsize(filepath)
-    if file_size > GITHUB_MAX_MB * 1024 * 1024:
+    max_bytes = GITHUB_MAX_MB * 1024 * 1024
+    if file_size > max_bytes:
         return False, f"File too large ({file_size/1024/1024:.1f}MB > {GITHUB_MAX_MB}MB)", ""
 
     orig_name = filename or os.path.basename(filepath)
@@ -92,11 +98,10 @@ async def upload_to_github(
         raw = await f.read()
     content_b64 = base64.b64encode(raw).decode()
 
-    # 🔧 اصلاح مهم: اضافه کردن User-Agent و ساده‌سازی هدرها
     headers = {
         "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",  # نسخه پایدار
-        "User-Agent": "GitHub-Uploader-Bot/1.0",    # 👈 کلید حل مشکل 401
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "GitHub-Uploader-Bot/1.0",
         "Content-Type": "application/json",
     }
 
@@ -107,16 +112,15 @@ async def upload_to_github(
     }
 
     api_url = _api_url(repo, gh_path)
-
     timeout = ClientTimeout(total=120, connect=15)
+
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        # بررسی وجود فایل (برای گرفتن sha در صورت نیاز)
+        # بررسی وجود فایل قبلی (برای گرفتن sha در صورت نیاز)
         async with session.get(api_url) as check_resp:
             if check_resp.status == 200:
                 existing = await check_resp.json()
                 payload["sha"] = existing.get("sha", "")
             elif check_resp.status not in (200, 404):
-                # هر خطای دیگری غیر از 404 را گزارش کن
                 body = await check_resp.text()
                 logger.error(f"GitHub check error {check_resp.status}: {body[:200]}")
                 return False, f"GitHub check error: {check_resp.status}", ""
@@ -133,4 +137,5 @@ async def upload_to_github(
                 return False, f"GitHub error {resp.status}: {body[:200]}", ""
 
 def github_configured() -> bool:
+    """بررسی می‌کند که توکن و مخزن تنظیم شده باشند"""
     return bool(GITHUB_TOKEN and GITHUB_REPO)
