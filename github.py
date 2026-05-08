@@ -17,7 +17,7 @@ from aiohttp import ClientTimeout
 logger = logging.getLogger("GitHubUploader")
 
 # ====================== CONFIGURATION ======================
-GITHUB_TOKEN    = "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"
+GITHUB_TOKEN    = "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"
 GITHUB_REPO     = "astwdnya/upanddown"
 GITHUB_BRANCH   = "main"
 GITHUB_BASE_DIR = "files"
