@@ -1419,7 +1419,7 @@ async def process_html_request(event, url: str):
 
 
 # ====================== TELEGRAM COMMANDS ======================
-@events.register(events.NewMessage(pattern='/admin', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/admin(\s|$)', incoming=True))
 async def admin_cmd(event):
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
@@ -1481,7 +1481,7 @@ async def admin_cancel_callback(event):
 
 
 
-@events.register(events.NewMessage(pattern='/startgithub', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/startgithub(\s|$)', incoming=True))
 async def startgithub_cmd(event):
     global GITHUB_ENABLED
     if event.sender_id != ADMIN_ID:
@@ -1499,7 +1499,7 @@ async def startgithub_cmd(event):
     )
 
 
-@events.register(events.NewMessage(pattern='/stopgithub', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/stopgithub(\s|$)', incoming=True))
 async def stopgithub_cmd(event):
     global GITHUB_ENABLED
     if event.sender_id != ADMIN_ID:
@@ -1508,7 +1508,7 @@ async def stopgithub_cmd(event):
     await event.reply("🔴 **GitHub upload DISABLED**\nFiles will no longer be uploaded to GitHub.", parse_mode='markdown')
 
 
-@events.register(events.NewMessage(pattern='/github', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/github(\s|$)', incoming=True))
 async def github_cmd(event):
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
@@ -1537,7 +1537,7 @@ async def github_cmd(event):
             parse_mode='markdown'
         )
 
-@events.register(events.NewMessage(pattern='/start', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/start(\s|$)', incoming=True))
 async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
@@ -1556,7 +1556,7 @@ async def start_cmd(event):
     )
 
 
-@events.register(events.NewMessage(pattern='/dirpy', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/dirpy(\s|$)', incoming=True))
 async def dirpy_command(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
@@ -1564,7 +1564,7 @@ async def dirpy_command(event):
     await process_dirpy_request(event, parts[1].strip())
 
 
-@events.register(events.NewMessage(pattern='/pdf', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/pdf(\s|$)', incoming=True))
 async def pdf_command(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
@@ -1698,7 +1698,7 @@ async def pdfimg_hd_callback(event):
     session_key = event.data.decode().split('|', 1)[1]
     await _do_send_pdfimg(event, session_key, hd=True)
 
-@events.register(events.NewMessage(pattern='/pdfimg', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/pdfimg(\s|$)', incoming=True))
 async def pdfimg_command(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
@@ -1706,7 +1706,7 @@ async def pdfimg_command(event):
     await process_pdfimg_request(event, parts[1].strip())
 
 
-@events.register(events.NewMessage(pattern='/html', incoming=True))
+@events.register(events.NewMessage(pattern=r'^/html(\s|$)', incoming=True))
 async def html_command(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
