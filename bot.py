@@ -56,7 +56,27 @@ GITHUB_ENABLED: bool = False
 video_github_pending: Dict[str, Dict] = {}
 
 # ====================== LOGGING ======================
-logging.basicConfig(format='%(asctime)s | %(levelname)s | %(message)s', level=logging.INFO)
+import sys as _sys
+
+# ===== LOGGING: همه چیز به stdout میره تا توی Render logs دیده بشه =====
+_log_formatter = logging.Formatter(
+    fmt='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+_stdout_handler = logging.StreamHandler(_sys.stdout)
+_stdout_handler.setFormatter(_log_formatter)
+_stdout_handler.setLevel(logging.DEBUG)
+
+logging.root.setLevel(logging.DEBUG)
+logging.root.addHandler(_stdout_handler)
+
+# کم‌حرف کردن کتابخونه‌های پرسروصدا
+logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("playwright").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 logger = logging.getLogger("UltimateBot")
 
 # ====================== FLASK KEEP-ALIVE ======================
@@ -184,9 +204,11 @@ async def download_with_controls(
     dl_buttons_pause  = [[Button.inline("⏸ Pause",    f"dlpause_{dl_id}"),  Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
     dl_buttons_resume = [[Button.inline("▶️ Resume",  f"dlresume_{dl_id}"), Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
+    logger.info(f"[DL] START | url={url[:120]}")
     await safe_edit(status_msg, "📥 Connecting...", buttons=dl_buttons_pause)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        logger.info(f"[DL] Attempt {attempt}/{MAX_RETRIES} | downloaded_so_far={human_readable_size(downloaded)}")
         try:
             attempt_headers = headers.copy()
             if downloaded > 0:
@@ -262,6 +284,7 @@ async def download_with_controls(
                                 await safe_edit(status_msg, text, buttons=dl_buttons_pause)
 
             active_downloads.pop(dl_id, None)
+            logger.info(f"[DL] DONE | size={human_readable_size(downloaded)} | file={filepath}")
             try:
                 await status_msg.edit("✅ Download complete!", parse_mode='markdown', buttons=None)
             except Exception: pass
@@ -693,6 +716,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
 
         try:
             browser = await p.chromium.launch(headless=True, args=_browser_args())
+            logger.info(f"[PLAYWRIGHT] Browser launched")
 
             async def make_context():
                 return await browser.new_context(
@@ -706,6 +730,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
             page1 = await ctx1.new_page()
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
             try:
+                logger.info(f"[PLAYWRIGHT] Opening Dirpy: {dirpy_url[:120]}")
                 await page1.goto(dirpy_url, wait_until='domcontentloaded', timeout=60000)
                 await _collect_from_page(page1, "DIRPY", captured_urls, seen)
                 if captured_urls:
@@ -722,6 +747,7 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                 ctx2 = await make_context()
                 page2 = await ctx2.new_page()
                 try:
+                    logger.info(f"[PLAYWRIGHT] Direct goto: {video_url[:120]}")
                     async def handle_dialog(dialog):
                         await dialog.accept()
                     page2.on('dialog', handle_dialog)
@@ -1000,14 +1026,17 @@ async def process_dirpy_request(event, url: str):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
+    logger.info(f"[DIRPY] START | chat={event.chat_id} | url={url[:120]}")
     status_msg = await event.reply("🔄 Starting extraction...", parse_mode='markdown')
     try:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         found_urls, session_headers, intercept_err = await extract_video_url_smart(url, status_msg)
         if not found_urls:
+            logger.warning(f"[DIRPY] No URLs found | chat={event.chat_id} | err={intercept_err}")
             await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
             return
+        logger.info(f"[DIRPY] Found {len(found_urls)} URLs | chat={event.chat_id}")
         if len(found_urls) == 1:
             await do_download_and_send(event, status_msg, found_urls[0], url, extra_headers=session_headers)
             return
@@ -1212,6 +1241,7 @@ async def process_pdfimg_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
+    logger.info(f"[PDFIMG] START | chat={event.chat_id} | url={url[:120]}")
     status = await event.reply("🌐 Loading page...", parse_mode='markdown')
     tmp_dir = f"/app/output_files/pdfimg_{event.chat_id}_{event.id}"
 
@@ -1260,9 +1290,11 @@ async def process_pdfimg_request(event, url: str):
             await browser.close()
 
         if not img_data:
+            logger.warning(f"[PDFIMG] No images found on page | chat={event.chat_id}")
             await safe_edit(status, "No images found on this page.")
             return
 
+        logger.info(f"[PDFIMG] Found {len(img_data)} images on page | chat={event.chat_id}")
         await safe_edit(status, f"Found {len(img_data)} images. Downloading...")
 
         # ---- مرحله 2: دانلود thumbnail ها (JPG/PNG) + ذخیره GIF به همان فرمت ----
@@ -1357,6 +1389,7 @@ async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
+    logger.info(f"[PDF] START | chat={event.chat_id} | url={url[:120]}")
     status = await event.reply("📄 Converting to PDF...", parse_mode='markdown')
     filepath = None
     try:
@@ -1390,6 +1423,7 @@ async def process_html_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
     if msg_id in processing_messages: return
     processing_messages.add(msg_id)
+    logger.info(f"[HTML] START | chat={event.chat_id} | url={url[:120]}")
     status = await event.reply("🌐 Capturing full webpage...", parse_mode='markdown')
     filepath = None
     try:
@@ -1421,6 +1455,7 @@ async def process_html_request(event, url: str):
 # ====================== TELEGRAM COMMANDS ======================
 @events.register(events.NewMessage(pattern=r'^/admin(\s|$)', incoming=True))
 async def admin_cmd(event):
+    logger.info(f"[CMD] /admin from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
@@ -1484,6 +1519,7 @@ async def admin_cancel_callback(event):
 @events.register(events.NewMessage(pattern=r'^/startgithub(\s|$)', incoming=True))
 async def startgithub_cmd(event):
     global GITHUB_ENABLED
+    logger.info(f"[CMD] /startgithub from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
     if not github_configured():
@@ -1502,6 +1538,7 @@ async def startgithub_cmd(event):
 @events.register(events.NewMessage(pattern=r'^/stopgithub(\s|$)', incoming=True))
 async def stopgithub_cmd(event):
     global GITHUB_ENABLED
+    logger.info(f"[CMD] /stopgithub from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
     GITHUB_ENABLED = False
@@ -1510,6 +1547,7 @@ async def stopgithub_cmd(event):
 
 @events.register(events.NewMessage(pattern=r'^/github(\s|$)', incoming=True))
 async def github_cmd(event):
+    logger.info(f"[CMD] /github from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
 
@@ -1539,6 +1577,7 @@ async def github_cmd(event):
 
 @events.register(events.NewMessage(pattern=r'^/start(\s|$)', incoming=True))
 async def start_cmd(event):
+    logger.info(f"[CMD] /start from user={event.sender_id}")
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     await event.reply(
@@ -1558,6 +1597,7 @@ async def start_cmd(event):
 
 @events.register(events.NewMessage(pattern=r'^/dirpy(\s|$)', incoming=True))
 async def dirpy_command(event):
+    logger.info(f"[CMD] /dirpy from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2: return await event.reply("❌ Usage: `/dirpy <url>`", parse_mode='markdown')
@@ -1566,6 +1606,7 @@ async def dirpy_command(event):
 
 @events.register(events.NewMessage(pattern=r'^/pdf(\s|$)', incoming=True))
 async def pdf_command(event):
+    logger.info(f"[CMD] /pdf from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2: return await event.reply("❌ Usage: `/pdf <url>`", parse_mode='markdown')
@@ -1700,6 +1741,7 @@ async def pdfimg_hd_callback(event):
 
 @events.register(events.NewMessage(pattern=r'^/pdfimg(\s|$)', incoming=True))
 async def pdfimg_command(event):
+    logger.info(f"[CMD] /pdfimg from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2: return await event.reply("❌ Usage: `/pdfimg <url>`", parse_mode='markdown')
@@ -1708,6 +1750,7 @@ async def pdfimg_command(event):
 
 @events.register(events.NewMessage(pattern=r'^/html(\s|$)', incoming=True))
 async def html_command(event):
+    logger.info(f"[CMD] /html from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2: return await event.reply("❌ Usage: `/html <url>`", parse_mode='markdown')
@@ -1724,6 +1767,7 @@ async def generic_url_handler(event):
     if not urls:
         return
     target_url = urls[0]
+    logger.info(f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}")
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading...")
@@ -1893,7 +1937,10 @@ async def main():
     print("   FIX 2: FFmpeg -noautorotate + yuv420p")
     print("   FIX 3: size_input uses chat_id (not sender_id)")
     print("   FIX 4: pause/resume split callbacks")
+    print("   FIX 5: command pattern conflict resolved")
+    print("   FIX 6: detailed logging enabled")
     print("="*60)
+    logger.info("[BOOT] Starting bot...")
 
     start_keep_alive()
     client = TelegramClient(
@@ -1932,7 +1979,9 @@ async def main():
     client.add_event_handler(generic_url_handler)
 
     me = await client.get_me()
-    logger.info(f"✅ Bot started as @{me.username}")
+    logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
+    logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
+    logger.info(f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO}")
     print(f"✅ Bot is online → @{me.username}")
     await client.run_until_disconnected()
 
