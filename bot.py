@@ -49,6 +49,12 @@ admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 
+# آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
+GITHUB_ENABLED: bool = False
+
+# نگه‌داری فایل‌های ویدیویی که کاربر فرستاده و منتظر تأیید گیتهاب هستن
+video_github_pending: Dict[str, Dict] = {}
+
 # ====================== LOGGING ======================
 logging.basicConfig(format='%(asctime)s | %(levelname)s | %(message)s', level=logging.INFO)
 logger = logging.getLogger("UltimateBot")
@@ -89,7 +95,28 @@ def parse_size_input(text: str) -> Optional[int]:
     elif unit == 'g': return int(num * 1024 * 1024 * 1024)
     return int(num)
 
-async def safe_edit(msg: Message, text: str, buttons=None):
+async def maybe_upload_github(client, chat_id: int, filepath: str, file_size: int) -> str:
+    """
+    اگه GITHUB_ENABLED فعال باشه فایل رو آپلود میکنه و لینک رو برمیگردونه.
+    در غیر اینصورت رشته خالی برمیگردونه.
+    """
+    global GITHUB_ENABLED
+    if not GITHUB_ENABLED:
+        return ""
+    if not github_configured():
+        return ""
+    if file_size > GITHUB_MAX_MB * 1024 * 1024:
+        return ""
+    try:
+        gh_ok, gh_msg, gh_url = await upload_to_github(filepath)
+        if gh_ok and gh_url:
+            logger.info(f"GitHub upload OK: {gh_url}")
+            return gh_url
+        else:
+            logger.warning(f"GitHub upload failed: {gh_msg}")
+    except Exception as e:
+        logger.warning(f"GitHub upload exception: {e}")
+    return ""
     try:
         if buttons is not None:
             await msg.edit(text, parse_mode='markdown', buttons=buttons)
@@ -459,15 +486,11 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
 
         # آپلود به GitHub اگه configure شده و فایل در محدوده سایز باشه
         gh_line = ""
-        if github_configured() and final_size <= GITHUB_MAX_MB * 1024 * 1024:
+        if GITHUB_ENABLED:
             await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-            gh_ok, gh_msg, gh_url = await upload_to_github(filepath)
-            if gh_ok and gh_url:
+            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, final_size)
+            if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-                logger.info(f"GitHub upload OK: {gh_url}")
-            else:
-                logger.warning(f"GitHub upload failed: {gh_msg}")
-
         await send_file_with_progress(
             client=event.client, chat_id=event.chat_id, filepath=filepath,
             caption=(
@@ -1132,12 +1155,20 @@ async def size_input_handler(event):
     if compressed_path and os.path.exists(compressed_path):
         await safe_edit(status_msg, "📤 Uploading compressed video...")
         try:
+            comp_size = os.path.getsize(compressed_path)
+            gh_line = ""
+            if GITHUB_ENABLED:
+                await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+                gh_url = await maybe_upload_github(event.client, event.chat_id, compressed_path, comp_size)
+                if gh_url:
+                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
             await send_file_with_progress(
                 client=event.client, chat_id=event.chat_id, filepath=compressed_path,
                 caption=(
                     f"✅ **Compressed Video**\n"
                     f"🎯 Requested: {human_readable_size(target_bytes)}\n"
-                    f"📦 Final Size: {human_readable_size(os.path.getsize(compressed_path))}"
+                    f"📦 Final Size: {human_readable_size(comp_size)}"
+                    f"{gh_line}"
                 ),
                 status_msg=status_msg,
             )
@@ -1334,7 +1365,17 @@ async def process_pdf_request(event, url: str):
         if error:
             await safe_edit(status, f"❌ {error}")
             return
-        await event.client.send_file(event.chat_id, filepath, caption=f"📑 PDF • {human_readable_size(size)}", force_document=True)
+        gh_line = ""
+        if GITHUB_ENABLED:
+            await safe_edit(status, "☁️ Uploading to GitHub...")
+            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, size)
+            if gh_url:
+                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        await event.client.send_file(
+            event.chat_id, filepath,
+            caption=f"📑 PDF • {human_readable_size(size)}{gh_line}",
+            force_document=True
+        )
         await status.delete()
     except Exception as e:
         await safe_edit(status, f"❌ Unexpected error: {str(e)[:120]}")
@@ -1357,7 +1398,16 @@ async def process_html_request(event, url: str):
         if error:
             await safe_edit(status, f"❌ {error}")
             return
-        await event.client.send_file(event.chat_id, filepath, caption="📦 Complete Webpage Snapshot (MHTML)")
+        gh_line = ""
+        if GITHUB_ENABLED:
+            await safe_edit(status, "☁️ Uploading to GitHub...")
+            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, size)
+            if gh_url:
+                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        await event.client.send_file(
+            event.chat_id, filepath,
+            caption=f"📦 Complete Webpage Snapshot (MHTML){gh_line}"
+        )
         await status.delete()
     except Exception as e:
         await safe_edit(status, f"❌ Unexpected error: {str(e)[:120]}")
@@ -1431,22 +1481,49 @@ async def admin_cancel_callback(event):
 
 
 
+@events.register(events.NewMessage(pattern='/startgithub', incoming=True))
+async def startgithub_cmd(event):
+    global GITHUB_ENABLED
+    if event.sender_id != ADMIN_ID:
+        return await event.reply("⛔ Unauthorized")
+    if not github_configured():
+        return await event.reply("❌ GitHub not configured (token or repo missing)")
+    GITHUB_ENABLED = True
+    await event.reply(
+        "✅ **GitHub upload ENABLED**\n\n"
+        f"📁 Repo: `{GITHUB_REPO}`\n"
+        f"🌿 Branch: `{GITHUB_BRANCH}`\n"
+        f"📦 Max size: `{GITHUB_MAX_MB}MB`\n\n"
+        "From now on, all files sent by the bot will also be uploaded to GitHub with a direct download link.",
+        parse_mode='markdown'
+    )
+
+
+@events.register(events.NewMessage(pattern='/stopgithub', incoming=True))
+async def stopgithub_cmd(event):
+    global GITHUB_ENABLED
+    if event.sender_id != ADMIN_ID:
+        return await event.reply("⛔ Unauthorized")
+    GITHUB_ENABLED = False
+    await event.reply("🔴 **GitHub upload DISABLED**\nFiles will no longer be uploaded to GitHub.", parse_mode='markdown')
+
+
 @events.register(events.NewMessage(pattern='/github', incoming=True))
 async def github_cmd(event):
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
 
     from github import GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH, GITHUB_BASE_DIR, github_configured
+    status_icon = "✅ Active" if GITHUB_ENABLED else "⏸ Paused"
     if github_configured():
         await event.reply(
-            f"☁️ **GitHub Status: ✅ Connected**\n\n"
+            f"☁️ **GitHub Status: {status_icon}**\n\n"
             f"📁 Repo: `{GITHUB_REPO}`\n"
             f"🌿 Branch: `{GITHUB_BRANCH}`\n"
             f"📂 Base dir: `{GITHUB_BASE_DIR}`\n"
             f"📦 Max file size: `{GITHUB_MAX_MB}MB`\n\n"
-            f"Files are auto-uploaded after each download.\n"
-            f"Set via environment variables:\n"
-            f"`GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_BASE_DIR`",
+            f"• `/startgithub` — enable auto-upload\n"
+            f"• `/stopgithub` — disable auto-upload",
             parse_mode='markdown'
         )
     else:
@@ -1468,7 +1545,11 @@ async def start_cmd(event):
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
         "• `/pdf <url>` → Webpage to PDF\n"
-        "• `/html <url>` → Save as MHTML\n• `/github` → GitHub upload status\n\n"
+        "• `/html <url>` → Save as MHTML\n"
+        "• `/pdfimg <url>` → Download all images\n"
+        "• `/github` → GitHub upload status\n"
+        "• `/startgithub` → Enable GitHub upload\n"
+        "• `/stopgithub` → Disable GitHub upload\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode='markdown'
@@ -1568,6 +1649,17 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                     force_document=False,
                 )
                 sent += 1
+
+                # آپلود به گیتهاب اگه فعاله
+                if GITHUB_ENABLED:
+                    try:
+                        img_size = os.path.getsize(send_path)
+                        gh_url = await maybe_upload_github(event.client, chat_id, send_path, img_size)
+                        if gh_url:
+                            await event.client.send_message(chat_id, f"☁️ [GitHub DL]({gh_url})", parse_mode='markdown')
+                    except Exception:
+                        pass
+
                 if sent % 5 == 0 or sent == total:
                     try: await status.edit(f"📨 Sending... {sent}/{total}")
                     except Exception: pass
@@ -1672,6 +1764,127 @@ async def generic_url_handler(event):
     except Exception: pass
 
 
+# ====================== VIDEO RECEIVE → GITHUB OFFER ======================
+
+@events.register(events.NewMessage(incoming=True, func=lambda e: e.video or e.document))
+async def video_receive_handler(event):
+    """وقتی کاربر ویدیو میفرسته و GITHUB_ENABLED فعاله، یه دکمه پیشنهاد آپلود به گیتهاب میده."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return
+    if not GITHUB_ENABLED:
+        return
+    # فقط ویدیو — document های غیر ویدیو رو رد کن
+    media = event.video or event.document
+    if not media:
+        return
+    # بررسی mime type
+    mime = getattr(media, 'mime_type', '') or ''
+    if not mime.startswith('video/') and not (event.video):
+        return
+    file_size = getattr(media, 'size', 0) or 0
+    if file_size == 0 or file_size > GITHUB_MAX_MB * 1024 * 1024:
+        return  # بزرگتر از حد مجاز — نادیده بگیر
+
+    pending_id = f"vgh_{event.chat_id}_{event.id}_{int(time.time())}"
+    video_github_pending[pending_id] = {
+        "chat_id": event.chat_id,
+        "message_id": event.id,
+        "file_size": file_size,
+    }
+
+    size_str = human_readable_size(file_size)
+    await event.reply(
+        f"☁️ **GitHub Upload**\n"
+        f"📦 Size: {size_str}\n\n"
+        f"Do you want to upload this video to GitHub and get a direct download link?",
+        parse_mode='markdown',
+        buttons=[
+            [Button.inline("✅ Yes, upload to GitHub", f"vgh_yes_{pending_id}"),
+             Button.inline("❌ No", f"vgh_no_{pending_id}")]
+        ]
+    )
+
+
+@events.register(events.CallbackQuery(pattern=r"vgh_yes_(.+)"))
+async def vgh_yes_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    pending_id = event.data.decode().replace("vgh_yes_", "")
+    data = video_github_pending.pop(pending_id, None)
+    if not data:
+        return await event.answer("❌ Session expired.", alert=True)
+
+    await event.answer("⏳ Downloading and uploading...", alert=False)
+    try:
+        await event.edit(
+            "⏳ Downloading video from Telegram...",
+            buttons=None
+        )
+    except Exception:
+        pass
+
+    # دانلود ویدیو از تلگرام
+    tmp_path = os.path.join(OUTPUT_FOLDER, f"vgh_{int(time.time())}.mp4")
+    try:
+        msg = await event.client.get_messages(data["chat_id"], ids=data["message_id"])
+        await event.client.download_media(msg, file=tmp_path)
+    except Exception as e:
+        try:
+            await event.edit(f"❌ Download failed: {str(e)[:100]}", buttons=None)
+        except Exception:
+            pass
+        return
+
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        try:
+            await event.edit("❌ Failed to download video from Telegram.", buttons=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        await event.edit("☁️ Uploading to GitHub...", buttons=None)
+    except Exception:
+        pass
+
+    gh_ok, gh_msg, gh_url = await upload_to_github(tmp_path)
+
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    if gh_ok and gh_url:
+        try:
+            await event.edit(
+                f"✅ **Uploaded to GitHub!**\n\n"
+                f"🔗 [Direct Download Link]({gh_url})\n"
+                f"`{gh_url}`",
+                parse_mode='markdown',
+                buttons=None
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await event.edit(f"❌ GitHub upload failed:\n{gh_msg[:200]}", buttons=None)
+        except Exception:
+            pass
+
+
+@events.register(events.CallbackQuery(pattern=r"vgh_no_(.+)"))
+async def vgh_no_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    pending_id = event.data.decode().replace("vgh_no_", "")
+    video_github_pending.pop(pending_id, None)
+    await event.answer("OK", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+
 # ====================== MAIN ======================
 async def main():
     print("\n" + "="*60)
@@ -1690,6 +1903,8 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
 
     client.add_event_handler(github_cmd)
+    client.add_event_handler(startgithub_cmd)
+    client.add_event_handler(stopgithub_cmd)
     client.add_event_handler(admin_cmd)
     client.add_event_handler(admin_add_callback)
     client.add_event_handler(admin_remove_callback)
@@ -1711,6 +1926,9 @@ async def main():
     client.add_event_handler(dl_resume_callback)
     client.add_event_handler(dl_cancel_callback)
     client.add_event_handler(size_input_handler)
+    client.add_event_handler(video_receive_handler)
+    client.add_event_handler(vgh_yes_callback)
+    client.add_event_handler(vgh_no_callback)
     client.add_event_handler(generic_url_handler)
 
     me = await client.get_me()
