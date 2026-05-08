@@ -1981,7 +1981,7 @@ async def main():
     me = await client.get_me()
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
-    logger.info(f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO}")
+    logger.info(f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO if github_configured() else 'not configured'}")
     print(f"✅ Bot is online → @{me.username}")
     await client.run_until_disconnected()
 
