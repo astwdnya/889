@@ -314,7 +314,6 @@ async def download_with_controls(
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
 
-@events.register(events.CallbackQuery(pattern=r"dlpause_(.+)"))
 async def dl_pause_callback(event):
     dl_id = event.data.decode().replace("dlpause_", "")
     if dl_id not in active_downloads:
@@ -323,7 +322,6 @@ async def dl_pause_callback(event):
     await event.answer("⏸ Paused!", alert=False)
 
 
-@events.register(events.CallbackQuery(pattern=r"dlresume_(.+)"))
 async def dl_resume_callback(event):
     dl_id = event.data.decode().replace("dlresume_", "")
     if dl_id not in active_downloads:
@@ -332,7 +330,6 @@ async def dl_resume_callback(event):
     await event.answer("▶️ Resumed!", alert=False)
 
 
-@events.register(events.CallbackQuery(pattern=r"dlcancel_(.+)"))
 async def dl_cancel_callback(event):
     dl_id = event.data.decode().replace("dlcancel_", "")
     if dl_id not in active_downloads:
@@ -1070,7 +1067,6 @@ async def process_dirpy_request(event, url: str):
 
 
 # ====================== CALLBACK HANDLERS ======================
-@events.register(events.CallbackQuery(pattern=r"compress_(.+)"))
 async def compress_callback(event):
     video_id = event.data.decode().replace("compress_", "")
     if video_id not in video_cache:
@@ -1080,7 +1076,6 @@ async def compress_callback(event):
     user_state[event.chat_id] = {"action": "wait_for_compression_size", "video_id": video_id}
 
 
-@events.register(events.CallbackQuery(pattern=r"check_(.+)"))
 async def check_callback(event):
     video_id = event.data.decode().replace("check_", "")
     if video_id not in video_cache:
@@ -1095,7 +1090,6 @@ async def check_callback(event):
     video_cache.pop(video_id, None)
 
 
-@events.register(events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$"))
 async def pickurl_callback(event):
     parts = event.data.decode().rsplit("_", 1)
     idx = int(parts[1])
@@ -1118,7 +1112,6 @@ async def pickurl_callback(event):
 
 
 # ====================== ADMIN HANDLERS ======================
-@events.register(events.NewMessage(incoming=True))
 async def admin_input_handler(event):
     if event.sender_id != ADMIN_ID:
         return
@@ -1148,7 +1141,6 @@ async def admin_input_handler(event):
 
 
 # ====================== SIZE INPUT HANDLER ======================
-@events.register(events.NewMessage(incoming=True))
 async def size_input_handler(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return
@@ -1453,7 +1445,6 @@ async def process_html_request(event, url: str):
 
 
 # ====================== TELEGRAM COMMANDS ======================
-@events.register(events.NewMessage(pattern=r'^/admin(\s|$)', incoming=True))
 async def admin_cmd(event):
     logger.info(f"[CMD] /admin from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
@@ -1470,7 +1461,6 @@ async def admin_cmd(event):
     )
 
 
-@events.register(events.CallbackQuery(pattern=r"admin_add"))
 async def admin_add_callback(event):
     if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
     admin_pending_add[event.sender_id] = "add"
@@ -1479,7 +1469,6 @@ async def admin_add_callback(event):
         buttons=[[Button.inline("❌ Cancel", "admin_cancel")]])
 
 
-@events.register(events.CallbackQuery(pattern=r"admin_remove"))
 async def admin_remove_callback(event):
     if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
     admin_pending_add[event.sender_id] = "remove"
@@ -1488,7 +1477,6 @@ async def admin_remove_callback(event):
         buttons=[[Button.inline("❌ Cancel", "admin_cancel")]])
 
 
-@events.register(events.CallbackQuery(pattern=r"admin_refresh"))
 async def admin_refresh_callback(event):
     if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
@@ -1506,7 +1494,6 @@ async def admin_refresh_callback(event):
     except Exception: pass
 
 
-@events.register(events.CallbackQuery(pattern=r"admin_cancel"))
 async def admin_cancel_callback(event):
     if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
     admin_pending_add.pop(event.sender_id, None)
@@ -1516,7 +1503,6 @@ async def admin_cancel_callback(event):
 
 
 
-@events.register(events.NewMessage(pattern=r'^/startgithub(\s|$)', incoming=True))
 async def startgithub_cmd(event):
     global GITHUB_ENABLED
     logger.info(f"[CMD] /startgithub from user={event.sender_id}")
@@ -1535,7 +1521,6 @@ async def startgithub_cmd(event):
     )
 
 
-@events.register(events.NewMessage(pattern=r'^/stopgithub(\s|$)', incoming=True))
 async def stopgithub_cmd(event):
     global GITHUB_ENABLED
     logger.info(f"[CMD] /stopgithub from user={event.sender_id}")
@@ -1545,7 +1530,6 @@ async def stopgithub_cmd(event):
     await event.reply("🔴 **GitHub upload DISABLED**\nFiles will no longer be uploaded to GitHub.", parse_mode='markdown')
 
 
-@events.register(events.NewMessage(pattern=r'^/github(\s|$)', incoming=True))
 async def github_cmd(event):
     logger.info(f"[CMD] /github from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
@@ -1575,7 +1559,6 @@ async def github_cmd(event):
             parse_mode='markdown'
         )
 
-@events.register(events.NewMessage(pattern=r'^/start(\s|$)', incoming=True))
 async def start_cmd(event):
     logger.info(f"[CMD] /start from user={event.sender_id}")
     if event.sender_id not in AUTHORIZED_USERS:
@@ -1595,7 +1578,6 @@ async def start_cmd(event):
     )
 
 
-@events.register(events.NewMessage(pattern=r'^/dirpy(\s|$)', incoming=True))
 async def dirpy_command(event):
     logger.info(f"[CMD] /dirpy from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
@@ -1604,7 +1586,6 @@ async def dirpy_command(event):
     await process_dirpy_request(event, parts[1].strip())
 
 
-@events.register(events.NewMessage(pattern=r'^/pdf(\s|$)', incoming=True))
 async def pdf_command(event):
     logger.info(f"[CMD] /pdf from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
@@ -1614,7 +1595,6 @@ async def pdf_command(event):
 
 
 
-@events.register(events.CallbackQuery(pattern=rb'pdfimg_del\|'))
 async def pdfimg_del_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
@@ -1726,20 +1706,17 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
     except Exception: pass
 
 
-@events.register(events.CallbackQuery(pattern=rb'pdfimg_send\|'))
 async def pdfimg_send_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
     await _do_send_pdfimg(event, session_key, hd=False)
 
 
-@events.register(events.CallbackQuery(pattern=rb'pdfimg_hd\|'))
 async def pdfimg_hd_callback(event):
     if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
     session_key = event.data.decode().split('|', 1)[1]
     await _do_send_pdfimg(event, session_key, hd=True)
 
-@events.register(events.NewMessage(pattern=r'^/pdfimg(\s|$)', incoming=True))
 async def pdfimg_command(event):
     logger.info(f"[CMD] /pdfimg from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
@@ -1748,7 +1725,6 @@ async def pdfimg_command(event):
     await process_pdfimg_request(event, parts[1].strip())
 
 
-@events.register(events.NewMessage(pattern=r'^/html(\s|$)', incoming=True))
 async def html_command(event):
     logger.info(f"[CMD] /html from user={event.sender_id} | text={event.raw_text[:100]}")
     if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
@@ -1757,7 +1733,6 @@ async def html_command(event):
     await process_html_request(event, parts[1].strip())
 
 
-@events.register(events.NewMessage(incoming=True))
 async def generic_url_handler(event):
     if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith('/'):
         return
@@ -1810,7 +1785,6 @@ async def generic_url_handler(event):
 
 # ====================== VIDEO RECEIVE → GITHUB OFFER ======================
 
-@events.register(events.NewMessage(incoming=True, func=lambda e: e.video or e.document))
 async def video_receive_handler(event):
     """وقتی کاربر ویدیو میفرسته و GITHUB_ENABLED فعاله، یه دکمه پیشنهاد آپلود به گیتهاب میده."""
     if event.sender_id not in AUTHORIZED_USERS:
@@ -1849,7 +1823,6 @@ async def video_receive_handler(event):
     )
 
 
-@events.register(events.CallbackQuery(pattern=r"vgh_yes_(.+)"))
 async def vgh_yes_callback(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.answer("⛔ Unauthorized", alert=True)
@@ -1916,7 +1889,6 @@ async def vgh_yes_callback(event):
             pass
 
 
-@events.register(events.CallbackQuery(pattern=r"vgh_no_(.+)"))
 async def vgh_no_callback(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.answer("⛔ Unauthorized", alert=True)
@@ -1949,34 +1921,39 @@ async def main():
     )
     await client.start(bot_token=BOT_TOKEN)
 
-    client.add_event_handler(github_cmd)
-    client.add_event_handler(startgithub_cmd)
-    client.add_event_handler(stopgithub_cmd)
-    client.add_event_handler(admin_cmd)
-    client.add_event_handler(admin_add_callback)
-    client.add_event_handler(admin_remove_callback)
-    client.add_event_handler(admin_refresh_callback)
-    client.add_event_handler(admin_cancel_callback)
-    client.add_event_handler(admin_input_handler)
-    client.add_event_handler(start_cmd)
-    client.add_event_handler(dirpy_command)
-    client.add_event_handler(pdf_command)
-    client.add_event_handler(pdfimg_command)
-    client.add_event_handler(pdfimg_del_callback)
-    client.add_event_handler(pdfimg_send_callback)
-    client.add_event_handler(pdfimg_hd_callback)
-    client.add_event_handler(html_command)
-    client.add_event_handler(compress_callback)
-    client.add_event_handler(check_callback)
-    client.add_event_handler(pickurl_callback)
-    client.add_event_handler(dl_pause_callback)
-    client.add_event_handler(dl_resume_callback)
-    client.add_event_handler(dl_cancel_callback)
-    client.add_event_handler(size_input_handler)
-    client.add_event_handler(video_receive_handler)
-    client.add_event_handler(vgh_yes_callback)
-    client.add_event_handler(vgh_no_callback)
-    client.add_event_handler(generic_url_handler)
+    # ===== CallbackQuery handlers =====
+    client.add_event_handler(dl_pause_callback,   events.CallbackQuery(pattern=r"dlpause_(.+)"))
+    client.add_event_handler(dl_resume_callback,  events.CallbackQuery(pattern=r"dlresume_(.+)"))
+    client.add_event_handler(dl_cancel_callback,  events.CallbackQuery(pattern=r"dlcancel_(.+)"))
+    client.add_event_handler(compress_callback,   events.CallbackQuery(pattern=r"compress_(.+)"))
+    client.add_event_handler(check_callback,      events.CallbackQuery(pattern=r"check_(.+)"))
+    client.add_event_handler(pickurl_callback,    events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$"))
+    client.add_event_handler(admin_add_callback,  events.CallbackQuery(pattern=r"admin_add"))
+    client.add_event_handler(admin_remove_callback, events.CallbackQuery(pattern=r"admin_remove"))
+    client.add_event_handler(admin_refresh_callback, events.CallbackQuery(pattern=r"admin_refresh"))
+    client.add_event_handler(admin_cancel_callback, events.CallbackQuery(pattern=r"admin_cancel"))
+    client.add_event_handler(pdfimg_del_callback, events.CallbackQuery(pattern=rb'pdfimg_del\|'))
+    client.add_event_handler(pdfimg_send_callback, events.CallbackQuery(pattern=rb'pdfimg_send\|'))
+    client.add_event_handler(pdfimg_hd_callback,  events.CallbackQuery(pattern=rb'pdfimg_hd\|'))
+    client.add_event_handler(vgh_yes_callback,    events.CallbackQuery(pattern=r"vgh_yes_(.+)"))
+    client.add_event_handler(vgh_no_callback,     events.CallbackQuery(pattern=r"vgh_no_(.+)"))
+
+    # ===== Command handlers =====
+    client.add_event_handler(start_cmd,      events.NewMessage(pattern=r'^/start(\s|$)',       incoming=True))
+    client.add_event_handler(startgithub_cmd, events.NewMessage(pattern=r'^/startgithub(\s|$)', incoming=True))
+    client.add_event_handler(stopgithub_cmd,  events.NewMessage(pattern=r'^/stopgithub(\s|$)',  incoming=True))
+    client.add_event_handler(github_cmd,      events.NewMessage(pattern=r'^/github(\s|$)',      incoming=True))
+    client.add_event_handler(admin_cmd,       events.NewMessage(pattern=r'^/admin(\s|$)',       incoming=True))
+    client.add_event_handler(dirpy_command,   events.NewMessage(pattern=r'^/dirpy(\s|$)',       incoming=True))
+    client.add_event_handler(pdf_command,     events.NewMessage(pattern=r'^/pdf(\s|$)',         incoming=True))
+    client.add_event_handler(pdfimg_command,  events.NewMessage(pattern=r'^/pdfimg(\s|$)',      incoming=True))
+    client.add_event_handler(html_command,    events.NewMessage(pattern=r'^/html(\s|$)',        incoming=True))
+
+    # ===== Message handlers (order matters - specific before generic) =====
+    client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
+    client.add_event_handler(size_input_handler,  events.NewMessage(incoming=True))
+    client.add_event_handler(video_receive_handler, events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)))
+    client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
 
     me = await client.get_me()
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
