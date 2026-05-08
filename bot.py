@@ -24,10 +24,11 @@ from aiohttp import ClientTimeout
 from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button, utils
+from telethon.errors import FloodWaitError
 from telethon.tl.types import (Message, DocumentAttributeVideo,
                                 InputMediaUploadedDocument)
 from FastTelethon import upload_file as fast_upload_file
-from github import upload_to_github, github_configured, GITHUB_MAX_MB
+from github import upload_to_github, github_configured, GITHUB_MAX_MB, GITHUB_REPO, GITHUB_BRANCH, GITHUB_BASE_DIR
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -1534,8 +1535,6 @@ async def github_cmd(event):
     logger.info(f"[CMD] /github from user={event.sender_id}")
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
-
-    from github import GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH, GITHUB_BASE_DIR, github_configured
     status_icon = "✅ Active" if GITHUB_ENABLED else "⏸ Paused"
     if github_configured():
         await event.reply(
@@ -1919,7 +1918,17 @@ async def main():
         'ultimate_bot_session', API_ID, API_HASH,
         connection_retries=5,
     )
-    await client.start(bot_token=BOT_TOKEN)
+    for attempt in range(5):
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            break
+        except FloodWaitError as e:
+            wait = e.seconds + 5
+            logger.warning(f"[BOOT] FloodWait — waiting {wait}s before retry (attempt {attempt+1}/5)")
+            await asyncio.sleep(wait)
+    else:
+        logger.critical("[BOOT] Could not connect after 5 FloodWait retries. Exiting.")
+        return
 
     # ===== CallbackQuery handlers =====
     client.add_event_handler(dl_pause_callback,   events.CallbackQuery(pattern=r"dlpause_(.+)"))
