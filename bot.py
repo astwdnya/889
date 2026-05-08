@@ -1810,115 +1810,38 @@ async def generic_url_handler(event):
     except Exception: pass
 
 
-# ====================== FILE RECEIVE → GITHUB OFFER ======================
+# ====================== VIDEO RECEIVE → GITHUB OFFER ======================
 
-# همه پسوندهای پشتیبانی شده برای آپلود گیتهاب
-SUPPORTED_EXTENSIONS = {
-    # Video
-    'mp4','mkv','avi','mov','wmv','flv','webm','mpeg','mpg','m4v','3gp','vob',
-    'ts','mts','ogv','rmvb','asf','f4v','swf','dv','mxf','avchd','prores',
-    # Image
-    'jpeg','jpg','png','gif','bmp','tiff','svg','ico','heic','heif','webp',
-    'raw','cr2','nef','arw','dng','psd','ai','eps',
-    # Document
-    'pdf','xps','epub','mobi','azw3','cbr','cbz','doc','docx','xls','xlsx',
-    'ppt','pptx','txt','rtf','csv','json','xml','yaml','html','css',
-    # Code
-    'js','ts','jsx','tsx','php','py','java','cpp','c','cs','go','rust','swift',
-    'kotlin','sh','bat','cmd','ps1',
-    # App / Package
-    'apk','xapk','ipa','deb','dylib','framework','app','pkg','aab','exe','msi',
-    'dll','sys','bin',
-    # Disk / Image
-    'iso','img','dmg','vhd','vmdk','qcow2',
-    # Archive
-    'zip','rar','7z','tar','gz','bz2','xz','cab','tgz','jar','war','ear','torrent',
-    # Database
-    'sqlite','db','accdb','sql','log','dat','tmp','bak','sav',
-    # Audio
-    'mp3','wav','aac','flac','ogg','opus','m4a','wma','amr','midi','ape','alac','caf',
-    # Game / ROM
-    'nds','rom','cso','nsp','xci','cia','rvz','wbfs','pak','obb','unitypackage',
-    'asset','blend','fbx','obj','stl','gltf','usdz',
-    # Security / Network
-    'pem','key','cer','p12','mobileprovision','keystore','har','pcap','cap',
-    # Xcode / iOS Dev
-    'apkm','apks','dysm','xcarchive','xcodeproj',
-}
-
-def _get_file_ext(media) -> str:
-    """پسوند فایل رو از attributes یا mime type استخراج می‌کنه."""
-    # اول از DocumentAttributeFilename بگیر
-    for attr in getattr(media, 'attributes', []):
-        if hasattr(attr, 'file_name') and attr.file_name:
-            ext = os.path.splitext(attr.file_name)[1].lstrip('.').lower()
-            if ext:
-                return ext
-    # بعد از mime_type
-    mime = getattr(media, 'mime_type', '') or ''
-    mime_map = {
-        'video/mp4': 'mp4', 'video/x-matroska': 'mkv', 'video/quicktime': 'mov',
-        'video/x-msvideo': 'avi', 'video/webm': 'webm', 'video/mpeg': 'mpg',
-        'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
-        'image/webp': 'webp', 'image/heic': 'heic', 'image/svg+xml': 'svg',
-        'audio/mpeg': 'mp3', 'audio/ogg': 'ogg', 'audio/flac': 'flac',
-        'audio/mp4': 'm4a', 'audio/wav': 'wav', 'audio/aac': 'aac',
-        'application/pdf': 'pdf', 'application/zip': 'zip',
-        'application/x-rar-compressed': 'rar', 'application/x-7z-compressed': '7z',
-        'application/vnd.android.package-archive': 'apk',
-        'application/octet-stream': 'bin',
-    }
-    return mime_map.get(mime, 'bin')
-
-def _get_original_filename(media) -> str:
-    """اسم اصلی فایل رو برمیگردونه."""
-    for attr in getattr(media, 'attributes', []):
-        if hasattr(attr, 'file_name') and attr.file_name:
-            return attr.file_name
-    ext = _get_file_ext(media)
-    return f"file_{int(time.time())}.{ext}"
-
-async def file_receive_handler(event):
-    """وقتی کاربر هر فایلی میفرسته و GITHUB_ENABLED فعاله، پیشنهاد آپلود گیتهاب میده."""
+async def video_receive_handler(event):
+    """وقتی کاربر ویدیو میفرسته و GITHUB_ENABLED فعاله، یه دکمه پیشنهاد آپلود به گیتهاب میده."""
     if event.sender_id not in AUTHORIZED_USERS:
         return
     if not GITHUB_ENABLED:
         return
-
-    media = event.video or event.audio or event.document or event.photo
+    # فقط ویدیو — document های غیر ویدیو رو رد کن
+    media = event.video or event.document
     if not media:
         return
-
-    # پسوند فایل رو بگیر
-    ext = _get_file_ext(media)
-    original_name = _get_original_filename(media)
-
-    # بررسی که پسوند پشتیبانی بشه
-    if ext not in SUPPORTED_EXTENSIONS:
-        # mime_type های ویدیو/صدا/تصویر هم قبول کن حتی اگه پسوند نشناختیم
-        mime = getattr(media, 'mime_type', '') or ''
-        if not (mime.startswith('video/') or mime.startswith('audio/') or mime.startswith('image/')):
-            return
-
+    # بررسی mime type
+    mime = getattr(media, 'mime_type', '') or ''
+    if not mime.startswith('video/') and not (event.video):
+        return
     file_size = getattr(media, 'size', 0) or 0
     if file_size == 0 or file_size > GITHUB_MAX_MB * 1024 * 1024:
-        return
+        return  # بزرگتر از حد مجاز — نادیده بگیر
 
     pending_id = f"vgh_{event.chat_id}_{event.id}_{int(time.time())}"
     video_github_pending[pending_id] = {
         "chat_id": event.chat_id,
         "message_id": event.id,
         "file_size": file_size,
-        "original_name": original_name,
-        "ext": ext,
     }
 
     size_str = human_readable_size(file_size)
     await event.reply(
         f"☁️ **GitHub Upload**\n"
-        f"📄 File: `{original_name}`\n"
         f"📦 Size: {size_str}\n\n"
-        f"Do you want to upload this file to GitHub and get a direct download link?",
+        f"Do you want to upload this video to GitHub and get a direct download link?",
         parse_mode='markdown',
         buttons=[
             [Button.inline("✅ Yes, upload to GitHub", f"vgh_yes_{pending_id}"),
@@ -1944,10 +1867,8 @@ async def vgh_yes_callback(event):
     except Exception:
         pass
 
-    # دانلود فایل از تلگرام — با اسم اصلی
-    original_name = data.get("original_name", f"file_{int(time.time())}.bin")
-    safe_name = re.sub(r'[<>:"/\\|?*\s]', '_', original_name)
-    tmp_path = os.path.join(OUTPUT_FOLDER, f"vgh_{int(time.time())}_{safe_name}")
+    # دانلود ویدیو از تلگرام
+    tmp_path = os.path.join(OUTPUT_FOLDER, f"vgh_{int(time.time())}.mp4")
     try:
         msg = await event.client.get_messages(data["chat_id"], ids=data["message_id"])
         await event.client.download_media(msg, file=tmp_path)
@@ -1960,13 +1881,20 @@ async def vgh_yes_callback(event):
 
     if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
         try:
-            await event.edit("❌ Failed to download file from Telegram.", buttons=None)
+            await event.edit("❌ Failed to download video from Telegram.", buttons=None)
         except Exception:
             pass
         return
 
+    actual_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+    size_mb = actual_size / (1024 * 1024)
+    from github import CONTENT_API_MAX_MB as _CMAX
+    if size_mb > _CMAX:
+        upload_note = f"📦 {size_mb:.1f} MB — using Releases API (may take a few minutes)..."
+    else:
+        upload_note = f"📦 {size_mb:.1f} MB — uploading..."
     try:
-        await event.edit("☁️ Uploading to GitHub...", buttons=None)
+        await event.edit(f"☁️ **Uploading to GitHub**\n{upload_note}", buttons=None)
     except Exception:
         pass
 
@@ -2068,7 +1996,7 @@ async def main():
     # ===== Message handlers (order matters - specific before generic) =====
     client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
     client.add_event_handler(size_input_handler,  events.NewMessage(incoming=True))
-    client.add_event_handler(file_receive_handler, events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.audio or e.document or e.photo)))
+    client.add_event_handler(video_receive_handler, events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
 
     me = await client.get_me()
