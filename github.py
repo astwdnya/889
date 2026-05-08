@@ -1,43 +1,129 @@
-import os
+"""
+github.py — آپلود فایل به GitHub repository و گرفتن لینک مستقیم دانلود
+"""
+
+import asyncio
+import base64
 import logging
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from github import upload_to_github, github_configured
+import os
+import time
+import re
+from typing import Optional, Tuple
 
-# توکن بات را از @BotFather بگیرید
-BOT_TOKEN = "توکن_بات_تلگرام_خود_را_وارد_کنید"
+import aiohttp
+import aiofiles
+from aiohttp import ClientTimeout
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("GitHubUploader")
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not github_configured():
-        await update.message.reply_text("❌ گیت‌هاب تنظیم نشده (توکن یا مخزن موجود نیست)")
-        return
+# ====================== CONFIGURATION (ویرایش شده با اطلاعات شما) ======================
+GITHUB_TOKEN    = "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"  # توکن شما
+GITHUB_REPO     = "astwdnya/upanddown"                          # نام مخزن
+GITHUB_BRANCH   = "main"                                         # شاخه اصلی
+GITHUB_BASE_DIR = "files"                                        # پوشه ریشه در مخزن
+GITHUB_MAX_MB   = 50                                             # حداکثر حجم (همان محدودیت API)
 
-    # دریافت فایل از تلگرام
-    file = await update.message.effective_attachment.get_file()
-    file_path = f"downloads/{file.file_id}_{update.message.file.file_name}"
-    os.makedirs("downloads", exist_ok=True)
+# ====================== HELPERS ======================
 
-    await file.download_to_drive(file_path)
+def _raw_url(repo: str, branch: str, path: str) -> str:
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 
-    await update.message.reply_text("⏳ در حال آپلود به گیت‌هاب...")
+def _api_url(repo: str, path: str) -> str:
+    return f"https://api.github.com/repos/{repo}/contents/{path}"
 
-    success, msg, url = await upload_to_github(file_path)
+def _safe_name(filename: str) -> str:
+    name = re.sub(r'[^\w.\-]', '_', filename)
+    return name[:200] or f"file_{int(time.time())}"
 
-    if success:
-        await update.message.reply_text(f"✅ فایل آپلود شد!\n\n🔗 لینک دانلود مستقیم:\n{url}")
+def _subfolder_for(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv']:
+        return 'videos'
+    elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+        return 'images'
+    elif ext in ['.pdf']:
+        return 'pdfs'
+    elif ext in ['.mp3', '.aac', '.ogg', '.flac', '.wav']:
+        return 'audio'
     else:
-        await update.message.reply_text(f"❌ خطا: {msg}")
+        return 'misc'
 
-    # پاک کردن فایل موقت
-    os.remove(file_path)
+# ====================== MAIN UPLOAD FUNCTION ======================
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_file))
-    print("بات راه‌اندازی شد...")
-    app.run_polling()
+async def upload_to_github(
+    filepath: str,
+    subfolder: Optional[str] = None,
+    filename: Optional[str] = None,
+    token: Optional[str] = None,
+    repo: Optional[str] = None,
+    branch: Optional[str] = None,
+    base_dir: Optional[str] = None,
+) -> Tuple[bool, str, str]:
+    """
+    Returns: (success, message, download_url)
+    """
+    token    = token    or GITHUB_TOKEN
+    repo     = repo     or GITHUB_REPO
+    branch   = branch   or GITHUB_BRANCH
+    base_dir = base_dir or GITHUB_BASE_DIR
 
-if __name__ == "__main__":
-    main()
+    if not token:
+        return False, "GITHUB_TOKEN not set.", ""
+    if not repo:
+        return False, "GITHUB_REPO not set.", ""
+
+    if not os.path.exists(filepath):
+        return False, f"File not found: {filepath}", ""
+
+    file_size = os.path.getsize(filepath)
+    if file_size > GITHUB_MAX_MB * 1024 * 1024:
+        return False, f"File too large ({file_size/1024/1024:.1f}MB > {GITHUB_MAX_MB}MB)", ""
+
+    orig_name = filename or os.path.basename(filepath)
+    safe_name = _safe_name(orig_name)
+    sub = subfolder or _subfolder_for(safe_name)
+
+    name_noext, ext = os.path.splitext(safe_name)
+    final_name = f"{name_noext}_{int(time.time())}{ext}"
+    gh_path = f"{base_dir}/{sub}/{final_name}"
+
+    async with aiofiles.open(filepath, 'rb') as f:
+        raw = await f.read()
+    content_b64 = base64.b64encode(raw).decode()
+
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "message": f"Upload {final_name} via bot",
+        "content": content_b64,
+        "branch": branch,
+    }
+
+    api_url = _api_url(repo, gh_path)
+
+    timeout = ClientTimeout(total=120, connect=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Check existence to get sha
+        async with session.get(api_url, headers=headers) as check_resp:
+            if check_resp.status == 200:
+                existing = await check_resp.json()
+                payload["sha"] = existing.get("sha", "")
+
+        async with session.put(api_url, headers=headers, json=payload) as resp:
+            body = await resp.json()
+            if resp.status in (200, 201):
+                raw_url = _raw_url(repo, branch, gh_path)
+                logger.info(f"[GitHub] Uploaded: {gh_path} → {raw_url}")
+                return True, f"Uploaded to `{gh_path}`", raw_url
+            else:
+                msg = body.get("message", str(body))
+                logger.error(f"[GitHub] Upload failed: {resp.status} — {msg}")
+                return False, f"GitHub error {resp.status}: {msg[:200]}", ""
+
+def github_configured() -> bool:
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
