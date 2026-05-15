@@ -29,6 +29,7 @@ from telethon.tl.types import (Message, DocumentAttributeVideo,
                                 InputMediaUploadedDocument)
 from FastTelethon import upload_file as fast_upload_file
 from github import upload_to_github, github_configured, GITHUB_MAX_MB, GITHUB_REPO, GITHUB_BRANCH, GITHUB_BASE_DIR
+from savep_handler import process_savep_request
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -1586,6 +1587,7 @@ async def start_cmd(event):
     await event.reply(
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
+        "• `/savep <url>` → Download via SaveTheVideo\n"
         "• `/pdf <url>` → Webpage to PDF\n"
         "• `/html <url>` → Save as MHTML\n"
         "• `/pdfimg <url>` → Download all images\n"
@@ -1604,6 +1606,20 @@ async def dirpy_command(event):
     parts = event.raw_text.split(maxsplit=1)
     if len(parts) < 2: return await event.reply("❌ Usage: `/dirpy <url>`", parse_mode='markdown')
     await process_dirpy_request(event, parts[1].strip())
+
+
+async def savep_command(event):
+    logger.info(f"[CMD] /savep from user={event.sender_id} | text={event.raw_text[:100]}")
+    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2: return await event.reply("❌ Usage: `/savep <url>`", parse_mode='markdown')
+    await process_savep_request(
+        event=event,
+        url=parts[1].strip(),
+        safe_edit_fn=safe_edit,
+        send_file_fn=send_file_with_progress,
+        download_dir="/tmp",
+    )
 
 
 async def pdf_command(event):
@@ -1989,6 +2005,7 @@ async def main():
     client.add_event_handler(github_cmd,      events.NewMessage(pattern=r'^/github(\s|$)',      incoming=True))
     client.add_event_handler(admin_cmd,       events.NewMessage(pattern=r'^/admin(\s|$)',       incoming=True))
     client.add_event_handler(dirpy_command,   events.NewMessage(pattern=r'^/dirpy(\s|$)',       incoming=True))
+    client.add_event_handler(savep_command,   events.NewMessage(pattern=r'^/savep(\s|$)',       incoming=True))
     client.add_event_handler(pdf_command,     events.NewMessage(pattern=r'^/pdf(\s|$)',         incoming=True))
     client.add_event_handler(pdfimg_command,  events.NewMessage(pattern=r'^/pdfimg(\s|$)',      incoming=True))
     client.add_event_handler(html_command,    events.NewMessage(pattern=r'^/html(\s|$)',        incoming=True))
