@@ -99,75 +99,158 @@ async def _async_extract_savep(video_url, progress_cb, stop_event=None):
                 except Exception: pass
                 await page.wait_for_timeout(1500)
 
-            # Convert tab
+            # ── debug: ببین صفحه الان چی داره ─────────────────────────────
+            debug_info = await page.evaluate('''() => {
+                const tabs = Array.from(document.querySelectorAll("li[role=\\"tab\\"], [role=\\"tab\\"]"))
+                    .map(el => ({id: el.id, text: el.textContent.trim().slice(0,30), aria: el.getAttribute("aria-controls")}));
+                const btns = Array.from(document.querySelectorAll("button"))
+                    .map(b => b.textContent.trim().slice(0,30)).filter(Boolean).slice(0,10);
+                const links = Array.from(document.querySelectorAll("a"))
+                    .map(a => a.textContent.trim().slice(0,30)).filter(Boolean).slice(0,10);
+                const selects = Array.from(document.querySelectorAll("select"))
+                    .map(s => s.id + ":" + Array.from(s.options).map(o=>o.value).join(",")).slice(0,5);
+                return {tabs, btns, links, selects};
+            }''')
+            progress_cb(f"🔍 Tabs: {debug_info.get('tabs', [])}")
+            progress_cb(f"🔍 Btns: {debug_info.get('btns', [])}")
+            progress_cb(f"🔍 Links: {debug_info.get('links', [])}")
+            progress_cb(f"🔍 Selects: {debug_info.get('selects', [])}")
+
+            # ── Convert tab — روش‌های مختلف ──────────────────────────────
             progress_cb("🖱 Clicking Convert tab...")
             convert_clicked = False
-            for sel in ['#react-tabs-2', 'li[aria-controls="react-tabs-3"]', 'li[role="tab"]:has-text("Convert")']:
+
+            # روش ۱: playwright selectors
+            for sel in [
+                'li[role="tab"]:has-text("Convert")',
+                'li:has-text("Convert")',
+                '[role="tab"]:has-text("Convert")',
+                '#react-tabs-2',
+                'li[aria-controls="react-tabs-3"]',
+                'button:has-text("Convert")',
+            ]:
                 try:
                     el = page.locator(sel).first
-                    if await el.is_visible(timeout=3000):
+                    if await el.is_visible(timeout=2000):
                         await el.click(); convert_clicked = True
-                        progress_cb("✅ Convert tab clicked"); break
+                        progress_cb(f"✅ Convert tab clicked ({sel})"); break
                 except Exception: continue
+
+            # روش ۲: JS — هر المانی که متن Convert داره
             if not convert_clicked:
                 result = await page.evaluate('''() => {
-                    const byId = document.getElementById("react-tabs-2");
-                    if (byId) { byId.click(); return "by-id"; }
-                    const byAria = document.querySelector("li[aria-controls=\\"react-tabs-3\\"]");
-                    if (byAria) { byAria.click(); return "by-aria"; }
-                    for (const li of document.querySelectorAll("li[role=\\"tab\\"]"))
-                        if (li.textContent.trim() === "Convert") { li.click(); return "by-text"; }
+                    // تمام tab ها
+                    for (const el of document.querySelectorAll("[role=\\"tab\\"]")) {
+                        if (/convert/i.test(el.textContent)) {
+                            el.click(); return "tab:" + el.textContent.trim().slice(0,20);
+                        }
+                    }
+                    // li ها
+                    for (const el of document.querySelectorAll("li")) {
+                        if (el.textContent.trim() === "Convert") {
+                            el.click(); return "li:" + el.textContent.trim();
+                        }
+                    }
+                    // button ها
+                    for (const el of document.querySelectorAll("button")) {
+                        if (/convert/i.test(el.textContent)) {
+                            el.click(); return "btn:" + el.textContent.trim().slice(0,20);
+                        }
+                    }
                     return "NOT_FOUND";
                 }''')
+                progress_cb(f"🖱 Convert JS: {result}")
                 if result and not result.startswith("NOT_FOUND"):
-                    progress_cb("✅ Convert tab clicked (JS)"); convert_clicked = True
-
-            await page.wait_for_timeout(1000)
-            try:
-                await page.wait_for_selector('#convert-format', state='visible', timeout=8000)
-                progress_cb("✅ Convert panel loaded")
-            except Exception:
-                progress_cb("⚠️ Convert panel not visible — trying anyway")
-                await page.wait_for_timeout(2000)
-
-            # انتخاب MP4
-            progress_cb("🎬 Selecting MP4...")
-            try: await page.select_option('#convert-format', value='mp4')
-            except Exception: pass
-            try:
-                val = await page.evaluate('''() => {
-                    const s = document.getElementById("convert-format");
-                    if (!s) return "NOT_FOUND";
-                    s.value = "mp4";
-                    s.dispatchEvent(new Event("change", {bubbles:true}));
-                    s.dispatchEvent(new Event("input", {bubbles:true}));
-                    return s.value;
-                }''')
-                progress_cb(f"✅ Format: {val}")
-            except Exception: pass
+                    convert_clicked = True
 
             await page.wait_for_timeout(2000)
 
-            # کلیک Convert to MP4
+            # ── صبر برای convert-format یا هر select روی صفحه ────────────
+            convert_format_found = False
+            try:
+                await page.wait_for_selector('#convert-format', state='visible', timeout=6000)
+                convert_format_found = True
+                progress_cb("✅ Convert panel loaded (#convert-format)")
+            except Exception:
+                # شاید select با ID دیگه‌ای باشه
+                any_select = await page.evaluate('''() => {
+                    const s = document.querySelector("select");
+                    return s ? (s.id || "no-id") : null;
+                }''')
+                if any_select:
+                    progress_cb(f"✅ Found select: #{any_select}")
+                    convert_format_found = True
+                else:
+                    progress_cb("⚠️ No select found — trying direct Convert button")
+                    await page.wait_for_timeout(2000)
+
+            # ── انتخاب MP4 (اگه select پیدا شد) ─────────────────────────
+            if convert_format_found:
+                progress_cb("🎬 Selecting MP4...")
+                try: await page.select_option('#convert-format', value='mp4')
+                except Exception:
+                    try: await page.select_option('select', value='mp4')
+                    except Exception: pass
+                try:
+                    val = await page.evaluate('''() => {
+                        let s = document.getElementById("convert-format");
+                        if (!s) s = document.querySelector("select");
+                        if (!s) return "NOT_FOUND";
+                        s.value = "mp4";
+                        s.dispatchEvent(new Event("change", {bubbles:true}));
+                        s.dispatchEvent(new Event("input", {bubbles:true}));
+                        return s.value;
+                    }''')
+                    progress_cb(f"✅ Format set: {val}")
+                except Exception as e:
+                    progress_cb(f"⚠️ Format set error: {e}")
+                await page.wait_for_timeout(2000)
+
+            # ── کلیک Convert to MP4 ───────────────────────────────────────
             progress_cb("🖱 Clicking Convert to MP4...")
             conv_ok = False
-            for sel in ['a:has-text("Convert to MP4")', 'a:has-text("Convert to mp4")']:
+
+            # روش ۱: playwright
+            for sel in [
+                'a:has-text("Convert to MP4")',
+                'a:has-text("Convert to mp4")',
+                'button:has-text("Convert to MP4")',
+                'button:has-text("Convert to mp4")',
+                '[class*="bg-gray"]:has-text("Convert")',
+                'a[class*="bg-gray"]',
+            ]:
                 try:
                     el = page.locator(sel).first
-                    if await el.is_visible(timeout=3000):
+                    if await el.is_visible(timeout=2000):
                         await el.dispatch_event('click'); conv_ok = True
-                        progress_cb("✅ Convert clicked"); break
+                        progress_cb(f"✅ Convert clicked ({sel})"); break
                 except Exception: continue
+
+            # روش ۲: JS — هر a یا button با متن Convert
             if not conv_ok:
                 result = await page.evaluate('''() => {
-                    for (const el of document.querySelectorAll("a"))
-                        if (/convert to mp4/i.test(el.textContent.trim())) {
+                    // دنبال "Convert to" میگرده
+                    for (const el of document.querySelectorAll("a, button")) {
+                        if (/convert to/i.test(el.textContent.trim())) {
                             el.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true}));
-                            return "clicked";
+                            return "clicked:" + el.textContent.trim().slice(0,30);
                         }
-                    return "NOT_FOUND";
+                    }
+                    // fallback: هر a با bg-gray
+                    for (const el of document.querySelectorAll("a")) {
+                        if ((el.className||"").includes("bg-gray")) {
+                            el.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true}));
+                            return "gray-a:" + el.textContent.trim().slice(0,30);
+                        }
+                    }
+                    // همه a ها رو لاگ کن
+                    const all = Array.from(document.querySelectorAll("a"))
+                        .map(a => a.textContent.trim().slice(0,25)).filter(Boolean);
+                    return "NOT_FOUND — links:" + JSON.stringify(all.slice(0,8));
                 }''')
-                if result and result != "NOT_FOUND": conv_ok = True
+                progress_cb(f"🖱 Convert JS: {result}")
+                if result and not result.startswith("NOT_FOUND"):
+                    conv_ok = True
 
             if not conv_ok:
                 return ["❌ نتونست روی Convert to MP4 کلیک کنه"]
