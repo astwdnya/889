@@ -2635,46 +2635,74 @@ async def snapwc_select_callback(event):
                 event, status_msg, download_url, video_url, title=title
             )
 
+            # Even if download failed, send the direct link to user
+            if not dl_ok and download_url:
+                try:
+                    await event.client.send_message(
+                        event.chat_id,
+                        f"⬇️ **Direct download link (try manually):**\n`{download_url}`\n_Links may expire quickly._",
+                        parse_mode="markdown",
+                        link_preview=False,
+                    )
+                except Exception:
+                    pass
+
             # Retry once on failure: get fresh URL from SnapWC
             if not dl_ok and video_url:
-                logger.info(f"[SNAPWC] Download failed, retrying with fresh URL...")
-                await safe_edit(status_msg, "🔄 Getting fresh download link...")
+                retry_msg = await event.client.send_message(
+                    event.chat_id,
+                    f"🔄 **Retrying SnapWC — fresh download link...**\nPrevious error logged.",
+                )
+                logger.info(
+                    f"[SNAPWC] Retry started | index={index} | url={video_url[:80]}"
+                )
                 new_session = None
                 try:
                     new_session = SnapWCSession()
+                    await safe_edit(retry_msg, "🔄 Step 1/3: Loading SnapWC...")
                     new_result = await new_session.run_full_flow(video_url)
                     if new_result["success"]:
+                        await safe_edit(retry_msg, "🔄 Step 2/3: Selecting quality...")
                         new_dl = await new_session.continue_with_quality(index)
                         if new_dl.get("success") and not new_dl.get("captcha"):
                             fresh_url = new_dl["download_url"]
                             fresh_title = new_dl.get("title", title)
                             await safe_edit(
-                                status_msg,
-                                "✅ Fresh link obtained! Retrying download...",
+                                retry_msg, "🔄 Step 3/3: Retrying download..."
                             )
-                            await do_download_and_send(
+                            retry_ok = await do_download_and_send(
                                 event,
-                                status_msg,
+                                retry_msg,
                                 fresh_url,
                                 video_url,
                                 title=fresh_title,
                             )
+                            if not retry_ok:
+                                await safe_edit(
+                                    retry_msg,
+                                    "❌ Retry also failed. SnapWC may be having issues.",
+                                )
                         elif new_dl.get("captcha"):
                             await safe_edit(
-                                status_msg, "🔐 Captcha on retry — run /snapwc again."
+                                retry_msg, "🔐 Captcha on retry — run /snapwc again."
                             )
                         else:
-                            await safe_edit(
-                                status_msg,
-                                f"❌ Retry failed: {new_dl.get('error', 'Unknown')}",
+                            err = new_dl.get("error", "Unknown")
+                            steps = " → ".join(new_dl.get("steps", []))
+                            logger.error(
+                                f"[SNAPWC] Retry continue_with_quality failed: {err} | steps: {steps}"
                             )
+                            await safe_edit(retry_msg, f"❌ Retry failed: {err}")
                     else:
-                        await safe_edit(
-                            status_msg,
-                            f"❌ Retry failed: {new_result.get('error', 'Unknown')}",
+                        err = new_result.get("error", "Unknown")
+                        steps = " → ".join(new_result.get("steps", []))
+                        logger.error(
+                            f"[SNAPWC] Retry run_full_flow failed: {err} | steps: {steps}"
                         )
+                        await safe_edit(retry_msg, f"❌ SnapWC retry failed: {err}")
                 except Exception as retry_e:
-                    logger.error(f"[SNAPWC] Retry error: {retry_e}")
+                    logger.error(f"[SNAPWC] Retry error: {retry_e}", exc_info=True)
+                    await safe_edit(retry_msg, f"❌ Retry error: {str(retry_e)[:120]}")
                 finally:
                     if new_session:
                         try:
@@ -2682,7 +2710,6 @@ async def snapwc_select_callback(event):
                         except Exception:
                             pass
 
-            snapwc_sessions.pop(session_id, None)
             user_state.pop(event.chat_id, None)
         else:
             err = result.get("error", "Unknown")
