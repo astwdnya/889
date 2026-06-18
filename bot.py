@@ -17,6 +17,7 @@ from threading import Thread
 
 import aiohttp
 import aiofiles
+import base64
 import gc
 from aiohttp import ClientTimeout
 
@@ -25,11 +26,22 @@ from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
-from telethon.tl.types import (Message, DocumentAttributeVideo,
-                                InputMediaUploadedDocument)
+from telethon.tl.types import (
+    Message,
+    DocumentAttributeVideo,
+    InputMediaUploadedDocument,
+)
 from FastTelethon import upload_file as fast_upload_file
-from github import upload_to_github, github_configured, GITHUB_MAX_MB, GITHUB_REPO, GITHUB_BRANCH, GITHUB_BASE_DIR
+from github import (
+    upload_to_github,
+    github_configured,
+    GITHUB_MAX_MB,
+    GITHUB_REPO,
+    GITHUB_BRANCH,
+    GITHUB_BASE_DIR,
+)
 from savep_handler import process_savep_request
+from snapwc_handler import SnapWCSession
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -43,13 +55,14 @@ MAX_FILE_SIZE_MB = 2000
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-HEALTH_PORT = int(os.environ.get('PORT', 10000))
+HEALTH_PORT = int(os.environ.get("PORT", 10000))
 
 video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
 admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
+snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
 
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
@@ -62,8 +75,7 @@ import sys as _sys
 
 # ===== LOGGING: همه چیز به stdout میره تا توی Render logs دیده بشه =====
 _log_formatter = logging.Formatter(
-    fmt='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-    datefmt='%H:%M:%S'
+    fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s", datefmt="%H:%M:%S"
 )
 _stdout_handler = logging.StreamHandler(_sys.stdout)
 _stdout_handler.setFormatter(_log_formatter)
@@ -84,40 +96,56 @@ logger = logging.getLogger("UltimateBot")
 # ====================== FLASK KEEP-ALIVE ======================
 flask_app = Flask(__name__)
 
-@flask_app.route('/')
+
+@flask_app.route("/")
 def health():
     return "OK", 200
 
+
 def start_keep_alive():
-    Thread(target=lambda: flask_app.run(host='0.0.0.0', port=HEALTH_PORT, debug=False), daemon=True).start()
+    Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=HEALTH_PORT, debug=False),
+        daemon=True,
+    ).start()
+
 
 # ====================== UTILITIES ======================
 def human_readable_size(num_bytes: int) -> str:
     if num_bytes == 0:
         return "0 B"
-    for unit in ['B', 'KB', 'MB', 'GB']:
+    for unit in ["B", "KB", "MB", "GB"]:
         if num_bytes < 1024:
             return f"{num_bytes:.2f} {unit}"
         num_bytes /= 1024
     return f"{num_bytes:.2f} TB"
 
+
 def safe_filename(title: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]', '_', title.strip()[:80]) or f"file_{int(time.time())}"
+    return (
+        re.sub(r'[<>:"/\\|?*]', "_", title.strip()[:80]) or f"file_{int(time.time())}"
+    )
+
 
 def parse_size_input(text: str) -> Optional[int]:
     # FIX: regex محکم‌تر — فقط عدد+واحد
     text = text.strip().lower().replace(" ", "")
-    match = re.match(r'^(\d+\.?\d*)([kmg]?)b?$', text)
+    match = re.match(r"^(\d+\.?\d*)([kmg]?)b?$", text)
     if not match:
         return None
     num = float(match.group(1))
     unit = match.group(2)
-    if unit == 'k': return int(num * 1024)
-    elif unit == 'm': return int(num * 1024 * 1024)
-    elif unit == 'g': return int(num * 1024 * 1024 * 1024)
+    if unit == "k":
+        return int(num * 1024)
+    elif unit == "m":
+        return int(num * 1024 * 1024)
+    elif unit == "g":
+        return int(num * 1024 * 1024 * 1024)
     return int(num)
 
-async def maybe_upload_github(client, chat_id: int, filepath: str, file_size: int) -> str:
+
+async def maybe_upload_github(
+    client, chat_id: int, filepath: str, file_size: int
+) -> str:
     """
     اگه GITHUB_ENABLED فعال باشه فایل رو آپلود میکنه و لینک رو برمیگردونه.
     در غیر اینصورت رشته خالی برمیگردونه.
@@ -144,18 +172,20 @@ async def maybe_upload_github(client, chat_id: int, filepath: str, file_size: in
 async def safe_edit(msg, text: str, buttons=None):
     try:
         if buttons is not None:
-            await msg.edit(text, parse_mode='markdown', buttons=buttons)
+            await msg.edit(text, parse_mode="markdown", buttons=buttons)
         else:
-            await msg.edit(text, parse_mode='markdown')
+            await msg.edit(text, parse_mode="markdown")
     except Exception:
         pass
 
 
-def build_progress_text(operation: str, current: int, total: int, speed: float, start_time: float) -> str:
+def build_progress_text(
+    operation: str, current: int, total: int, speed: float, start_time: float
+) -> str:
     eta = (total - current) / speed if speed > 0 else 0
     percent = (current / total) * 100 if total > 0 else 0
     filled = int(18 * current // total) if total > 0 else 0
-    bar = '█' * filled + '░' * (18 - filled)
+    bar = "█" * filled + "░" * (18 - filled)
     if eta < 60:
         eta_str = f"{int(eta)}s"
     elif eta < 3600:
@@ -169,6 +199,7 @@ def build_progress_text(operation: str, current: int, total: int, speed: float, 
         f"🚀 {human_readable_size(int(speed))}/s  •  ⏱ {eta_str}"
     )
 
+
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
 async def download_with_controls(
     url: str,
@@ -181,15 +212,15 @@ async def download_with_controls(
     CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive',
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
     }
     if referer:
-        headers['Referer'] = referer
+        headers["Referer"] = referer
         try:
-            headers['Origin'] = '/'.join(referer.split('/')[:3])
+            headers["Origin"] = "/".join(referer.split("/")[:3])
         except Exception:
             pass
     if extra_headers:
@@ -207,25 +238,43 @@ async def download_with_controls(
     if dl_id not in active_downloads:
         active_downloads[dl_id] = {"paused": False, "cancelled": False}
 
-    dl_buttons_pause  = [[Button.inline("⏸ Pause",    f"dlpause_{dl_id}"),  Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
-    dl_buttons_resume = [[Button.inline("▶️ Resume",  f"dlresume_{dl_id}"), Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+    dl_buttons_pause = [
+        [
+            Button.inline("⏸ Pause", f"dlpause_{dl_id}"),
+            Button.inline("❌ Cancel", f"dlcancel_{dl_id}"),
+        ]
+    ]
+    dl_buttons_resume = [
+        [
+            Button.inline("▶️ Resume", f"dlresume_{dl_id}"),
+            Button.inline("❌ Cancel", f"dlcancel_{dl_id}"),
+        ]
+    ]
 
     logger.info(f"[DL] START | url={url[:120]}")
     await safe_edit(status_msg, "📥 Connecting...", buttons=dl_buttons_pause)
 
     for attempt in range(1, MAX_RETRIES + 1):
-        logger.info(f"[DL] Attempt {attempt}/{MAX_RETRIES} | downloaded_so_far={human_readable_size(downloaded)}")
+        logger.info(
+            f"[DL] Attempt {attempt}/{MAX_RETRIES} | downloaded_so_far={human_readable_size(downloaded)}"
+        )
         try:
             attempt_headers = headers.copy()
             if downloaded > 0:
-                attempt_headers['Range'] = f'bytes={downloaded}-'
-                await safe_edit(status_msg,
+                attempt_headers["Range"] = f"bytes={downloaded}-"
+                await safe_edit(
+                    status_msg,
                     f"🔄 Retry {attempt}/{MAX_RETRIES} — resuming from {human_readable_size(downloaded)}...",
-                    buttons=dl_buttons_pause)
+                    buttons=dl_buttons_pause,
+                )
 
             connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False)
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                async with session.get(url, headers=attempt_headers, allow_redirects=True) as response:
+            async with aiohttp.ClientSession(
+                timeout=timeout, connector=connector
+            ) as session:
+                async with session.get(
+                    url, headers=attempt_headers, allow_redirects=True
+                ) as response:
                     # FIX: 403 رو به عنوان کد خاص برمیگردونه تا caller تصمیم بگیره
                     if response.status == 403:
                         return None, "HTTP_403", 0
@@ -233,45 +282,67 @@ async def download_with_controls(
                         return None, f"HTTP {response.status}", 0
 
                     if total == 0:
-                        content_length = int(response.headers.get('content-length', 0))
+                        content_length = int(response.headers.get("content-length", 0))
                         if response.status == 206:
-                            cr = response.headers.get('content-range', '')
-                            m = re.search(r'/(\d+)', cr)
-                            total = int(m.group(1)) if m else content_length + downloaded
+                            cr = response.headers.get("content-range", "")
+                            m = re.search(r"/(\d+)", cr)
+                            total = (
+                                int(m.group(1)) if m else content_length + downloaded
+                            )
                         else:
                             total = content_length
                         if total > MAX_FILE_SIZE_MB * 1024 * 1024:
-                            return None, f"File too large ({human_readable_size(total)})", 0
-                        cd = response.headers.get('Content-Disposition', '')
-                        if 'filename=' in cd:
+                            return (
+                                None,
+                                f"File too large ({human_readable_size(total)})",
+                                0,
+                            )
+                        cd = response.headers.get("Content-Disposition", "")
+                        if "filename=" in cd:
                             fm = re.search(r'filename="?([^";]+)', cd)
                             if fm:
-                                ext = os.path.splitext(fm.group(1).strip())[1] or '.mp4'
-                                filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}{ext}")
+                                ext = os.path.splitext(fm.group(1).strip())[1] or ".mp4"
+                                filepath = os.path.join(
+                                    OUTPUT_FOLDER, f"video_{int(time.time())}{ext}"
+                                )
 
-                    write_mode = 'ab' if downloaded > 0 else 'wb'
+                    write_mode = "ab" if downloaded > 0 else "wb"
                     async with aiofiles.open(filepath, write_mode) as f:
                         async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                             if active_downloads.get(dl_id, {}).get("cancelled"):
                                 try:
-                                    if os.path.exists(filepath): os.remove(filepath)
-                                except Exception: pass
+                                    if os.path.exists(filepath):
+                                        os.remove(filepath)
+                                except Exception:
+                                    pass
                                 try:
-                                    await status_msg.edit("🚫 Download cancelled.", buttons=None)
-                                except Exception: pass
+                                    await status_msg.edit(
+                                        "🚫 Download cancelled.", buttons=None
+                                    )
+                                except Exception:
+                                    pass
                                 return None, "Cancelled by user", 0
 
                             if active_downloads.get(dl_id, {}).get("paused"):
-                                paused_text = build_progress_text("⏸ Paused", downloaded, total, 0, start_time)
-                                await safe_edit(status_msg, paused_text, buttons=dl_buttons_resume)
+                                paused_text = build_progress_text(
+                                    "⏸ Paused", downloaded, total, 0, start_time
+                                )
+                                await safe_edit(
+                                    status_msg, paused_text, buttons=dl_buttons_resume
+                                )
                                 while active_downloads.get(dl_id, {}).get("paused"):
                                     if active_downloads.get(dl_id, {}).get("cancelled"):
                                         try:
-                                            if os.path.exists(filepath): os.remove(filepath)
-                                        except Exception: pass
+                                            if os.path.exists(filepath):
+                                                os.remove(filepath)
+                                        except Exception:
+                                            pass
                                         try:
-                                            await status_msg.edit("🚫 Download cancelled.", buttons=None)
-                                        except Exception: pass
+                                            await status_msg.edit(
+                                                "🚫 Download cancelled.", buttons=None
+                                            )
+                                        except Exception:
+                                            pass
                                         return None, "Cancelled by user", 0
                                     await asyncio.sleep(0.5)
                                 last_update = 0.0
@@ -282,35 +353,60 @@ async def download_with_controls(
                             now = time.time()
                             if now - last_update >= 1.5 and downloaded != total:
                                 dt = now - last_time_for_speed
-                                speed = (downloaded - last_bytes_for_speed) / dt if dt > 0 else 0
+                                speed = (
+                                    (downloaded - last_bytes_for_speed) / dt
+                                    if dt > 0
+                                    else 0
+                                )
                                 last_bytes_for_speed = downloaded
                                 last_time_for_speed = now
                                 last_update = now
-                                text = build_progress_text("📥 Downloading", downloaded, total, speed, start_time)
-                                await safe_edit(status_msg, text, buttons=dl_buttons_pause)
+                                text = build_progress_text(
+                                    "📥 Downloading",
+                                    downloaded,
+                                    total,
+                                    speed,
+                                    start_time,
+                                )
+                                await safe_edit(
+                                    status_msg, text, buttons=dl_buttons_pause
+                                )
 
             active_downloads.pop(dl_id, None)
-            logger.info(f"[DL] DONE | size={human_readable_size(downloaded)} | file={filepath}")
+            logger.info(
+                f"[DL] DONE | size={human_readable_size(downloaded)} | file={filepath}"
+            )
             try:
-                await status_msg.edit("✅ Download complete!", parse_mode='markdown', buttons=None)
-            except Exception: pass
+                await status_msg.edit(
+                    "✅ Download complete!", parse_mode="markdown", buttons=None
+                )
+            except Exception:
+                pass
             return filepath, None, downloaded
 
-        except (aiohttp.ClientError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            aiohttp.ServerDisconnectedError,
+        ) as e:
             logger.warning(f"Download attempt {attempt} failed: {e}")
             if attempt == MAX_RETRIES:
                 active_downloads.pop(dl_id, None)
                 try:
-                    if os.path.exists(filepath): os.remove(filepath)
-                except Exception: pass
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except Exception:
+                    pass
                 return None, f"Failed after {MAX_RETRIES} retries: {str(e)[:80]}", 0
             await asyncio.sleep(3)
         except Exception as e:
             logger.error(f"Unexpected download error: {e}")
             active_downloads.pop(dl_id, None)
             try:
-                if os.path.exists(filepath): os.remove(filepath)
-            except Exception: pass
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception:
+                pass
             return None, str(e)[:100], 0
 
     active_downloads.pop(dl_id, None)
@@ -319,6 +415,7 @@ async def download_with_controls(
 
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
+
 
 async def dl_pause_callback(event):
     dl_id = event.data.decode().replace("dlpause_", "")
@@ -345,7 +442,8 @@ async def dl_cancel_callback(event):
     await event.answer("❌ Cancelling...", alert=False)
     try:
         await event.edit(buttons=None)
-    except Exception: pass
+    except Exception:
+        pass
 
 
 # ====================== UPLOAD WITH PROGRESS ======================
@@ -355,24 +453,42 @@ async def get_video_thumbnail(filepath: str) -> Optional[str]:
         thumb_path = filepath + "_thumb.jpg"
         # مدت ویدیو رو بگیر تا فریم از وسط باشه
         probe = await asyncio.create_subprocess_exec(
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', filepath,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            filepath,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await probe.communicate()
         duration = 0.0
         try:
-            duration = float(json.loads(stdout.decode()).get('format', {}).get('duration', 0))
+            duration = float(
+                json.loads(stdout.decode()).get("format", {}).get("duration", 0)
+            )
         except Exception:
             pass
         seek_time = max(duration / 2, 1) if duration > 2 else 0
 
         proc = await asyncio.create_subprocess_exec(
-            'ffmpeg', '-y', '-ss', str(seek_time), '-i', filepath,
-            '-vframes', '1', '-q:v', '2',
-            '-vf', 'scale=320:-1',
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(seek_time),
+            "-i",
+            filepath,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            "-vf",
+            "scale=320:-1",
             thumb_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
         if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
@@ -383,8 +499,13 @@ async def get_video_thumbnail(filepath: str) -> Optional[str]:
 
 
 async def send_file_with_progress(
-    client, chat_id: int, filepath: str, caption: str,
-    status_msg: Message, buttons=None, supports_streaming: bool = True
+    client,
+    chat_id: int,
+    filepath: str,
+    caption: str,
+    status_msg: Message,
+    buttons=None,
+    supports_streaming: bool = True,
 ):
     file_size = os.path.getsize(filepath)
     start_time = time.time()
@@ -408,14 +529,17 @@ async def send_file_with_progress(
         last_time[0] = now
         text = build_progress_text("📤 Uploading", current, total, speed, start_time)
         try:
-            asyncio.ensure_future(status_msg.edit(text, parse_mode='markdown'))
-        except Exception: pass
+            asyncio.ensure_future(status_msg.edit(text, parse_mode="markdown"))
+        except Exception:
+            pass
 
     try:
         duration_int = int(duration) if duration else 0
         # FastTelethon: parallel upload — چند connection همزمان به تلگرام
-        with open(filepath, 'rb') as f:
-            uploaded = await fast_upload_file(client, f, progress_callback=progress_cb, connection_count=15)
+        with open(filepath, "rb") as f:
+            uploaded = await fast_upload_file(
+                client, f, progress_callback=progress_cb, connection_count=15
+            )
 
         # ساخت media با متادیتای ویدیو
         attributes, mime_type = utils.get_attributes(
@@ -432,7 +556,7 @@ async def send_file_with_progress(
         # آپلود thumbnail به تلگرام
         thumb_input = None
         if thumb_path and os.path.exists(thumb_path):
-            with open(thumb_path, 'rb') as tf:
+            with open(thumb_path, "rb") as tf:
                 thumb_input = await fast_upload_file(client, tf)
 
         media = InputMediaUploadedDocument(
@@ -443,8 +567,11 @@ async def send_file_with_progress(
             force_file=False,
         )
         await client.send_file(
-            chat_id, media, caption=caption,
-            buttons=buttons, parse_mode='markdown',
+            chat_id,
+            media,
+            caption=caption,
+            buttons=buttons,
+            parse_mode="markdown",
         )
     finally:
         # پاک کردن thumbnail موقت
@@ -456,11 +583,19 @@ async def send_file_with_progress(
 
     try:
         await status_msg.delete()
-    except Exception: pass
+    except Exception:
+        pass
 
 
 # ====================== DOWNLOAD AND SEND ======================
-async def do_download_and_send(event, status_msg, direct_url: str, source_url: str, extra_headers: Optional[dict] = None):
+async def do_download_and_send(
+    event,
+    status_msg,
+    direct_url: str,
+    source_url: str,
+    extra_headers: Optional[dict] = None,
+    title: str = "",
+):
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
 
@@ -471,16 +606,29 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
     # FIX: 403 → auto-retry via dirpy
     if dl_error == "HTTP_403":
         await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
-        found_urls, session_headers, intercept_err = await extract_video_url_smart(source_url, status_msg)
+        (
+            found_urls,
+            session_headers,
+            intercept_err,
+            page_title,
+        ) = await extract_video_url_smart(source_url, status_msg)
         if not found_urls:
-            await safe_edit(status_msg, f"❌ Could not extract via Dirpy either:\n{intercept_err}")
+            await safe_edit(
+                status_msg, f"❌ Could not extract via Dirpy either:\n{intercept_err}"
+            )
             return
+        if page_title and not title:
+            title = page_title
         direct_url = found_urls[0]
         extra_headers = session_headers
         dl_id2 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_r"
         active_downloads[dl_id2] = {"paused": False, "cancelled": False}
         filepath, dl_error, final_size = await download_with_controls(
-            direct_url, status_msg, dl_id2, referer=source_url, extra_headers=extra_headers
+            direct_url,
+            status_msg,
+            dl_id2,
+            referer=source_url,
+            extra_headers=extra_headers,
         )
 
     if dl_error or not filepath:
@@ -488,19 +636,18 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
         return
 
-    video_id = f"vid_{event.chat_id}_{int(time.time())}"
-    video_cache[video_id] = {
-        "filepath": filepath, "chat_id": event.chat_id,
-        "original_size": final_size, "original_url": source_url
-    }
-    after_buttons = [
-        [Button.inline("🗜 Compress Video", f"compress_{video_id}")],
-        [Button.inline("✅ Check (Delete)", f"check_{video_id}")]
-    ]
+    # بررسی کن فایل دانلود شده واقعاً ویدیو هست یا نه
+    vid_duration, vw, vh = await get_video_info(filepath)
+    if vid_duration is None or vid_duration <= 0:
+        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+        return
+
     await safe_edit(status_msg, "📤 Uploading...")
     try:
-        # مدت زمان ویدیو رو برای caption بگیر
-        vid_duration, _, _ = await get_video_info(filepath)
         dur_str = ""
         if vid_duration and vid_duration > 0:
             mins, secs = divmod(int(vid_duration), 60)
@@ -510,25 +657,36 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
             else:
                 dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
 
-        # آپلود به GitHub اگه configure شده و فایل در محدوده سایز باشه
+        caption_start = f"🎬 {title}" if title else "🎬 **Video Downloaded**"
+
         gh_line = ""
         if GITHUB_ENABLED:
             await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, final_size)
+            gh_url = await maybe_upload_github(
+                event.client, event.chat_id, filepath, final_size
+            )
             if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
         await send_file_with_progress(
-            client=event.client, chat_id=event.chat_id, filepath=filepath,
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=filepath,
             caption=(
-                f"🎬 **Video Downloaded**\n"
+                f"{caption_start}\n"
                 f"📦 Size: {human_readable_size(final_size)}"
                 f"{dur_str}\n"
                 f"🔗 [Source]({source_url})\n"
                 f"⬇️ [DW Link]({direct_url})"
                 f"{gh_line}"
             ),
-            status_msg=status_msg, buttons=after_buttons, supports_streaming=True
+            status_msg=status_msg,
+            supports_streaming=True,
         )
+        # پاک کردن خودکار فایل از سرور بعد از آپلود موفق
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"Upload error: {e}")
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
@@ -538,10 +696,14 @@ async def do_download_and_send(event, status_msg, direct_url: str, source_url: s
 async def get_file_size(url: str) -> int:
     try:
         timeout = ClientTimeout(connect=10, sock_read=10, total=15)
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(url, headers=headers, allow_redirects=True, ssl=False) as resp:
-                return int(resp.headers.get('content-length', 0))
+            async with session.head(
+                url, headers=headers, allow_redirects=True, ssl=False
+            ) as resp:
+                return int(resp.headers.get("content-length", 0))
     except Exception:
         return 0
 
@@ -549,49 +711,72 @@ async def get_file_size(url: str) -> int:
 def _url_label(url: str, size: int, index: int) -> str:
     u = url.lower()
     quality = "Unknown"
-    for q in ['2160p', '1080p', '720p', '480p', '360p', '240p', '4k', 'hd', 'sd']:
+    for q in ["2160p", "1080p", "720p", "480p", "360p", "240p", "4k", "hd", "sd"]:
         if q in u:
             quality = q.upper()
             break
     sz_str = human_readable_size(size) if size > 0 else "? MB"
     try:
         from urllib.parse import urlparse
-        domain = urlparse(url).netloc.replace('www.', '')[:20]
+
+        domain = urlparse(url).netloc.replace("www.", "")[:20]
     except Exception:
-        domain = f"Link {index+1}"
-    return f"#{index+1} {quality} • {sz_str} • {domain}"
+        domain = f"Link {index + 1}"
+    return f"#{index + 1} {quality} • {sz_str} • {domain}"
 
 
 # ====================== VIDEO URL EXTRACTOR ======================
-SKIP_KEYWORDS = ['thumb', 'preview', 'poster', 'banner', 'logo', 'icon', 'sprite',
-                 'storyboard', 'tracking', 'analytics', 'pixel', 'ad/', '/ads/']
+SKIP_KEYWORDS = [
+    "thumb",
+    "preview",
+    "poster",
+    "banner",
+    "logo",
+    "icon",
+    "sprite",
+    "storyboard",
+    "tracking",
+    "analytics",
+    "pixel",
+    "ad/",
+    "/ads/",
+]
 MIN_SIZE = 2 * 1024 * 1024  # 2MB
 
 
 def _browser_args() -> list:
     """آرگومان‌های chromium برای مصرف RAM کم."""
     return [
-        '--no-sandbox',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--disable-software-rasterizer',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-sync',
-        '--disable-translate',
-        '--hide-scrollbars',
-        '--mute-audio',
-        '--no-first-run',
-        '--js-flags=--max-old-space-size=96',
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--disable-translate",
+        "--hide-scrollbars",
+        "--mute-audio",
+        "--no-first-run",
+        "--js-flags=--max-old-space-size=96",
     ]
 
+
 KNOWN_CDN_DOMAINS = [
-    'rdtcdn.com', 'phncdn.com', 'xnxx-cdn.com',
-    'media4.luxuretv', 'media.luxuretv',
-    'rule34.xxx', 'rule34video',
-    'kv-ph.', 'ev-ph.', 'di-ph.',
-    'googlevideo.com', 'videoplayback',
-    'p300cdn', 'x-tg.tube/get_file',
+    "rdtcdn.com",
+    "phncdn.com",
+    "xnxx-cdn.com",
+    "media4.luxuretv",
+    "media.luxuretv",
+    "rule34.xxx",
+    "rule34video",
+    "kv-ph.",
+    "ev-ph.",
+    "di-ph.",
+    "googlevideo.com",
+    "videoplayback",
+    "p300cdn",
+    "x-tg.tube/get_file",
 ]
 
 
@@ -599,16 +784,29 @@ def _should_capture(url: str, content_type: str = "", content_length: int = 0) -
     ul = url.lower()
     if any(k in ul for k in SKIP_KEYWORDS):
         return False
-    if 'video/' in content_type and content_length > MIN_SIZE:
+    if "video/" in content_type and content_length > MIN_SIZE:
         return True
     is_known_cdn = any(d in ul for d in KNOWN_CDN_DOMAINS)
-    has_video_ext = '.mp4' in ul or '.webm' in ul or 'videoplayback' in ul or '/get_file/' in ul
+    has_video_ext = (
+        ".mp4" in ul or ".webm" in ul or "videoplayback" in ul or "/get_file/" in ul
+    )
     if is_known_cdn and has_video_ext:
-        if 'rdtcdn.com' in ul or 'phncdn.com' in ul:
+        if "rdtcdn.com" in ul or "phncdn.com" in ul:
             quality_signals = [
-                '_720p_', '_1080p_', '_480p_', '_240p_', '_2160p_',
-                '_4000k_', '_2000k_', '_1000k_', '_500k_', '_800k_',
-                'p_720', 'p_1080', 'p_480', 'p_240',
+                "_720p_",
+                "_1080p_",
+                "_480p_",
+                "_240p_",
+                "_2160p_",
+                "_4000k_",
+                "_2000k_",
+                "_1000k_",
+                "_500k_",
+                "_800k_",
+                "p_720",
+                "p_1080",
+                "p_480",
+                "p_240",
             ]
             return any(q in ul for q in quality_signals)
         return True
@@ -618,7 +816,7 @@ def _should_capture(url: str, content_type: str = "", content_length: int = 0) -
 def _extract_from_html(html: str, seen: set, captured_urls: list, label: str):
     for m in re.findall(r"https?://[^\x22\x27<>\s]+", html):
         if _should_capture(m):
-            norm = m.split('?')[0]
+            norm = m.split("?")[0]
             if norm not in seen:
                 seen.add(norm)
                 captured_urls.append(m)
@@ -632,19 +830,22 @@ def _extract_from_html(html: str, seen: set, captured_urls: list, label: str):
     ]
     for pat in kv_patterns:
         for m in re.findall(pat, html, re.IGNORECASE):
-            url = m.rstrip('/')
-            if not url.startswith('http'):
+            url = m.rstrip("/")
+            if not url.startswith("http"):
                 continue
-            norm = url.split('?')[0]
+            norm = url.split("?")[0]
             if norm not in seen and not any(k in url.lower() for k in SKIP_KEYWORDS):
                 seen.add(norm)
                 captured_urls.append(url)
                 logger.info(f"[{label}-KV] {url[:180]}")
 
-    for m in re.findall(r"[\x22\x27]([^\x22\x27]*?/get_file/[^\x22\x27]+\.mp4[^\x22\x27]*)[\x22\x27]", html):
-        if m.startswith('http'):
-            url = m.rstrip('/')
-            norm = url.split('?')[0]
+    for m in re.findall(
+        r"[\x22\x27]([^\x22\x27]*?/get_file/[^\x22\x27]+\.mp4[^\x22\x27]*)[\x22\x27]",
+        html,
+    ):
+        if m.startswith("http"):
+            url = m.rstrip("/")
+            norm = url.split("?")[0]
             if norm not in seen:
                 seen.add(norm)
                 captured_urls.append(url)
@@ -654,18 +855,19 @@ def _extract_from_html(html: str, seen: set, captured_urls: list, label: str):
 async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
     async def on_response(response):
         try:
-            ct = response.headers.get('content-type', '')
-            cl = int(response.headers.get('content-length', 0))
+            ct = response.headers.get("content-type", "")
+            cl = int(response.headers.get("content-length", 0))
             ru = response.url
             if _should_capture(ru, ct, cl):
-                norm = ru.split('?')[0]
+                norm = ru.split("?")[0]
                 if norm not in seen:
                     seen.add(norm)
                     captured_urls.append(ru)
                     logger.info(f"[{label}] {ru[:180]}")
         except Exception:
             pass
-    page.on('response', on_response)
+
+    page.on("response", on_response)
 
     try:
         html = await page.content()
@@ -682,7 +884,9 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
             pass
 
     if not captured_urls:
-        await page.evaluate('() => { try { document.querySelector("video")?.play(); } catch(e){} }')
+        await page.evaluate(
+            '() => { try { document.querySelector("video")?.play(); } catch(e){} }'
+        )
         await page.wait_for_timeout(6000)
         try:
             html = await page.content()
@@ -691,13 +895,15 @@ async def _collect_from_page(page, label: str, captured_urls: list, seen: set):
             pass
 
 
-
-async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[list, dict, Optional[str]]:
+async def extract_video_url_smart(
+    video_url: str, status_msg: Message
+) -> Tuple[list, dict, Optional[str], str]:
     async with async_playwright() as p:
         browser = None
         captured_urls: list = []
         seen: set = set()
         session_headers: dict = {}
+        video_title: str = ""
 
         try:
             browser = await p.chromium.launch(headless=True, args=_browser_args())
@@ -705,8 +911,8 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
 
             async def make_context():
                 return await browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-                    viewport={'width': 1280, 'height': 720}
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 720},
                 )
 
             # مرحله ۱: Dirpy
@@ -716,8 +922,15 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
             dirpy_url = f"https://dirpy.com/studio?url={quote(video_url)}"
             try:
                 logger.info(f"[PLAYWRIGHT] Opening Dirpy: {dirpy_url[:120]}")
-                await page1.goto(dirpy_url, wait_until='domcontentloaded', timeout=60000)
+                await page1.goto(
+                    dirpy_url, wait_until="domcontentloaded", timeout=60000
+                )
                 await _collect_from_page(page1, "DIRPY", captured_urls, seen)
+                try:
+                    raw = await page1.title()
+                    video_title = raw.replace("Dirpy Studio", "").strip(" -|").strip()
+                except:
+                    pass
                 if captured_urls:
                     session_headers = {"Referer": video_url}
             except Exception as e:
@@ -728,22 +941,33 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
 
             # مرحله ۲: Direct site fallback
             if not captured_urls:
-                await safe_edit(status_msg, "🌐 Dirpy failed — trying direct site extraction...")
+                await safe_edit(
+                    status_msg, "🌐 Dirpy failed — trying direct site extraction..."
+                )
                 ctx2 = await make_context()
                 page2 = await ctx2.new_page()
                 try:
                     logger.info(f"[PLAYWRIGHT] Direct goto: {video_url[:120]}")
+
                     async def handle_dialog(dialog):
                         await dialog.accept()
-                    page2.on('dialog', handle_dialog)
 
-                    await page2.goto(video_url, wait_until='domcontentloaded', timeout=60000)
+                    page2.on("dialog", handle_dialog)
+
+                    await page2.goto(
+                        video_url, wait_until="domcontentloaded", timeout=60000
+                    )
 
                     age_selectors = [
-                        'button:has-text("I AM 18")', 'button:has-text("ENTER")',
-                        'button:has-text("Yes")', '.age-gate button', 'button.y',
-                        'button:has-text("Enter")', 'button:has-text("Confirm")',
-                        'a:has-text("I AM 18")', 'a:has-text("ENTER")',
+                        'button:has-text("I AM 18")',
+                        'button:has-text("ENTER")',
+                        'button:has-text("Yes")',
+                        ".age-gate button",
+                        "button.y",
+                        'button:has-text("Enter")',
+                        'button:has-text("Confirm")',
+                        'a:has-text("I AM 18")',
+                        'a:has-text("ENTER")',
                     ]
                     for sel in age_selectors:
                         try:
@@ -760,13 +984,15 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                     if captured_urls:
                         raw_cookies = await ctx2.cookies()
                         cookie_str = "; ".join(
-                            f"{c['name']}={c['value']}" for c in raw_cookies
-                            if video_url.split('/')[2].replace('www.', '') in c.get('domain', '')
-                               or c.get('domain', '').lstrip('.') in video_url
+                            f"{c['name']}={c['value']}"
+                            for c in raw_cookies
+                            if video_url.split("/")[2].replace("www.", "")
+                            in c.get("domain", "")
+                            or c.get("domain", "").lstrip(".") in video_url
                         )
                         session_headers = {
                             "Referer": video_url,
-                            "Origin": '/'.join(video_url.split('/')[:3]),
+                            "Origin": "/".join(video_url.split("/")[:3]),
                         }
                         if cookie_str:
                             session_headers["Cookie"] = cookie_str
@@ -778,19 +1004,26 @@ async def extract_video_url_smart(video_url: str, status_msg: Message) -> Tuple[
                     await ctx2.close()
 
             if captured_urls:
-                return captured_urls, session_headers, None
-            return [], {}, "Could not capture video link via Dirpy or direct extraction"
+                return captured_urls, session_headers, None, video_title
+            return (
+                [],
+                {},
+                "Could not capture video link via Dirpy or direct extraction",
+                video_title,
+            )
 
         except Exception as e:
             logger.error(f"Extractor error: {e}")
-            return [], {}, str(e)
+            return [], {}, str(e), ""
         finally:
             if browser:
                 await browser.close()
 
 
 # ====================== HTML TO PDF ======================
-async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
+async def html_to_pdf(
+    url: str, status_msg: Message
+) -> Tuple[Optional[str], Optional[str], int]:
     async with async_playwright() as p:
         browser = None
         try:
@@ -802,8 +1035,13 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
             except Exception:
                 pass
             try:
-                for sel in ['button:has-text("I AM 18")', 'button:has-text("ENTER")',
-                            'button:has-text("Yes")', '.age-gate button', 'button.y']:
+                for sel in [
+                    'button:has-text("I AM 18")',
+                    'button:has-text("ENTER")',
+                    'button:has-text("Yes")',
+                    ".age-gate button",
+                    "button.y",
+                ]:
                     try:
                         el = page.locator(sel).first
                         if await el.is_visible(timeout=1000):
@@ -833,22 +1071,30 @@ async def html_to_pdf(url: str, status_msg: Message) -> Tuple[Optional[str], Opt
             await asyncio.sleep(4)
             await safe_edit(status_msg, "📄 Rendering PDF...")
             filepath = os.path.join(OUTPUT_FOLDER, f"pdf_{int(time.time())}.pdf")
-            await page.pdf(path=filepath, format="A4", print_background=True,
-                           margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"})
+            await page.pdf(
+                path=filepath,
+                format="A4",
+                print_background=True,
+                margin={"top": "10mm", "bottom": "10mm", "left": "8mm", "right": "8mm"},
+            )
             return filepath, None, os.path.getsize(filepath)
         except Exception as e:
             err = str(e)
-            if 'connection closed' in err.lower() or 'browser' in err.lower():
+            if "connection closed" in err.lower() or "browser" in err.lower():
                 return None, "PDF Error: Browser crashed. Please try again.", 0
             return None, f"PDF Error: {err[:80]}", 0
         finally:
             if browser:
-                try: await browser.close()
-                except Exception: pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
 
 # ====================== CAPTURE MHTML ======================
-async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], Optional[str], int]:
+async def capture_mhtml(
+    url: str, status_msg: Message
+) -> Tuple[Optional[str], Optional[str], int]:
     async with async_playwright() as p:
         browser = None
         try:
@@ -864,7 +1110,7 @@ async def capture_mhtml(url: str, status_msg: Message) -> Tuple[Optional[str], O
             if not mhtml_data:
                 return None, "Failed to capture MHTML", 0
             filepath = os.path.join(OUTPUT_FOLDER, f"page_{int(time.time())}.mhtml")
-            async with aiofiles.open(filepath, 'w', encoding='utf-8') as f:
+            async with aiofiles.open(filepath, "w", encoding="utf-8") as f:
                 await f.write(mhtml_data)
             return filepath, None, os.path.getsize(filepath)
         except Exception as e:
@@ -880,37 +1126,48 @@ async def _run_ffmpeg(args: list) -> Tuple[int, str]:
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     _, stderr = await proc.communicate()
-    return proc.returncode, stderr.decode(errors='replace')
+    return proc.returncode, stderr.decode(errors="replace")
 
 
 async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
     proc = await asyncio.create_subprocess_exec(
-        'ffprobe', '-v', 'quiet', '-print_format', 'json',
-        '-show_format', '-show_streams', input_path,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        input_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
         return None, 0, 0
     try:
         info = json.loads(stdout.decode())
-        dur = float(info.get('format', {}).get('duration', 0))
+        dur = float(info.get("format", {}).get("duration", 0))
         w, h = 0, 0
-        for s in info.get('streams', []):
-            if s.get('codec_type') == 'video':
-                w = int(s.get('width', 0))
-                h = int(s.get('height', 0))
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "video":
+                w = int(s.get("width", 0))
+                h = int(s.get("height", 0))
                 if not dur:
-                    dur = float(s.get('duration', 0))
+                    dur = float(s.get("duration", 0))
                 break
         return dur or None, w, h
     except Exception:
         return None, 0, 0
 
 
-async def compress_video(input_path: str, target_size_bytes: int, status_msg: Message) -> Tuple[Optional[str], str]:
+async def compress_video(
+    input_path: str, target_size_bytes: int, status_msg: Message
+) -> Tuple[Optional[str], str]:
     target_mb = target_size_bytes / 1024 / 1024
-    output_path = os.path.join(OUTPUT_FOLDER, f"compressed_{int(target_mb)}mb_{int(time.time())}.mp4")
+    output_path = os.path.join(
+        OUTPUT_FOLDER, f"compressed_{int(target_mb)}mb_{int(time.time())}.mp4"
+    )
     passlog = os.path.join(OUTPUT_FOLDER, f"passlog_{int(time.time())}")
 
     await safe_edit(status_msg, "🔍 Analyzing video...")
@@ -929,21 +1186,33 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
         # - format=yuv420p: مطمئن میشه pixel format با libx264 سازگاره
         # - noautorotate: جلوگیری از تداخل rotation metadata با scale filter
         SCALE_VF = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
-        COMMON_INPUT = ['-noautorotate', '-i', input_path]
+        COMMON_INPUT = ["-noautorotate", "-i", input_path]
 
         await safe_edit(
             status_msg,
             f"⚙️ Compressing to ≈ {human_readable_size(target_size_bytes)}\n"
-            f"📊 Duration: {int(duration)}s  |  Video: {video_bitrate_bps//1000}kbps\n"
-            f"🔄 Pass 1/2..."
+            f"📊 Duration: {int(duration)}s  |  Video: {video_bitrate_bps // 1000}kbps\n"
+            f"🔄 Pass 1/2...",
         )
 
         pass1_args = [
-            'ffmpeg', '-y', *COMMON_INPUT,
-            '-vf', SCALE_VF,
-            '-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
-            '-pass', '1', '-passlogfile', passlog,
-            '-an', '-f', 'null', '/dev/null'
+            "ffmpeg",
+            "-y",
+            *COMMON_INPUT,
+            "-vf",
+            SCALE_VF,
+            "-c:v",
+            "libx264",
+            "-b:v",
+            str(video_bitrate_bps),
+            "-pass",
+            "1",
+            "-passlogfile",
+            passlog,
+            "-an",
+            "-f",
+            "null",
+            "/dev/null",
         ]
         rc, err = await _run_ffmpeg(pass1_args)
 
@@ -951,15 +1220,28 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
             logger.warning(f"Two-pass pass1 failed → single-pass CRF. err: {err[:200]}")
             await safe_edit(status_msg, "⚙️ Single-pass encoding (CRF mode)...")
             sp_args = [
-                'ffmpeg', '-y', *COMMON_INPUT,
-                '-vf', SCALE_VF,
-                '-c:v', 'libx264', '-crf', '28',
-                '-maxrate', str(video_bitrate_bps),
-                '-bufsize', str(video_bitrate_bps * 2),
-                '-preset', 'fast',
-                '-c:a', 'aac', '-b:a', f'{audio_bitrate_k}k',
-                '-movflags', '+faststart',
-                output_path
+                "ffmpeg",
+                "-y",
+                *COMMON_INPUT,
+                "-vf",
+                SCALE_VF,
+                "-c:v",
+                "libx264",
+                "-crf",
+                "28",
+                "-maxrate",
+                str(video_bitrate_bps),
+                "-bufsize",
+                str(video_bitrate_bps * 2),
+                "-preset",
+                "fast",
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{audio_bitrate_k}k",
+                "-movflags",
+                "+faststart",
+                output_path,
             ]
             rc2, err2 = await _run_ffmpeg(sp_args)
             if rc2 != 0:
@@ -968,18 +1250,32 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
             await safe_edit(
                 status_msg,
                 f"⚙️ Compressing to ≈ {human_readable_size(target_size_bytes)}\n"
-                f"📊 Duration: {int(duration)}s  |  Video: {video_bitrate_bps//1000}kbps\n"
-                f"🔄 Pass 2/2..."
+                f"📊 Duration: {int(duration)}s  |  Video: {video_bitrate_bps // 1000}kbps\n"
+                f"🔄 Pass 2/2...",
             )
             pass2_args = [
-                'ffmpeg', '-y', *COMMON_INPUT,
-                '-vf', SCALE_VF,
-                '-c:v', 'libx264', '-b:v', str(video_bitrate_bps),
-                '-pass', '2', '-passlogfile', passlog,
-                '-preset', 'fast',
-                '-c:a', 'aac', '-b:a', f'{audio_bitrate_k}k',
-                '-movflags', '+faststart',
-                output_path
+                "ffmpeg",
+                "-y",
+                *COMMON_INPUT,
+                "-vf",
+                SCALE_VF,
+                "-c:v",
+                "libx264",
+                "-b:v",
+                str(video_bitrate_bps),
+                "-pass",
+                "2",
+                "-passlogfile",
+                passlog,
+                "-preset",
+                "fast",
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{audio_bitrate_k}k",
+                "-movflags",
+                "+faststart",
+                output_path,
             ]
             rc, err = await _run_ffmpeg(pass2_args)
             if rc != 0:
@@ -988,7 +1284,10 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             return None, "Output file is empty or missing."
 
-        return output_path, f"✅ Compressed: {human_readable_size(os.path.getsize(output_path))}"
+        return (
+            output_path,
+            f"✅ Compressed: {human_readable_size(os.path.getsize(output_path))}",
+        )
 
     except FileNotFoundError:
         return None, "ffmpeg/ffprobe not found. Please install ffmpeg on the server."
@@ -996,15 +1295,18 @@ async def compress_video(input_path: str, target_size_bytes: int, status_msg: Me
         logger.error(f"Compression error: {e}", exc_info=True)
         return None, f"Unexpected error: {str(e)[:150]}"
     finally:
-        for ext in ['.log', '-0.log', '-0.log.mbtree']:
+        for ext in [".log", "-0.log", "-0.log.mbtree"]:
             try:
                 pp = passlog + ext
-                if os.path.exists(pp): os.remove(pp)
-            except Exception: pass
+                if os.path.exists(pp):
+                    os.remove(pp)
+            except Exception:
+                pass
 
 
 # ====================== DIRPY FLOW ======================
 processing_messages = set()
+
 
 async def process_dirpy_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
@@ -1012,41 +1314,64 @@ async def process_dirpy_request(event, url: str):
         return
     processing_messages.add(msg_id)
     logger.info(f"[DIRPY] START | chat={event.chat_id} | url={url[:120]}")
-    status_msg = await event.reply("🔄 Starting extraction...", parse_mode='markdown')
+    status_msg = await event.reply("🔄 Starting extraction...", parse_mode="markdown")
     try:
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-        found_urls, session_headers, intercept_err = await extract_video_url_smart(url, status_msg)
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        (
+            found_urls,
+            session_headers,
+            intercept_err,
+            video_title,
+        ) = await extract_video_url_smart(url, status_msg)
         if not found_urls:
-            logger.warning(f"[DIRPY] No URLs found | chat={event.chat_id} | err={intercept_err}")
+            logger.warning(
+                f"[DIRPY] No URLs found | chat={event.chat_id} | err={intercept_err}"
+            )
             await safe_edit(status_msg, f"❌ Could not capture video:\n{intercept_err}")
             return
         logger.info(f"[DIRPY] Found {len(found_urls)} URLs | chat={event.chat_id}")
         if len(found_urls) == 1:
-            await do_download_and_send(event, status_msg, found_urls[0], url, extra_headers=session_headers)
+            await do_download_and_send(
+                event,
+                status_msg,
+                found_urls[0],
+                url,
+                extra_headers=session_headers,
+                title=video_title,
+            )
             return
-        await safe_edit(status_msg, f"🔍 Found {len(found_urls)} links, checking sizes...")
+        await safe_edit(
+            status_msg, f"🔍 Found {len(found_urls)} links, checking sizes..."
+        )
         sized_urls = []
         for u in found_urls:
             sz = await get_file_size(u)
             sized_urls.append((u, sz))
         pick_id = f"pick_{event.chat_id}_{int(time.time())}"
         video_cache[pick_id] = {
-            "urls": sized_urls, "source_url": url,
-            "chat_id": event.chat_id, "session_headers": session_headers
+            "urls": sized_urls,
+            "source_url": url,
+            "chat_id": event.chat_id,
+            "session_headers": session_headers,
+            "title": video_title,
         }
-        buttons = [[Button.inline(_url_label(u, sz, i), f"pickurl_{pick_id}_{i}")] for i, (u, sz) in enumerate(sized_urls)]
+        buttons = [
+            [Button.inline(_url_label(u, sz, i), f"pickurl_{pick_id}_{i}")]
+            for i, (u, sz) in enumerate(sized_urls)
+        ]
         await safe_edit(status_msg, "📋 **Select video to download:**")
         await event.client.send_message(
             event.chat_id,
             f"🎬 Found **{len(sized_urls)}** video links.\nChoose one to download:",
-            buttons=buttons, parse_mode='markdown'
+            buttons=buttons,
+            parse_mode="markdown",
         )
         await status_msg.delete()
     except Exception as e:
         logger.error(f"Dirpy process error: {e}", exc_info=True)
         err_str = str(e)
-        if 'connection closed' in err_str.lower() or 'browser' in err_str.lower():
+        if "connection closed" in err_str.lower() or "browser" in err_str.lower():
             await safe_edit(status_msg, "❌ Browser crashed. Please try again.")
         else:
             await safe_edit(status_msg, f"❌ Error: {err_str[:120]}")
@@ -1061,7 +1386,10 @@ async def compress_callback(event):
         return await event.answer("Video not found or expired.", alert=True)
     await event.answer("Send desired size (e.g: 15mb or 800kb)", alert=False)
     # FIX: chat_id رو ذخیره میکنیم (نه sender_id) — در private chat یکیه ولی در گروه فرق دارن
-    user_state[event.chat_id] = {"action": "wait_for_compression_size", "video_id": video_id}
+    user_state[event.chat_id] = {
+        "action": "wait_for_compression_size",
+        "video_id": video_id,
+    }
 
 
 async def check_callback(event):
@@ -1070,7 +1398,8 @@ async def check_callback(event):
         return await event.answer("Video already deleted.", alert=True)
     data = video_cache[video_id]
     try:
-        if os.path.exists(data["filepath"]): os.remove(data["filepath"])
+        if os.path.exists(data["filepath"]):
+            os.remove(data["filepath"])
         await event.answer("✅ Video deleted from server.", alert=False)
         await event.edit(buttons=None)
     except Exception:
@@ -1083,20 +1412,33 @@ async def pickurl_callback(event):
     idx = int(parts[1])
     pick_id = parts[0].replace("pickurl_", "")
     if pick_id not in video_cache:
-        return await event.answer("Session expired. Please resend /dirpy command.", alert=True)
+        return await event.answer(
+            "Session expired. Please resend /dirpy command.", alert=True
+        )
     data = video_cache[pick_id]
     if idx >= len(data["urls"]):
         return await event.answer("Invalid selection.", alert=True)
     chosen_url, _ = data["urls"][idx]
     source_url = data["source_url"]
     session_headers = data.get("session_headers", {})
-    await event.answer(f"Starting download #{idx+1}...", alert=False)
+    saved_title = data.get("title", "")
+    await event.answer(f"Starting download #{idx + 1}...", alert=False)
     try:
         await event.delete()
-    except Exception: pass
-    status_msg = await event.client.send_message(event.chat_id, "📥 Starting download...")
+    except Exception:
+        pass
+    status_msg = await event.client.send_message(
+        event.chat_id, "📥 Starting download..."
+    )
     del video_cache[pick_id]
-    await do_download_and_send(event, status_msg, chosen_url, source_url, extra_headers=session_headers)
+    await do_download_and_send(
+        event,
+        status_msg,
+        chosen_url,
+        source_url,
+        extra_headers=session_headers,
+        title=saved_title,
+    )
 
 
 # ====================== ADMIN HANDLERS ======================
@@ -1108,23 +1450,33 @@ async def admin_input_handler(event):
     action = admin_pending_add.pop(event.sender_id)
     raw = event.raw_text.strip()
     if not raw.isdigit():
-        await event.reply("❌ Invalid ID! Please send a numeric ID only.", parse_mode='markdown')
+        await event.reply(
+            "❌ Invalid ID! Please send a numeric ID only.", parse_mode="markdown"
+        )
         raise events.StopPropagation
     uid = int(raw)
     if action == "add":
         if uid in AUTHORIZED_USERS:
-            await event.reply(f"⚠️ User `{uid}` is already authorized.", parse_mode='markdown')
+            await event.reply(
+                f"⚠️ User `{uid}` is already authorized.", parse_mode="markdown"
+            )
         else:
             AUTHORIZED_USERS.add(uid)
-            await event.reply(f"✅ User `{uid}` added!\nTotal: **{len(AUTHORIZED_USERS)}**", parse_mode='markdown')
+            await event.reply(
+                f"✅ User `{uid}` added!\nTotal: **{len(AUTHORIZED_USERS)}**",
+                parse_mode="markdown",
+            )
     elif action == "remove":
         if uid == ADMIN_ID:
-            await event.reply("❌ You cannot remove yourself!", parse_mode='markdown')
+            await event.reply("❌ You cannot remove yourself!", parse_mode="markdown")
         elif uid not in AUTHORIZED_USERS:
-            await event.reply(f"⚠️ User `{uid}` not found.", parse_mode='markdown')
+            await event.reply(f"⚠️ User `{uid}` not found.", parse_mode="markdown")
         else:
             AUTHORIZED_USERS.discard(uid)
-            await event.reply(f"✅ User `{uid}` removed!\nTotal: **{len(AUTHORIZED_USERS)}**", parse_mode='markdown')
+            await event.reply(
+                f"✅ User `{uid}` removed!\nTotal: **{len(AUTHORIZED_USERS)}**",
+                parse_mode="markdown",
+            )
     raise events.StopPropagation
 
 
@@ -1146,20 +1498,26 @@ async def size_input_handler(event):
     if not target_bytes:
         await event.reply(
             "❌ Invalid size format!\nExamples: `15mb`, `800kb`, `1.5gb`",
-            parse_mode='markdown'
+            parse_mode="markdown",
         )
         raise events.StopPropagation
 
     data = video_cache[video_id]
     if target_bytes >= data["original_size"]:
-        await event.reply("❌ Target size must be smaller than original size.", parse_mode='markdown')
+        await event.reply(
+            "❌ Target size must be smaller than original size.", parse_mode="markdown"
+        )
         raise events.StopPropagation
 
     # state رو قبل از شروع پاک کن — جلوگیری از double-trigger
     user_state.pop(event.chat_id, None)
 
-    status_msg = await event.reply(f"⚙️ Starting compression → {human_readable_size(target_bytes)}...")
-    compressed_path, result = await compress_video(data["filepath"], target_bytes, status_msg)
+    status_msg = await event.reply(
+        f"⚙️ Starting compression → {human_readable_size(target_bytes)}..."
+    )
+    compressed_path, result = await compress_video(
+        data["filepath"], target_bytes, status_msg
+    )
 
     if compressed_path and os.path.exists(compressed_path):
         await safe_edit(status_msg, "📤 Uploading compressed video...")
@@ -1168,11 +1526,15 @@ async def size_input_handler(event):
             gh_line = ""
             if GITHUB_ENABLED:
                 await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-                gh_url = await maybe_upload_github(event.client, event.chat_id, compressed_path, comp_size)
+                gh_url = await maybe_upload_github(
+                    event.client, event.chat_id, compressed_path, comp_size
+                )
                 if gh_url:
                     gh_line = f"\n☁️ [GitHub DL]({gh_url})"
             await send_file_with_progress(
-                client=event.client, chat_id=event.chat_id, filepath=compressed_path,
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=compressed_path,
                 caption=(
                     f"✅ **Compressed Video**\n"
                     f"🎯 Requested: {human_readable_size(target_bytes)}\n"
@@ -1186,7 +1548,8 @@ async def size_input_handler(event):
         try:
             os.remove(compressed_path)
             os.remove(data["filepath"])
-        except Exception: pass
+        except Exception:
+            pass
     else:
         await safe_edit(status_msg, f"❌ Compression failed: {result}")
 
@@ -1196,7 +1559,10 @@ async def size_input_handler(event):
 
 # ====================== PDF & HTML COMMANDS ======================
 
-async def _fetch_hd_url(post_url: str, thumb_url: str, session: aiohttp.ClientSession) -> str:
+
+async def _fetch_hd_url(
+    post_url: str, thumb_url: str, session: aiohttp.ClientSession
+) -> str:
     """برای یه post URL لینک عکس اصلی رو میگیره (برای سایت‌هایی مثل rule34)."""
     try:
         async with session.get(post_url, timeout=ClientTimeout(total=15)) as resp:
@@ -1204,12 +1570,19 @@ async def _fetch_hd_url(post_url: str, thumb_url: str, session: aiohttp.ClientSe
                 return thumb_url
             html = await resp.text()
             # rule34: id="image" src="..."
-            m = re.search(r'id=[\x22\x27]image[\x22\x27][^>]*src=[\x22\x27]([^\x22\x27]+)[\x22\x27]', html)
+            m = re.search(
+                r"id=[\x22\x27]image[\x22\x27][^>]*src=[\x22\x27]([^\x22\x27]+)[\x22\x27]",
+                html,
+            )
             if not m:
-                m = re.search(r'src=[\x22\x27]([^\x22\x27]+)[\x22\x27][^>]*id=[\x22\x27]image[\x22\x27]', html)
+                m = re.search(
+                    r"src=[\x22\x27]([^\x22\x27]+)[\x22\x27][^>]*id=[\x22\x27]image[\x22\x27]",
+                    html,
+                )
             if m:
                 src = m.group(1)
-                if src.startswith('//'): src = 'https:' + src
+                if src.startswith("//"):
+                    src = "https:" + src
                 return src
     except Exception:
         pass
@@ -1219,14 +1592,16 @@ async def _fetch_hd_url(post_url: str, thumb_url: str, session: aiohttp.ClientSe
 async def process_pdfimg_request(event, url: str):
     """عکس‌های صفحه رو دانلود، grid preview میسازه، دو دکمه Send All / Send All HD داره."""
     msg_id = f"{event.chat_id}_{event.id}"
-    if msg_id in processing_messages: return
+    if msg_id in processing_messages:
+        return
     processing_messages.add(msg_id)
     logger.info(f"[PDFIMG] START | chat={event.chat_id} | url={url[:120]}")
-    status = await event.reply("🌐 Loading page...", parse_mode='markdown')
+    status = await event.reply("🌐 Loading page...", parse_mode="markdown")
     tmp_dir = f"/app/output_files/pdfimg_{event.chat_id}_{event.id}"
 
     try:
-        if not url.startswith(('http://', 'https://')): url = 'https://' + url
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
         os.makedirs(tmp_dir, exist_ok=True)
 
         # ---- مرحله 1: استخراج URL عکس‌ها + لینک post اصلی با playwright ----
@@ -1253,26 +1628,26 @@ async def process_pdfimg_request(event, url: str):
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=_browser_args())
             context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 extra_http_headers={
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124"',
-                    'Sec-Ch-Ua-Mobile': '?0',
-                    'Sec-Ch-Ua-Platform': '"Windows"',
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
                 },
                 java_script_enabled=True,
                 bypass_csp=True,
             )
             page = await context.new_page()
-            page.on('dialog', lambda d: asyncio.ensure_future(d.dismiss()))
+            page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
 
             await safe_edit(status, "🌐 Opening page...")
             load_ok = False
-            for wait_mode in ('domcontentloaded', 'commit'):
+            for wait_mode in ("domcontentloaded", "commit"):
                 try:
                     await page.goto(url, wait_until=wait_mode, timeout=45000)
                     load_ok = True
@@ -1282,7 +1657,9 @@ async def process_pdfimg_request(event, url: str):
 
             if not load_ok:
                 await browser.close()
-                await safe_edit(status, "❌ Could not load the page (timeout or blocked).")
+                await safe_edit(
+                    status, "❌ Could not load the page (timeout or blocked)."
+                )
                 return
 
             await page.wait_for_timeout(3000)
@@ -1290,8 +1667,14 @@ async def process_pdfimg_request(event, url: str):
             # Cloudflare challenge detection
             for _cf_attempt in range(6):
                 title = await page.title()
-                if 'just a moment' in title.lower() or 'checking your browser' in title.lower() or 'please wait' in title.lower():
-                    await safe_edit(status, f"⏳ Bypassing protection... ({_cf_attempt+1}/6)")
+                if (
+                    "just a moment" in title.lower()
+                    or "checking your browser" in title.lower()
+                    or "please wait" in title.lower()
+                ):
+                    await safe_edit(
+                        status, f"⏳ Bypassing protection... ({_cf_attempt + 1}/6)"
+                    )
                     await page.wait_for_timeout(5000)
                 else:
                     break
@@ -1309,28 +1692,32 @@ async def process_pdfimg_request(event, url: str):
             await safe_edit(status, "No images found on this page.")
             return
 
-        logger.info(f"[PDFIMG] Found {len(img_data)} images on page | chat={event.chat_id}")
+        logger.info(
+            f"[PDFIMG] Found {len(img_data)} images on page | chat={event.chat_id}"
+        )
         await safe_edit(status, f"Found {len(img_data)} images. Downloading...")
 
         # ---- مرحله 2: دانلود thumbnail ها (JPG/PNG) + ذخیره GIF به همان فرمت ----
         import io as _io
         from PIL import Image as PILImage
 
-        saved = []   # list of {"path": str, "is_gif": bool, "thumb_url": str, "post_url": str|None}
+        saved = []  # list of {"path": str, "is_gif": bool, "thumb_url": str, "post_url": str|None}
         dl_headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Referer': url,
+            "User-Agent": "Mozilla/5.0",
+            "Referer": url,
         }
         connector = aiohttp.TCPConnector(ssl=False, limit=8)
-        async with aiohttp.ClientSession(connector=connector, headers=dl_headers,
-                                         timeout=ClientTimeout(total=20)) as http:
+        async with aiohttp.ClientSession(
+            connector=connector, headers=dl_headers, timeout=ClientTimeout(total=20)
+        ) as http:
             for i, item in enumerate(img_data[:300]):
                 thumb_url = item["thumb"]
                 post_url = item.get("post")
                 orig_url = item.get("orig")
                 try:
                     async with http.get(thumb_url) as resp:
-                        if resp.status != 200: continue
+                        if resp.status != 200:
+                            continue
                         data = await resp.read()
                         ct = resp.content_type or ""
 
@@ -1339,21 +1726,38 @@ async def process_pdfimg_request(event, url: str):
                         if is_gif:
                             # GIF رو همون‌طور ذخیره کن
                             gif_path = f"{tmp_dir}/img_{len(saved):04d}.gif"
-                            async with aiofiles.open(gif_path, 'wb') as f:
+                            async with aiofiles.open(gif_path, "wb") as f:
                                 await f.write(data)
-                            saved.append({"path": gif_path, "is_gif": True,
-                                          "thumb_url": thumb_url, "post_url": post_url, "orig_url": orig_url})
+                            saved.append(
+                                {
+                                    "path": gif_path,
+                                    "is_gif": True,
+                                    "thumb_url": thumb_url,
+                                    "post_url": post_url,
+                                    "orig_url": orig_url,
+                                }
+                            )
                         else:
-                            img = PILImage.open(_io.BytesIO(data)).convert('RGB')
-                            if img.width < 80 or img.height < 80: continue
+                            img = PILImage.open(_io.BytesIO(data)).convert("RGB")
+                            if img.width < 80 or img.height < 80:
+                                continue
                             img_path = f"{tmp_dir}/img_{len(saved):04d}.jpg"
-                            img.save(img_path, 'JPEG', quality=92)
+                            img.save(img_path, "JPEG", quality=92)
                             img.close()
-                            saved.append({"path": img_path, "is_gif": False,
-                                          "thumb_url": thumb_url, "post_url": post_url, "orig_url": orig_url})
+                            saved.append(
+                                {
+                                    "path": img_path,
+                                    "is_gif": False,
+                                    "thumb_url": thumb_url,
+                                    "post_url": post_url,
+                                    "orig_url": orig_url,
+                                }
+                            )
 
                         if len(saved) % 10 == 0:
-                            await safe_edit(status, f"Downloaded {len(saved)} images...")
+                            await safe_edit(
+                                status, f"Downloaded {len(saved)} images..."
+                            )
                 except Exception:
                     continue
 
@@ -1364,10 +1768,10 @@ async def process_pdfimg_request(event, url: str):
         # ---- مرحله 3: ذخیره session و نمایش دکمه‌ها ----
         session_key = f"pdfimg_{event.chat_id}_{event.id}"
         pdfimg_sessions[session_key] = {
-            'items': saved,
-            'tmp_dir': tmp_dir,
-            'chat_id': event.chat_id,
-            'source_url': url,
+            "items": saved,
+            "tmp_dir": tmp_dir,
+            "chat_id": event.chat_id,
+            "source_url": url,
         }
 
         n = len(saved)
@@ -1381,18 +1785,20 @@ async def process_pdfimg_request(event, url: str):
         await event.client.send_message(
             event.chat_id,
             info,
-            parse_mode='markdown',
+            parse_mode="markdown",
             buttons=[
-                [Button.inline(f"📨 Send All ({n})", f"pdfimg_send|{session_key}"),
-                 Button.inline(f"🔷 Send All HD ({n})", f"pdfimg_hd|{session_key}")],
+                [
+                    Button.inline(f"📨 Send All ({n})", f"pdfimg_send|{session_key}"),
+                    Button.inline(f"🔷 Send All HD ({n})", f"pdfimg_hd|{session_key}"),
+                ],
                 [Button.inline("🗑 Delete from server", f"pdfimg_del|{session_key}")],
-            ]
+            ],
         )
 
     except Exception as e:
         logger.error(f"pdfimg error: {e}", exc_info=True)
         err = str(e)
-        if 'connection closed' in err.lower() or 'browser' in err.lower():
+        if "connection closed" in err.lower() or "browser" in err.lower():
             await safe_edit(status, "❌ Browser crashed. Please try again.")
         else:
             await safe_edit(status, f"❌ Error: {err[:200]}")
@@ -1402,13 +1808,15 @@ async def process_pdfimg_request(event, url: str):
 
 async def process_pdf_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
-    if msg_id in processing_messages: return
+    if msg_id in processing_messages:
+        return
     processing_messages.add(msg_id)
     logger.info(f"[PDF] START | chat={event.chat_id} | url={url[:120]}")
-    status = await event.reply("📄 Converting to PDF...", parse_mode='markdown')
+    status = await event.reply("📄 Converting to PDF...", parse_mode="markdown")
     filepath = None
     try:
-        if not url.startswith(('http://', 'https://')): url = 'https://' + url
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
         filepath, error, size = await html_to_pdf(url, status)
         if error:
             await safe_edit(status, f"❌ {error}")
@@ -1416,13 +1824,16 @@ async def process_pdf_request(event, url: str):
         gh_line = ""
         if GITHUB_ENABLED:
             await safe_edit(status, "☁️ Uploading to GitHub...")
-            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, size)
+            gh_url = await maybe_upload_github(
+                event.client, event.chat_id, filepath, size
+            )
             if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
         await event.client.send_file(
-            event.chat_id, filepath,
+            event.chat_id,
+            filepath,
             caption=f"📑 PDF • {human_readable_size(size)}{gh_line}",
-            force_document=True
+            force_document=True,
         )
         await status.delete()
     except Exception as e:
@@ -1430,19 +1841,23 @@ async def process_pdf_request(event, url: str):
     finally:
         processing_messages.discard(msg_id)
         try:
-            if filepath and os.path.exists(filepath): os.remove(filepath)
-        except Exception: pass
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
 
 
 async def process_html_request(event, url: str):
     msg_id = f"{event.chat_id}_{event.id}"
-    if msg_id in processing_messages: return
+    if msg_id in processing_messages:
+        return
     processing_messages.add(msg_id)
     logger.info(f"[HTML] START | chat={event.chat_id} | url={url[:120]}")
-    status = await event.reply("🌐 Capturing full webpage...", parse_mode='markdown')
+    status = await event.reply("🌐 Capturing full webpage...", parse_mode="markdown")
     filepath = None
     try:
-        if not url.startswith(('http://', 'https://')): url = 'https://' + url
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
         filepath, error, size = await capture_mhtml(url, status)
         if error:
             await safe_edit(status, f"❌ {error}")
@@ -1450,12 +1865,15 @@ async def process_html_request(event, url: str):
         gh_line = ""
         if GITHUB_ENABLED:
             await safe_edit(status, "☁️ Uploading to GitHub...")
-            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, size)
+            gh_url = await maybe_upload_github(
+                event.client, event.chat_id, filepath, size
+            )
             if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
         await event.client.send_file(
-            event.chat_id, filepath,
-            caption=f"📦 Complete Webpage Snapshot (MHTML){gh_line}"
+            event.chat_id,
+            filepath,
+            caption=f"📦 Complete Webpage Snapshot (MHTML){gh_line}",
         )
         await status.delete()
     except Exception as e:
@@ -1463,8 +1881,10 @@ async def process_html_request(event, url: str):
     finally:
         processing_messages.discard(msg_id)
         try:
-            if filepath and os.path.exists(filepath): os.remove(filepath)
-        except Exception: pass
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
 
 
 # ====================== TELEGRAM COMMANDS ======================
@@ -1475,55 +1895,69 @@ async def admin_cmd(event):
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
     await event.reply(
         f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\nChoose an action:",
-        parse_mode='markdown',
+        parse_mode="markdown",
         buttons=[
             [Button.inline("➕ Add User", "admin_add")],
             [Button.inline("➖ Remove User", "admin_remove")],
             [Button.inline("🔄 Refresh List", "admin_refresh")],
-        ]
+        ],
     )
 
 
 async def admin_add_callback(event):
-    if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
     admin_pending_add[event.sender_id] = "add"
     await event.answer("", alert=False)
-    await event.client.send_message(event.chat_id, "📩 Send me the **numeric user ID** to add:", parse_mode='markdown',
-        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]])
+    await event.client.send_message(
+        event.chat_id,
+        "📩 Send me the **numeric user ID** to add:",
+        parse_mode="markdown",
+        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]],
+    )
 
 
 async def admin_remove_callback(event):
-    if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
     admin_pending_add[event.sender_id] = "remove"
     await event.answer("", alert=False)
-    await event.client.send_message(event.chat_id, "📩 Send me the **numeric user ID** to remove:", parse_mode='markdown',
-        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]])
+    await event.client.send_message(
+        event.chat_id,
+        "📩 Send me the **numeric user ID** to remove:",
+        parse_mode="markdown",
+        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]],
+    )
 
 
 async def admin_refresh_callback(event):
-    if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
     await event.answer("✅ Refreshed", alert=False)
     try:
         await event.edit(
             f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\nChoose an action:",
-            parse_mode='markdown',
+            parse_mode="markdown",
             buttons=[
                 [Button.inline("➕ Add User", "admin_add")],
                 [Button.inline("➖ Remove User", "admin_remove")],
                 [Button.inline("🔄 Refresh List", "admin_refresh")],
-            ]
+            ],
         )
-    except Exception: pass
+    except Exception:
+        pass
 
 
 async def admin_cancel_callback(event):
-    if event.sender_id != ADMIN_ID: return await event.answer("Unauthorized", alert=True)
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
     admin_pending_add.pop(event.sender_id, None)
     await event.answer("Cancelled", alert=False)
-    try: await event.delete()
-    except Exception: pass
-
+    try:
+        await event.delete()
+    except Exception:
+        pass
 
 
 async def startgithub_cmd(event):
@@ -1540,7 +1974,7 @@ async def startgithub_cmd(event):
         f"🌿 Branch: `{GITHUB_BRANCH}`\n"
         f"📦 Max size: `{GITHUB_MAX_MB}MB`\n\n"
         "From now on, all files sent by the bot will also be uploaded to GitHub with a direct download link.",
-        parse_mode='markdown'
+        parse_mode="markdown",
     )
 
 
@@ -1550,7 +1984,10 @@ async def stopgithub_cmd(event):
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
     GITHUB_ENABLED = False
-    await event.reply("🔴 **GitHub upload DISABLED**\nFiles will no longer be uploaded to GitHub.", parse_mode='markdown')
+    await event.reply(
+        "🔴 **GitHub upload DISABLED**\nFiles will no longer be uploaded to GitHub.",
+        parse_mode="markdown",
+    )
 
 
 async def github_cmd(event):
@@ -1567,7 +2004,7 @@ async def github_cmd(event):
             f"📦 Max file size: `{GITHUB_MAX_MB}MB`\n\n"
             f"• `/startgithub` — enable auto-upload\n"
             f"• `/stopgithub` — disable auto-upload",
-            parse_mode='markdown'
+            parse_mode="markdown",
         )
     else:
         await event.reply(
@@ -1577,8 +2014,9 @@ async def github_cmd(event):
             "`GITHUB_REPO` — e.g. `username/myrepo`\n"
             "`GITHUB_BRANCH` — default: `main`\n"
             "`GITHUB_BASE_DIR` — default: `files`",
-            parse_mode='markdown'
+            parse_mode="markdown",
         )
+
 
 async def start_cmd(event):
     logger.info(f"[CMD] /start from user={event.sender_id}")
@@ -1587,6 +2025,7 @@ async def start_cmd(event):
     await event.reply(
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
+        "• `/snapwc <url>` → Download via SnapWC\n"
         "• `/savep <url>` → Download via SaveTheVideo\n"
         "• `/pdf <url>` → Webpage to PDF\n"
         "• `/html <url>` → Save as MHTML\n"
@@ -1596,23 +2035,31 @@ async def start_cmd(event):
         "• `/stopgithub` → Disable GitHub upload\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
-        parse_mode='markdown'
+        parse_mode="markdown",
     )
 
 
 async def dirpy_command(event):
-    logger.info(f"[CMD] /dirpy from user={event.sender_id} | text={event.raw_text[:100]}")
-    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    logger.info(
+        f"[CMD] /dirpy from user={event.sender_id} | text={event.raw_text[:100]}"
+    )
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2: return await event.reply("❌ Usage: `/dirpy <url>`", parse_mode='markdown')
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/dirpy <url>`", parse_mode="markdown")
     await process_dirpy_request(event, parts[1].strip())
 
 
 async def savep_command(event):
-    logger.info(f"[CMD] /savep from user={event.sender_id} | text={event.raw_text[:100]}")
-    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    logger.info(
+        f"[CMD] /savep from user={event.sender_id} | text={event.raw_text[:100]}"
+    )
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2: return await event.reply("❌ Usage: `/savep <url>`", parse_mode='markdown')
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/savep <url>`", parse_mode="markdown")
     await process_savep_request(
         event=event,
         url=parts[1].strip(),
@@ -1624,21 +2071,26 @@ async def savep_command(event):
 
 async def pdf_command(event):
     logger.info(f"[CMD] /pdf from user={event.sender_id} | text={event.raw_text[:100]}")
-    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2: return await event.reply("❌ Usage: `/pdf <url>`", parse_mode='markdown')
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/pdf <url>`", parse_mode="markdown")
     await process_pdf_request(event, parts[1].strip())
 
 
-
 async def pdfimg_del_callback(event):
-    if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
-    session_key = event.data.decode().split('|', 1)[1]
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized")
+    session_key = event.data.decode().split("|", 1)[1]
     session = pdfimg_sessions.pop(session_key, None)
     if session:
         import shutil
-        try: shutil.rmtree(session['tmp_dir'], ignore_errors=True)
-        except Exception: pass
+
+        try:
+            shutil.rmtree(session["tmp_dir"], ignore_errors=True)
+        except Exception:
+            pass
     await event.edit(buttons=None)
     await event.answer("🗑 Deleted from server.")
 
@@ -1650,36 +2102,39 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
         return await event.answer("❌ Session expired. Run /pdfimg again.", alert=True)
 
     await event.answer("📨 Sending..." if not hd else "🔷 Fetching HD...", alert=False)
-    items = [it for it in session['items'] if os.path.exists(it['path'])]
-    chat_id = session['chat_id']
-    source_url = session.get('source_url', '')
+    items = [it for it in session["items"] if os.path.exists(it["path"])]
+    chat_id = session["chat_id"]
+    source_url = session.get("source_url", "")
     total = len(items)
 
     if total == 0:
         return await event.client.send_message(chat_id, "❌ No images found on server.")
 
     label = "HD" if hd else "normal"
-    status = await event.client.send_message(chat_id, f"📨 Sending {total} files ({label})...")
+    status = await event.client.send_message(
+        chat_id, f"📨 Sending {total} files ({label})..."
+    )
     sent = 0
 
-    dl_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': source_url}
+    dl_headers = {"User-Agent": "Mozilla/5.0", "Referer": source_url}
     connector = aiohttp.TCPConnector(ssl=False, limit=4)
     import io as _io
     from PIL import Image as PILImage
 
-    async with aiohttp.ClientSession(connector=connector, headers=dl_headers,
-                                     timeout=ClientTimeout(total=30)) as http:
+    async with aiohttp.ClientSession(
+        connector=connector, headers=dl_headers, timeout=ClientTimeout(total=30)
+    ) as http:
         for item in items:
             try:
-                send_path = item['path']
+                send_path = item["path"]
 
                 if hd:
                     # پیدا کردن لینک اصلی
-                    hd_url = item.get('orig_url') or item['thumb_url']
+                    hd_url = item.get("orig_url") or item["thumb_url"]
 
                     # اگه post_url داره، برو صفحه پست و عکس اصلی رو بگیر
-                    post_url = item.get('post_url')
-                    if post_url and post_url.startswith('http'):
+                    post_url = item.get("post_url")
+                    if post_url and post_url.startswith("http"):
                         fetched = await _fetch_hd_url(post_url, hd_url, http)
                         if fetched != hd_url:
                             hd_url = fetched
@@ -1689,20 +2144,27 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                         if resp.status == 200:
                             data = await resp.read()
                             ct = resp.content_type or ""
-                            is_gif = ct == "image/gif" or hd_url.lower().endswith(".gif")
+                            is_gif = ct == "image/gif" or hd_url.lower().endswith(
+                                ".gif"
+                            )
                             ext = ".gif" if is_gif else ".jpg"
-                            hd_path = item['path'].replace('.jpg', '_hd' + ext).replace('.gif', '_hd' + ext)
+                            hd_path = (
+                                item["path"]
+                                .replace(".jpg", "_hd" + ext)
+                                .replace(".gif", "_hd" + ext)
+                            )
                             if not is_gif:
                                 # convert به JPEG
-                                img = PILImage.open(_io.BytesIO(data)).convert('RGB')
-                                img.save(hd_path, 'JPEG', quality=97)
+                                img = PILImage.open(_io.BytesIO(data)).convert("RGB")
+                                img.save(hd_path, "JPEG", quality=97)
                             else:
-                                async with aiofiles.open(hd_path, 'wb') as f:
+                                async with aiofiles.open(hd_path, "wb") as f:
                                     await f.write(data)
                             send_path = hd_path
 
                 await event.client.send_file(
-                    chat_id, send_path,
+                    chat_id,
+                    send_path,
                     force_document=False,
                 )
                 sent += 1
@@ -1711,95 +2173,141 @@ async def _do_send_pdfimg(event, session_key: str, hd: bool):
                 if GITHUB_ENABLED:
                     try:
                         img_size = os.path.getsize(send_path)
-                        gh_url = await maybe_upload_github(event.client, chat_id, send_path, img_size)
+                        gh_url = await maybe_upload_github(
+                            event.client, chat_id, send_path, img_size
+                        )
                         if gh_url:
-                            await event.client.send_message(chat_id, f"☁️ [GitHub DL]({gh_url})", parse_mode='markdown')
+                            await event.client.send_message(
+                                chat_id,
+                                f"☁️ [GitHub DL]({gh_url})",
+                                parse_mode="markdown",
+                            )
                     except Exception:
                         pass
 
                 if sent % 5 == 0 or sent == total:
-                    try: await status.edit(f"📨 Sending... {sent}/{total}")
-                    except Exception: pass
+                    try:
+                        await status.edit(f"📨 Sending... {sent}/{total}")
+                    except Exception:
+                        pass
 
                 # پاک کردن HD temp
-                if hd and send_path != item['path'] and os.path.exists(send_path):
-                    try: os.remove(send_path)
-                    except Exception: pass
+                if hd and send_path != item["path"] and os.path.exists(send_path):
+                    try:
+                        os.remove(send_path)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.warning(f"pdfimg send error: {e}")
-                try: await status.edit(f"⚠️ Error on {sent+1}: {str(e)[:60]}")
-                except Exception: pass
+                try:
+                    await status.edit(f"⚠️ Error on {sent + 1}: {str(e)[:60]}")
+                except Exception:
+                    pass
 
     # cleanup
     import shutil
+
     pdfimg_sessions.pop(session_key, None)
-    try: shutil.rmtree(session['tmp_dir'], ignore_errors=True)
-    except Exception: pass
-    try: await event.edit(buttons=None)
-    except Exception: pass
-    try: await status.edit(f"✅ Sent {sent}/{total} files!")
-    except Exception: pass
+    try:
+        shutil.rmtree(session["tmp_dir"], ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        await event.edit(buttons=None)
+    except Exception:
+        pass
+    try:
+        await status.edit(f"✅ Sent {sent}/{total} files!")
+    except Exception:
+        pass
 
 
 async def pdfimg_send_callback(event):
-    if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
-    session_key = event.data.decode().split('|', 1)[1]
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized")
+    session_key = event.data.decode().split("|", 1)[1]
     await _do_send_pdfimg(event, session_key, hd=False)
 
 
 async def pdfimg_hd_callback(event):
-    if event.sender_id not in AUTHORIZED_USERS: return await event.answer("⛔ Unauthorized")
-    session_key = event.data.decode().split('|', 1)[1]
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized")
+    session_key = event.data.decode().split("|", 1)[1]
     await _do_send_pdfimg(event, session_key, hd=True)
 
+
 async def pdfimg_command(event):
-    logger.info(f"[CMD] /pdfimg from user={event.sender_id} | text={event.raw_text[:100]}")
-    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    logger.info(
+        f"[CMD] /pdfimg from user={event.sender_id} | text={event.raw_text[:100]}"
+    )
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2: return await event.reply("❌ Usage: `/pdfimg <url>`", parse_mode='markdown')
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/pdfimg <url>`", parse_mode="markdown")
     await process_pdfimg_request(event, parts[1].strip())
 
 
 async def html_command(event):
-    logger.info(f"[CMD] /html from user={event.sender_id} | text={event.raw_text[:100]}")
-    if event.sender_id not in AUTHORIZED_USERS: return await event.reply("⛔ Unauthorized")
+    logger.info(
+        f"[CMD] /html from user={event.sender_id} | text={event.raw_text[:100]}"
+    )
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
     parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2: return await event.reply("❌ Usage: `/html <url>`", parse_mode='markdown')
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/html <url>`", parse_mode="markdown")
     await process_html_request(event, parts[1].strip())
 
 
 async def generic_url_handler(event):
-    if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith('/'):
+    if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith("/"):
         return
-    if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_compression_size":
+    if (
+        event.chat_id in user_state
+        and user_state[event.chat_id].get("action") == "wait_for_compression_size"
+    ):
         return
     urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
     if not urls:
         return
     target_url = urls[0]
-    logger.info(f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}")
+    logger.info(
+        f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}"
+    )
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading...")
 
-    filepath, error, size = await download_with_controls(target_url, status_msg, dl_id, referer=target_url)
+    filepath, error, size = await download_with_controls(
+        target_url, status_msg, dl_id, referer=target_url
+    )
 
     # FIX: 403 → auto-dirpy
     if error == "HTTP_403":
         await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
         await process_dirpy_request(event, target_url)
-        try: await status_msg.delete()
-        except Exception: pass
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
         return
 
     if error or not filepath:
         if error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ {error or 'Failed'}")
         return
+    vid_duration, vw, vh = await get_video_info(filepath)
+    if vid_duration is None or vid_duration <= 0:
+        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+        return
     await safe_edit(status_msg, "📤 Uploading...")
     try:
-        vid_duration, _, _ = await get_video_info(filepath)
         dur_str = ""
         if vid_duration and vid_duration > 0:
             mins, secs = divmod(int(vid_duration), 60)
@@ -1811,22 +2319,30 @@ async def generic_url_handler(event):
         gh_line = ""
         if GITHUB_ENABLED:
             await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-            gh_url = await maybe_upload_github(event.client, event.chat_id, filepath, size)
+            gh_url = await maybe_upload_github(
+                event.client, event.chat_id, filepath, size
+            )
             if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
             await safe_edit(status_msg, "📤 Uploading...")
         await send_file_with_progress(
-            client=event.client, chat_id=event.chat_id, filepath=filepath,
-            caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}", status_msg=status_msg,
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=filepath,
+            caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
+            status_msg=status_msg,
         )
     except Exception as e:
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
         return
-    try: os.remove(filepath)
-    except Exception: pass
+    try:
+        os.remove(filepath)
+    except Exception:
+        pass
 
 
 # ====================== VIDEO RECEIVE → GITHUB OFFER ======================
+
 
 async def video_receive_handler(event):
     """وقتی کاربر ویدیو میفرسته و GITHUB_ENABLED فعاله، یه دکمه پیشنهاد آپلود به گیتهاب میده."""
@@ -1839,10 +2355,10 @@ async def video_receive_handler(event):
     if not media:
         return
     # بررسی mime type
-    mime = getattr(media, 'mime_type', '') or ''
-    if not mime.startswith('video/') and not (event.video):
+    mime = getattr(media, "mime_type", "") or ""
+    if not mime.startswith("video/") and not (event.video):
         return
-    file_size = getattr(media, 'size', 0) or 0
+    file_size = getattr(media, "size", 0) or 0
     if file_size == 0 or file_size > GITHUB_MAX_MB * 1024 * 1024:
         return  # بزرگتر از حد مجاز — نادیده بگیر
 
@@ -1858,11 +2374,13 @@ async def video_receive_handler(event):
         f"☁️ **GitHub Upload**\n"
         f"📦 Size: {size_str}\n\n"
         f"Do you want to upload this video to GitHub and get a direct download link?",
-        parse_mode='markdown',
+        parse_mode="markdown",
         buttons=[
-            [Button.inline("✅ Yes, upload to GitHub", f"vgh_yes_{pending_id}"),
-             Button.inline("❌ No", f"vgh_no_{pending_id}")]
-        ]
+            [
+                Button.inline("✅ Yes, upload to GitHub", f"vgh_yes_{pending_id}"),
+                Button.inline("❌ No", f"vgh_no_{pending_id}"),
+            ]
+        ],
     )
 
 
@@ -1876,10 +2394,7 @@ async def vgh_yes_callback(event):
 
     await event.answer("⏳ Downloading and uploading...", alert=False)
     try:
-        await event.edit(
-            "⏳ Downloading video from Telegram...",
-            buttons=None
-        )
+        await event.edit("⏳ Downloading video from Telegram...", buttons=None)
     except Exception:
         pass
 
@@ -1905,8 +2420,11 @@ async def vgh_yes_callback(event):
     actual_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
     size_mb = actual_size / (1024 * 1024)
     from github import CONTENT_API_MAX_MB as _CMAX
+
     if size_mb > _CMAX:
-        upload_note = f"📦 {size_mb:.1f} MB — using Releases API (may take a few minutes)..."
+        upload_note = (
+            f"📦 {size_mb:.1f} MB — using Releases API (may take a few minutes)..."
+        )
     else:
         upload_note = f"📦 {size_mb:.1f} MB — uploading..."
     try:
@@ -1927,8 +2445,8 @@ async def vgh_yes_callback(event):
                 f"✅ **Uploaded to GitHub!**\n\n"
                 f"🔗 [Direct Download Link]({gh_url})\n"
                 f"`{gh_url}`",
-                parse_mode='markdown',
-                buttons=None
+                parse_mode="markdown",
+                buttons=None,
             )
         except Exception:
             pass
@@ -1951,9 +2469,211 @@ async def vgh_no_callback(event):
         pass
 
 
+# ====================== SNAPWC HANDLERS ======================
+
+
+async def snapwc_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/snapwc <url>`", parse_mode="markdown")
+
+    url = parts[1].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    status_msg = await event.reply("🔄 Starting SnapWC session...")
+    logger.info(f"[SNAPWC] START | chat={event.chat_id} | url={url[:120]}")
+
+    session = SnapWCSession()
+    try:
+        result = await session.run_full_flow(url)
+
+        if not result["success"]:
+            await safe_edit(
+                status_msg, f"❌ SnapWC error: {result.get('error', 'Unknown')}"
+            )
+            await session.close_browser()
+            return
+
+        qualities = result.get("qualities", [])
+        if not qualities:
+            await safe_edit(status_msg, "❌ No quality options found.")
+            await session.close_browser()
+            return
+
+        session_id = f"snapwc_{event.chat_id}_{event.id}_{int(time.time())}"
+        snapwc_sessions[session_id] = session
+        user_state[event.chat_id] = {
+            "action": "snapwc_quality",
+            "session_id": session_id,
+            "video_url": url,
+        }
+
+        buttons = []
+        for q in qualities:
+            label = f"[{q['category']}] {q['label']}"
+            if q.get("size"):
+                label += f" ({q['size']})"
+            buttons.append(
+                [Button.inline(label, f"snapwc_q_{session_id}_{q['index']}")]
+            )
+
+        buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")])
+
+        await safe_edit(
+            status_msg,
+            f"🎬 **SnapWC — Select Quality**\n\nFound **{len(qualities)}** options:",
+            buttons=buttons,
+        )
+
+    except Exception as e:
+        logger.error(f"[SNAPWC] Command error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ Error: {str(e)[:120]}")
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+
+
+async def snapwc_select_callback(event):
+    data = event.data.decode()
+    prefix_removed = data.replace("snapwc_q_", "")
+    session_id = prefix_removed.rsplit("_", 1)[0]
+    index = int(prefix_removed.rsplit("_", 1)[1])
+
+    if session_id not in snapwc_sessions:
+        return await event.answer("❌ Session expired. Run /snapwc again.", alert=True)
+
+    session = snapwc_sessions[session_id]
+    await event.answer("⏳ Processing...", alert=False)
+
+    try:
+        result = await session.continue_with_quality(index)
+
+        if result.get("captcha"):
+            captcha_b64 = result["captcha_image"]
+            if "," in captcha_b64:
+                raw_b64 = captcha_b64.split(",", 1)[1]
+            else:
+                raw_b64 = captcha_b64
+            captcha_data = base64.b64decode(raw_b64)
+
+            captcha_path = os.path.join(OUTPUT_FOLDER, f"captcha_{session_id}.png")
+            async with aiofiles.open(captcha_path, "wb") as f:
+                await f.write(captcha_data)
+
+            await event.client.send_file(
+                event.chat_id,
+                captcha_path,
+                caption="🔐 **Captcha detected!**\nPlease enter the code from the image.",
+                buttons=[Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")],
+            )
+
+            try:
+                os.remove(captcha_path)
+            except Exception:
+                pass
+
+            user_state[event.chat_id] = {
+                "action": "snapwc_captcha",
+                "session_id": session_id,
+                "selected_index": index,
+                "video_url": user_state.get(event.chat_id, {}).get("video_url", ""),
+            }
+
+            await safe_edit(event, "🔐 Captcha required — check the image sent above.")
+            return
+
+        if result["success"]:
+            download_url = result["download_url"]
+            title = result.get("title", "")
+
+            await safe_edit(event, "✅ Got download link! Downloading...")
+
+            video_url = user_state.get(event.chat_id, {}).get("video_url", "")
+            await do_download_and_send(
+                event, event.message, download_url, video_url, title=title
+            )
+
+            snapwc_sessions.pop(session_id, None)
+            user_state.pop(event.chat_id, None)
+        else:
+            await safe_edit(event, f"❌ Error: {result.get('error', 'Unknown')}")
+            snapwc_sessions.pop(session_id, None)
+            user_state.pop(event.chat_id, None)
+
+    except Exception as e:
+        logger.error(f"[SNAPWC] Select callback error: {e}", exc_info=True)
+        await safe_edit(event, f"❌ Error: {str(e)[:120]}")
+        snapwc_sessions.pop(session_id, None)
+        user_state.pop(event.chat_id, None)
+
+
+async def snapwc_captcha_handler(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return
+    state = user_state.get(event.chat_id)
+    if not state or state.get("action") != "snapwc_captcha":
+        return
+
+    session_id = state.get("session_id", "")
+    index = state.get("selected_index", 0)
+    code = event.raw_text.strip()
+
+    if session_id not in snapwc_sessions:
+        await event.reply("❌ Session expired. Please run /snapwc again.")
+        user_state.pop(event.chat_id, None)
+        raise events.StopPropagation
+
+    session = snapwc_sessions[session_id]
+    status_msg = await event.reply("⏳ Submitting captcha...")
+
+    try:
+        result = await session.continue_after_captcha(code, index)
+
+        if result["success"]:
+            download_url = result["download_url"]
+            title = result.get("title", "")
+
+            await safe_edit(status_msg, "✅ Captcha solved! Starting download...")
+            video_url = state.get("video_url", "")
+            await do_download_and_send(
+                event, status_msg, download_url, video_url, title=title
+            )
+        else:
+            await safe_edit(status_msg, f"❌ {result.get('error', 'Captcha failed')}")
+    except Exception as e:
+        logger.error(f"[SNAPWC] Captcha error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ Error: {str(e)[:120]}")
+    finally:
+        snapwc_sessions.pop(session_id, None)
+        user_state.pop(event.chat_id, None)
+
+    raise events.StopPropagation
+
+
+async def snapwc_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("snapwc_cancel_", "")
+    if session_id in snapwc_sessions:
+        session = snapwc_sessions.pop(session_id)
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+    user_state.pop(event.chat_id, None)
+    await event.answer("❌ Cancelled", alert=False)
+    try:
+        await event.edit("❌ SnapWC session cancelled.", buttons=None)
+    except Exception:
+        pass
+
+
 # ====================== MAIN ======================
 async def main():
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🚀 ULTIMATE BOT v5")
     print("   FIX 1: 403 → auto-retry via Dirpy")
     print("   FIX 2: FFmpeg -noautorotate + yuv420p")
@@ -1961,12 +2681,14 @@ async def main():
     print("   FIX 4: pause/resume split callbacks")
     print("   FIX 5: command pattern conflict resolved")
     print("   FIX 6: detailed logging enabled")
-    print("="*60)
+    print("=" * 60)
     logger.info("[BOOT] Starting bot...")
 
     start_keep_alive()
     client = TelegramClient(
-        'ultimate_bot_session', API_ID, API_HASH,
+        "ultimate_bot_session",
+        API_ID,
+        API_HASH,
         connection_retries=5,
     )
     for attempt in range(5):
@@ -1975,58 +2697,127 @@ async def main():
             break
         except FloodWaitError as e:
             wait = e.seconds + 5
-            logger.warning(f"[BOOT] FloodWait — waiting {wait}s before retry (attempt {attempt+1}/5)")
+            logger.warning(
+                f"[BOOT] FloodWait — waiting {wait}s before retry (attempt {attempt + 1}/5)"
+            )
             await asyncio.sleep(wait)
     else:
         logger.critical("[BOOT] Could not connect after 5 FloodWait retries. Exiting.")
         return
 
     # ===== CallbackQuery handlers =====
-    client.add_event_handler(dl_pause_callback,   events.CallbackQuery(pattern=r"dlpause_(.+)"))
-    client.add_event_handler(dl_resume_callback,  events.CallbackQuery(pattern=r"dlresume_(.+)"))
-    client.add_event_handler(dl_cancel_callback,  events.CallbackQuery(pattern=r"dlcancel_(.+)"))
-    client.add_event_handler(compress_callback,   events.CallbackQuery(pattern=r"compress_(.+)"))
-    client.add_event_handler(check_callback,      events.CallbackQuery(pattern=r"check_(.+)"))
-    client.add_event_handler(pickurl_callback,    events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$"))
-    client.add_event_handler(admin_add_callback,  events.CallbackQuery(pattern=r"admin_add"))
-    client.add_event_handler(admin_remove_callback, events.CallbackQuery(pattern=r"admin_remove"))
-    client.add_event_handler(admin_refresh_callback, events.CallbackQuery(pattern=r"admin_refresh"))
-    client.add_event_handler(admin_cancel_callback, events.CallbackQuery(pattern=r"admin_cancel"))
-    client.add_event_handler(pdfimg_del_callback, events.CallbackQuery(pattern=rb'pdfimg_del\|'))
-    client.add_event_handler(pdfimg_send_callback, events.CallbackQuery(pattern=rb'pdfimg_send\|'))
-    client.add_event_handler(pdfimg_hd_callback,  events.CallbackQuery(pattern=rb'pdfimg_hd\|'))
-    client.add_event_handler(vgh_yes_callback,    events.CallbackQuery(pattern=r"vgh_yes_(.+)"))
-    client.add_event_handler(vgh_no_callback,     events.CallbackQuery(pattern=r"vgh_no_(.+)"))
+    client.add_event_handler(
+        dl_pause_callback, events.CallbackQuery(pattern=r"dlpause_(.+)")
+    )
+    client.add_event_handler(
+        dl_resume_callback, events.CallbackQuery(pattern=r"dlresume_(.+)")
+    )
+    client.add_event_handler(
+        dl_cancel_callback, events.CallbackQuery(pattern=r"dlcancel_(.+)")
+    )
+    client.add_event_handler(
+        compress_callback, events.CallbackQuery(pattern=r"compress_(.+)")
+    )
+    client.add_event_handler(
+        check_callback, events.CallbackQuery(pattern=r"check_(.+)")
+    )
+    client.add_event_handler(
+        pickurl_callback, events.CallbackQuery(pattern=r"pickurl_(.+)_(\d+)$")
+    )
+    client.add_event_handler(
+        admin_add_callback, events.CallbackQuery(pattern=r"admin_add")
+    )
+    client.add_event_handler(
+        admin_remove_callback, events.CallbackQuery(pattern=r"admin_remove")
+    )
+    client.add_event_handler(
+        admin_refresh_callback, events.CallbackQuery(pattern=r"admin_refresh")
+    )
+    client.add_event_handler(
+        admin_cancel_callback, events.CallbackQuery(pattern=r"admin_cancel")
+    )
+    client.add_event_handler(
+        pdfimg_del_callback, events.CallbackQuery(pattern=rb"pdfimg_del\|")
+    )
+    client.add_event_handler(
+        pdfimg_send_callback, events.CallbackQuery(pattern=rb"pdfimg_send\|")
+    )
+    client.add_event_handler(
+        pdfimg_hd_callback, events.CallbackQuery(pattern=rb"pdfimg_hd\|")
+    )
+    client.add_event_handler(
+        vgh_yes_callback, events.CallbackQuery(pattern=r"vgh_yes_(.+)")
+    )
+    client.add_event_handler(
+        vgh_no_callback, events.CallbackQuery(pattern=r"vgh_no_(.+)")
+    )
+    client.add_event_handler(
+        snapwc_select_callback, events.CallbackQuery(pattern=r"snapwc_q_(.+)")
+    )
+    client.add_event_handler(
+        snapwc_cancel_callback, events.CallbackQuery(pattern=r"snapwc_cancel_(.+)")
+    )
 
     # ===== Command handlers =====
-    client.add_event_handler(start_cmd,      events.NewMessage(pattern=r'^/start(\s|$)',       incoming=True))
-    client.add_event_handler(startgithub_cmd, events.NewMessage(pattern=r'^/startgithub(\s|$)', incoming=True))
-    client.add_event_handler(stopgithub_cmd,  events.NewMessage(pattern=r'^/stopgithub(\s|$)',  incoming=True))
-    client.add_event_handler(github_cmd,      events.NewMessage(pattern=r'^/github(\s|$)',      incoming=True))
-    client.add_event_handler(admin_cmd,       events.NewMessage(pattern=r'^/admin(\s|$)',       incoming=True))
-    client.add_event_handler(dirpy_command,   events.NewMessage(pattern=r'^/dirpy(\s|$)',       incoming=True))
-    client.add_event_handler(savep_command,   events.NewMessage(pattern=r'^/savep(\s|$)',       incoming=True))
-    client.add_event_handler(pdf_command,     events.NewMessage(pattern=r'^/pdf(\s|$)',         incoming=True))
-    client.add_event_handler(pdfimg_command,  events.NewMessage(pattern=r'^/pdfimg(\s|$)',      incoming=True))
-    client.add_event_handler(html_command,    events.NewMessage(pattern=r'^/html(\s|$)',        incoming=True))
+    client.add_event_handler(
+        start_cmd, events.NewMessage(pattern=r"^/start(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        startgithub_cmd,
+        events.NewMessage(pattern=r"^/startgithub(\s|$)", incoming=True),
+    )
+    client.add_event_handler(
+        stopgithub_cmd, events.NewMessage(pattern=r"^/stopgithub(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        github_cmd, events.NewMessage(pattern=r"^/github(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        admin_cmd, events.NewMessage(pattern=r"^/admin(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        dirpy_command, events.NewMessage(pattern=r"^/dirpy(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        snapwc_command, events.NewMessage(pattern=r"^/snapwc(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        savep_command, events.NewMessage(pattern=r"^/savep(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        pdf_command, events.NewMessage(pattern=r"^/pdf(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        pdfimg_command, events.NewMessage(pattern=r"^/pdfimg(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        html_command, events.NewMessage(pattern=r"^/html(\s|$)", incoming=True)
+    )
 
     # ===== Message handlers (order matters - specific before generic) =====
     client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
-    client.add_event_handler(size_input_handler,  events.NewMessage(incoming=True))
-    client.add_event_handler(video_receive_handler, events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)))
+    client.add_event_handler(size_input_handler, events.NewMessage(incoming=True))
+    client.add_event_handler(
+        video_receive_handler,
+        events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)),
+    )
+    client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
 
     me = await client.get_me()
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
-    logger.info(f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO if github_configured() else 'not configured'}")
+    logger.info(
+        f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO if github_configured() else 'not configured'}"
+    )
     print(f"✅ Bot is online → @{me.username}")
     await client.run_until_disconnected()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         import uvloop
+
         uvloop.run(main())
     except ImportError:
         asyncio.run(main())

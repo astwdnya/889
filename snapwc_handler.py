@@ -1,0 +1,578 @@
+import asyncio
+import re
+import os
+import sys
+import time
+import random
+import base64
+from playwright.async_api import async_playwright
+
+URL_PATTERN = re.compile(r"https?://[^\s/$.?#].[^\s]*", re.IGNORECASE)
+
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5].map(() => ({ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' })),
+});
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } } };
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+"""
+
+
+class SnapWCSession:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.qualities = []
+        self.title_text = ""
+        self.download_url = ""
+        self.captcha_image_b64 = ""
+        self.waiting_for_captcha = False
+        self.done = False
+        self.error = ""
+
+    async def start_browser(self):
+        self.playwright = await async_playwright().__aenter__()
+        user_agent = random.choice(
+            [
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ]
+        )
+        self.browser = await self.playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-quic",
+                "--disable-setuid-sandbox",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-infobars",
+                "--disable-popup-blocking",
+                "--mute-audio",
+            ],
+        )
+        self.context = await self.browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            device_scale_factor=1.0,
+            user_agent=user_agent,
+            locale="en-US",
+            timezone_id="America/New_York",
+            permissions=["clipboard-read", "clipboard-write"],
+            color_scheme="light",
+        )
+        try:
+            await self.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        except Exception:
+            pass
+
+        self.page = await self.context.new_page()
+        await self.page.add_init_script(STEALTH_JS)
+
+    async def close_browser(self):
+        try:
+            if self.browser:
+                await self.browser.close()
+        except Exception:
+            pass
+        try:
+            if self.playwright:
+                await self.playwright.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    async def navigate(self):
+        for retry in range(3):
+            try:
+                await self.page.goto(
+                    "https://snapwc.com/sites", wait_until="load", timeout=60000
+                )
+                return
+            except Exception as e:
+                if retry < 2:
+                    await asyncio.sleep(3)
+                else:
+                    raise e
+
+    async def paste_url(self, video_url: str):
+        await self.page.wait_for_selector(
+            'input[name="video-url-input"]', timeout=15000
+        )
+        el = self.page.locator('input[name="video-url-input"]')
+        await el.click()
+        await el.fill("")
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+        for char in video_url:
+            await el.type(char, delay=random.randint(30, 80))
+
+    async def click_get_links(self):
+        await self.page.locator('span.block:text("Get Download Links")').first.click(
+            timeout=10000
+        )
+
+    async def wait_for_conversion(self):
+        progress_selector = "div.text-center.text-caption.text-grey"
+        last_progress = ""
+        for _ in range(180):
+            try:
+                el = await self.page.query_selector(progress_selector)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text and text != last_progress:
+                        last_progress = text
+                    if text.rstrip("%") == "100":
+                        return
+                test_q = await self.page.query_selector_all("div.q-item__label")
+                for q_el in test_q:
+                    t = (await q_el.inner_text()).strip()
+                    if t and (re.search(r"\d{3,4}p", t) or "mp4" in t.lower()):
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    async def parse_qualities(self):
+        self.qualities = []
+        for _ in range(120):
+            all_labels = await self.page.query_selector_all("div.q-item__label")
+            found = []
+            for el in all_labels:
+                t = (await el.inner_text()).strip()
+                if not t:
+                    continue
+                is_q = (
+                    bool(re.search(r"\d{3,4}p", t))
+                    or "mp4" in t.lower()
+                    or "m4a" in t.lower()
+                    or ("kbps" in t.lower() and re.search(r"\d+", t))
+                    or "webm" in t.lower()
+                )
+                if not is_q:
+                    continue
+                if any(q["label"] == t for q in found):
+                    continue
+
+                cat = "Video"
+                try:
+                    cat_js = await el.evaluate(r"""el => {
+                        let sib = el.previousElementSibling;
+                        for (let i = 0; i < 20; i++) {
+                            if (!sib) {
+                                let p = el.parentElement;
+                                for (let j = 0; j < 10; j++) {
+                                    if (!p) break;
+                                    sib = p.previousElementSibling;
+                                    if (sib && sib.classList.contains('text-subtitle1')) break;
+                                    p = p.parentElement;
+                                }
+                                if (!sib) break;
+                            }
+                            if (sib.classList.contains('text-subtitle1')) {
+                                const iconEl = sib.querySelector('i');
+                                const icon = iconEl ? iconEl.textContent.trim() : '';
+                                if (icon === 'volume_off') return 'No Sound';
+                                if (icon === 'audiotrack') return 'Audio';
+                                return 'Video';
+                            }
+                            sib = sib.previousElementSibling;
+                        }
+                        return 'Video';
+                    }""")
+                    cat = cat_js if cat_js else "Video"
+                except Exception:
+                    pass
+
+                size = ""
+                try:
+                    size_el = await el.evaluate_handle(r"""el => {
+                        let sib = el.nextElementSibling;
+                        if (sib && sib.classList.contains('q-item__label--caption')) return sib;
+                        let parent = el.parentElement;
+                        if (parent) {
+                            const cap = parent.querySelector('.q-item__label--caption');
+                            if (cap) return cap;
+                        }
+                        return null;
+                    }""")
+                    if size_el:
+                        size_elem = size_el.as_element()
+                        if size_elem:
+                            size = (await size_elem.inner_text()).strip()
+                except Exception:
+                    pass
+
+                found.append({"label": t, "el": el, "category": cat, "size": size})
+
+            if found:
+                self.qualities = found
+                return
+            await asyncio.sleep(1)
+
+        raise Exception("No quality options found")
+
+    async def select_and_click_download(self, index: int):
+        if index < 0 or index >= len(self.qualities):
+            raise ValueError(f"Invalid quality index: {index}")
+
+        target = self.qualities[index]
+
+        async with self.page.context.expect_page(timeout=10000) as popup_info:
+            dl_handle = await target["el"].evaluate_handle("""el => {
+                let parent = el.parentElement;
+                const findIcon = (p) => {
+                    const icons = p.querySelectorAll('i.q-icon');
+                    for (const ic of icons) {
+                        if (ic.textContent.trim() === 'file_download') return ic;
+                    }
+                    return null;
+                };
+                let icon = findIcon(el.parentElement || el);
+                if (icon) return icon;
+                for (let i = 0; i < 10; i++) {
+                    if (!parent) break;
+                    icon = findIcon(parent);
+                    if (icon) return icon;
+                    parent = parent.parentElement;
+                }
+                return null;
+            }""")
+            dl_elem = dl_handle.as_element() if dl_handle else None
+            if dl_elem:
+                box = await dl_elem.bounding_box()
+                if box:
+                    await self.page.mouse.click(
+                        box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                    )
+                else:
+                    await dl_elem.click()
+            else:
+                await target["el"].click()
+
+        try:
+            popup = await popup_info.value
+            await popup.wait_for_load_state("load", timeout=15000)
+            popup_url = popup.url
+            if "offer-support" in popup_url or "supportsnapwc" in popup_url:
+                await popup.close()
+                self.current_page = self.page
+            else:
+                self.current_page = popup
+        except Exception:
+            self.current_page = self.page
+
+    def check_captcha(self) -> bool:
+        return self.waiting_for_captcha
+
+    async def handle_captcha_auto(self) -> bool:
+        """Look for captcha, if found extract image b64, return True if captcha present."""
+        try:
+            captcha_div = await self.page.query_selector(
+                'div.text-h6.text-center.q-mb-md:text("Security Check")'
+            )
+            if not captcha_div:
+                return False
+            img = await self.page.query_selector("img.q-img__image")
+            if img:
+                src = await img.get_attribute("src")
+                if src and src.startswith("data:image"):
+                    self.captcha_image_b64 = src
+                    self.waiting_for_captcha = True
+                    return True
+        except Exception:
+            pass
+        return False
+
+    async def submit_captcha(self, code: str) -> bool:
+        try:
+            inp = self.page.locator('input[placeholder*="Enter the code"]')
+            await inp.fill(code)
+            await asyncio.sleep(0.5)
+            await self.page.locator('span.block:text("Confirm")').first.click()
+            await asyncio.sleep(2)
+            self.waiting_for_captcha = False
+            self.captcha_image_b64 = ""
+            return True
+        except Exception:
+            return False
+
+    async def wait_for_dialog(self):
+        for _ in range(60):
+            try:
+                title_el = await (self.current_page or self.page).query_selector(
+                    'div.iframe-dialog-title, div[class*="dialog-title"]'
+                )
+                if title_el:
+                    self.title_text = (await title_el.inner_text()).strip()
+                    if self.title_text:
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+    async def click_copy_link(self):
+        current = getattr(self, "current_page", self.page)
+        for attempt in range(40):
+            try:
+                btn = current.locator('button:has-text("Copy Download Link")').first
+                await btn.click(timeout=2000)
+                await asyncio.sleep(0.3)
+                return True
+            except Exception:
+                pass
+            try:
+                btn = current.locator('span.block:has-text("Copy Download Link")').first
+                await btn.click(timeout=2000)
+                await asyncio.sleep(0.3)
+                return True
+            except Exception:
+                pass
+            try:
+                all_spans = await current.query_selector_all("span.block")
+                for sp in all_spans:
+                    txt = (await sp.inner_text()).strip()
+                    if txt == "Copy Download Link":
+                        box = await sp.bounding_box()
+                        if box:
+                            await current.mouse.click(
+                                box["x"] + box["width"] / 2,
+                                box["y"] + box["height"] / 2,
+                            )
+                            return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
+    async def get_download_url(self) -> str:
+        current = getattr(self, "current_page", self.page)
+        for attempt in range(60):
+            # clipboard
+            try:
+                text = await current.evaluate("""async () => {
+                    try { const t = await navigator.clipboard.readText(); if (t && t.startsWith('http')) return t; } catch(e) {}
+                    return '';
+                }""")
+                if text and text.startswith("http"):
+                    self.download_url = text
+                    return text
+            except Exception:
+                pass
+
+            # scan DOM for /get? URLs
+            try:
+                url = await current.evaluate("""() => {
+                    const a = document.querySelector('a[href*="/get?"]');
+                    if (a) return a.href;
+                    const inp = document.querySelector('input[value*="/get?"]');
+                    if (inp) return inp.value;
+                    return null;
+                }""")
+                if url:
+                    self.download_url = url
+                    return url
+            except Exception:
+                pass
+
+            # scan all elements text
+            try:
+                body = await current.inner_text("body")
+                for match in re.finditer(r'https?://[^\s"\']+/get\?[^\s"\']+', body):
+                    self.download_url = match.group(0)
+                    return match.group(0)
+            except Exception:
+                pass
+
+            # clipboard via hidden input
+            try:
+                url = await current.evaluate("""async () => {
+                    try {
+                        const inp = document.createElement('input');
+                        inp.style.position = 'fixed'; inp.style.left = '-9999px';
+                        document.body.appendChild(inp);
+                        inp.focus();
+                        const t = await navigator.clipboard.readText();
+                        inp.value = t;
+                        inp.remove();
+                        if (t.startsWith('http')) return t;
+                    } catch(e) {}
+                    return '';
+                }""")
+                if url and url.startswith("http"):
+                    self.download_url = url
+                    return url
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.5)
+        return ""
+
+    async def run_full_flow(self, video_url: str) -> dict:
+        """Returns dict with: success, qualities, download_url, title, captcha, error"""
+        try:
+            await self.start_browser()
+            await self.navigate()
+            await self.paste_url(video_url)
+            await self.click_get_links()
+            await self.wait_for_conversion()
+            await self.parse_qualities()
+
+            return {
+                "success": True,
+                "qualities": [
+                    {
+                        "index": i,
+                        "label": q["label"],
+                        "category": q["category"],
+                        "size": q.get("size", ""),
+                    }
+                    for i, q in enumerate(self.qualities)
+                ],
+                "session": self,
+            }
+        except Exception as e:
+            await self.close_browser()
+            return {"success": False, "error": str(e), "session": self}
+
+    async def continue_with_quality(self, index: int) -> dict:
+        """After user selects quality: click download -> handle captcha -> get URL"""
+        try:
+            await self.select_and_click_download(index)
+
+            captcha = await self.handle_captcha_auto()
+            if captcha:
+                return {
+                    "success": True,
+                    "captcha": True,
+                    "captcha_image": self.captcha_image_b64,
+                    "session": self,
+                }
+
+            await self.wait_for_dialog()
+            copied = await self.click_copy_link()
+            if not copied:
+                # maybe captcha appeared during wait
+                captcha = await self.handle_captcha_auto()
+                if captcha:
+                    return {
+                        "success": True,
+                        "captcha": True,
+                        "captcha_image": self.captcha_image_b64,
+                        "session": self,
+                    }
+                return {
+                    "success": False,
+                    "error": "Could not find Copy Download Link",
+                    "session": self,
+                }
+
+            url = await self.get_download_url()
+            if not url:
+                return {
+                    "success": False,
+                    "error": "Failed to get download URL",
+                    "session": self,
+                }
+
+            await self.close_browser()
+            return {
+                "success": True,
+                "captcha": False,
+                "download_url": url,
+                "title": self.title_text,
+                "session": self,
+            }
+        except Exception as e:
+            await self.close_browser()
+            return {"success": False, "error": str(e), "session": self}
+
+    async def continue_after_captcha(self, code: str, index: int) -> dict:
+        """Submit captcha code, then continue: click copy -> get URL"""
+        try:
+            ok = await self.submit_captcha(code)
+            if not ok:
+                return {
+                    "success": False,
+                    "error": "Captcha submission failed",
+                    "session": self,
+                }
+
+            await asyncio.sleep(2)
+
+            # re-select and click download after captcha
+            await self.select_and_click_download(index)
+
+            await self.wait_for_dialog()
+            copied = await self.click_copy_link()
+            if not copied:
+                return {
+                    "success": False,
+                    "error": "Could not find Copy Download Link after captcha",
+                    "session": self,
+                }
+
+            url = await self.get_download_url()
+            if not url:
+                return {
+                    "success": False,
+                    "error": "Failed to get download URL after captcha",
+                    "session": self,
+                }
+
+            await self.close_browser()
+            return {
+                "success": True,
+                "captcha": False,
+                "download_url": url,
+                "title": self.title_text,
+                "session": self,
+            }
+        except Exception as e:
+            await self.close_browser()
+            return {"success": False, "error": str(e), "session": self}
+
+
+# ─── Standalone CLI usage ──────────────────────────────────────────
+async def main():
+    print("SnapWC Video Downloader")
+    video_url = input("Paste video URL: ").strip()
+    session = SnapWCSession()
+    result = await session.run_full_flow(video_url)
+
+    if not result["success"]:
+        print(f"Error: {result['error']}")
+        return
+
+    print("\nAvailable qualities:")
+    for q in result["qualities"]:
+        sz = f" ({q['size']})" if q.get("size") else ""
+        print(f"  {q['index'] + 1}: [{q['category']}] {q['label']}{sz}")
+
+    choice = int(input("Select quality: ")) - 1
+    result2 = await session.continue_with_quality(choice)
+
+    if result2.get("captcha"):
+        print("Captcha detected! Check the browser window.")
+        code = input("Enter captcha code: ")
+        result2 = await session.continue_after_captcha(code, choice)
+
+    if result2["success"] and result2.get("download_url"):
+        print(f"\nDownload URL: {result2['download_url']}")
+        print(f"Title: {result2.get('title', '')}")
+    else:
+        print(f"Error: {result2.get('error', 'Unknown')}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
