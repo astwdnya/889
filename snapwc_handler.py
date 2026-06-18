@@ -222,8 +222,26 @@ class SnapWCSession:
 
         raise Exception("No quality options found")
 
+    async def _human_click(self, element, page=None):
+        p = page or self.page
+        box = await element.bounding_box()
+        if box:
+            x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+            await p.mouse.move(
+                box["x"] + box["width"] * 0.1,
+                box["y"] + box["height"] * 0.1,
+                steps=random.randint(5, 12),
+            )
+            await asyncio.sleep(random.uniform(0.05, 0.15))
+            await p.mouse.move(x, y, steps=random.randint(8, 20))
+            await asyncio.sleep(random.uniform(0.05, 0.15))
+            await p.mouse.click(x, y)
+        else:
+            await element.click()
+
     async def _click_download_icon_near(self, quality_el):
-        """Find file_download icon near a quality element and click it."""
+        """Find file_download icon near a quality element and click it with human-like motion."""
         dl_handle = await quality_el.evaluate_handle("""el => {
             let parent = el.parentElement;
             const findIcon = (p) => {
@@ -245,15 +263,9 @@ class SnapWCSession:
         }""")
         dl_elem = dl_handle.as_element() if dl_handle else None
         if dl_elem:
-            box = await dl_elem.bounding_box()
-            if box:
-                await self.page.mouse.click(
-                    box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-                )
-            else:
-                await dl_elem.click()
+            await self._human_click(dl_elem)
         else:
-            await quality_el.click()
+            await self._human_click(quality_el)
 
     async def select_and_click_download(self, index: int):
         if index < 0 or index >= len(self.qualities):
@@ -262,20 +274,58 @@ class SnapWCSession:
         label = self.qualities[index]["label"]
         quality_el = self.page.locator(f'div.q-item__label:text("{label}")').first
 
-        async with self.page.context.expect_page(timeout=10000) as popup_info:
-            await self._click_download_icon_near(quality_el)
+        await quality_el.wait_for(timeout=10000)
 
-        try:
-            popup = await popup_info.value
-            await popup.wait_for_load_state("load", timeout=15000)
-            popup_url = popup.url
-            if "offer-support" in popup_url or "supportsnapwc" in popup_url:
-                await popup.close()
-                self.current_page = self.page
-            else:
-                self.current_page = popup
-        except Exception:
-            self.current_page = self.page
+        for attempt in range(3):
+            try:
+                async with self.page.context.expect_page(timeout=12000) as pi:
+                    await self._click_download_icon_near(quality_el)
+
+                popup = await pi.value
+                await popup.wait_for_load_state("load", timeout=15000)
+                pu = popup.url
+                if "offer-support" in pu or "supportsnapwc" in pu:
+                    await popup.close()
+                    await asyncio.sleep(2)
+                    try:
+                        async with self.page.context.expect_page(timeout=15000):
+                            pass
+                        real = await pi.value
+                        # pi is consumed, need new context
+                        # Instead just wait and check current pages
+                    except Exception:
+                        pass
+                    # After closing fake popup, check if download appears in-page
+                    await asyncio.sleep(3)
+                    has_dl = (
+                        await self.page.locator(
+                            'button:has-text("Copy Download Link"), span:has-text("Copy Download Link")'
+                        )
+                        .first.is_visible()
+                        .__bool__()
+                    )
+                    if has_dl:
+                        self.current_page = self.page
+                        return
+                    # Try catching real popup with a fresh expect
+                    try:
+                        async with self.page.context.expect_page(timeout=15000) as rpi:
+                            pass
+                        rp = await rpi.value
+                        await rp.wait_for_load_state("load", timeout=15000)
+                        self.current_page = rp
+                        return
+                    except Exception:
+                        self.current_page = self.page
+                        return
+                else:
+                    self.current_page = popup
+                    return
+            except Exception:
+                await asyncio.sleep(2)
+                continue
+
+        self.current_page = self.page
 
     def check_captcha(self) -> bool:
         return self.waiting_for_captcha
