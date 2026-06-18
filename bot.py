@@ -2511,14 +2511,41 @@ async def snapwc_command(event):
             "video_url": url,
         }
 
-        buttons = []
+        grouped = {"Video": [], "No Sound": [], "Audio": []}
         for q in qualities:
-            label = f"[{q['category']}] {q['label']}"
-            if q.get("size"):
-                label += f" ({q['size']})"
-            buttons.append(
-                [Button.inline(label, f"snapwc_q_{session_id}_{q['index']}")]
-            )
+            cat = q["category"]
+            if cat in grouped:
+                grouped[cat].append(q)
+
+        msg_lines = [f"🎬 **SnapWC — {len(qualities)} options found:**\n"]
+        cat_icons = {"Video": "🎬", "No Sound": "🔇", "Audio": "🎵"}
+        idx = 1
+        buttons = []
+        for cat in ["Video", "No Sound", "Audio"]:
+            items = grouped.get(cat, [])
+            if not items:
+                continue
+            msg_lines.append(f"\n{cat_icons.get(cat, '📁')} **{cat}**")
+            for q in items:
+                sz = f" ({q['size']})" if q.get("size") else ""
+                msg_lines.append(f"  {idx}. {q['label']}{sz}")
+                buttons.append(
+                    [
+                        Button.inline(
+                            f"{idx}. {q['label']}{sz}",
+                            f"snapwc_q_{session_id}_{q['index']}",
+                        )
+                    ]
+                )
+                idx += 1
+
+        buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")])
+
+        await safe_edit(
+            status_msg,
+            "\n".join(msg_lines),
+            buttons=buttons,
+        )
 
         buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")])
 

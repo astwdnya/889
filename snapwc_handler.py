@@ -308,15 +308,22 @@ class SnapWCSession:
             return False
 
     async def wait_for_dialog(self):
+        current = getattr(self, "current_page", self.page)
         for _ in range(60):
             try:
-                title_el = await (self.current_page or self.page).query_selector(
+                title_el = await current.query_selector(
                     'div.iframe-dialog-title, div[class*="dialog-title"]'
                 )
                 if title_el:
                     self.title_text = (await title_el.inner_text()).strip()
                     if self.title_text:
                         return
+            except Exception:
+                pass
+            try:
+                inner = await current.inner_text("body")
+                if inner and "Copy Download Link" in inner:
+                    return
             except Exception:
                 pass
             await asyncio.sleep(0.5)
@@ -339,6 +346,15 @@ class SnapWCSession:
             except Exception:
                 pass
             try:
+                btn = current.locator(
+                    '[class*="q-btn"]:has-text("Copy Download Link")'
+                ).first
+                await btn.click(timeout=2000)
+                await asyncio.sleep(0.3)
+                return True
+            except Exception:
+                pass
+            try:
                 all_spans = await current.query_selector_all("span.block")
                 for sp in all_spans:
                     txt = (await sp.inner_text()).strip()
@@ -350,6 +366,21 @@ class SnapWCSession:
                                 box["y"] + box["height"] / 2,
                             )
                             return True
+            except Exception:
+                pass
+            try:
+                for fr in await current.query_selector_all("iframe"):
+                    try:
+                        fr_content = await fr.content_frame()
+                        if fr_content:
+                            btn = fr_content.locator(
+                                'button:has-text("Copy Download Link"), span:has-text("Copy Download Link")'
+                            ).first
+                            await btn.click(timeout=1000)
+                            await asyncio.sleep(0.3)
+                            return True
+                    except Exception:
+                        continue
             except Exception:
                 pass
             await asyncio.sleep(0.5)
@@ -385,7 +416,25 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # scan all elements text
+            # scan ALL elements text (more thorough than body inner_text)
+            try:
+                url = await current.evaluate("""() => {
+                    const els = document.querySelectorAll('*');
+                    for (const el of els) {
+                        const t = el.textContent.trim();
+                        if (t.startsWith('http://') || t.startsWith('https://')) {
+                            if (t.includes('/get?') || t.includes('sf-converter.com/get')) return t;
+                        }
+                    }
+                    return null;
+                }""")
+                if url:
+                    self.download_url = url
+                    return url
+            except Exception:
+                pass
+
+            # regex on body inner_text
             try:
                 body = await current.inner_text("body")
                 for match in re.finditer(r'https?://[^\s"\']+/get\?[^\s"\']+', body):
