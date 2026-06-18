@@ -297,13 +297,9 @@ class SnapWCSession:
                         pass
                     # After closing fake popup, check if download appears in-page
                     await asyncio.sleep(3)
-                    has_dl = (
-                        await self.page.locator(
-                            'button:has-text("Copy Download Link"), span:has-text("Copy Download Link")'
-                        )
-                        .first.is_visible()
-                        .__bool__()
-                    )
+                    has_dl = await self.page.locator(
+                        'button:has-text("Copy Download Link"), span:has-text("Copy Download Link")'
+                    ).first.is_visible()
                     if has_dl:
                         self.current_page = self.page
                         return

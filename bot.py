@@ -595,7 +595,7 @@ async def do_download_and_send(
     source_url: str,
     extra_headers: Optional[dict] = None,
     title: str = "",
-):
+) -> bool:
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
 
@@ -616,7 +616,7 @@ async def do_download_and_send(
             await safe_edit(
                 status_msg, f"❌ Could not extract via Dirpy either:\n{intercept_err}"
             )
-            return
+            return False
         if page_title and not title:
             title = page_title
         direct_url = found_urls[0]
@@ -634,7 +634,7 @@ async def do_download_and_send(
     if dl_error or not filepath:
         if dl_error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
-        return
+        return False
 
     # بررسی کن فایل دانلود شده واقعاً ویدیو هست یا نه
     vid_duration, vw, vh = await get_video_info(filepath)
@@ -644,7 +644,7 @@ async def do_download_and_send(
             os.remove(filepath)
         except Exception:
             pass
-        return
+        return False
 
     await safe_edit(status_msg, "📤 Uploading...")
     try:
@@ -690,6 +690,8 @@ async def do_download_and_send(
     except Exception as e:
         logger.error(f"Upload error: {e}")
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        return False
+    return True
 
 
 # ====================== GET FILE SIZE ======================
@@ -2634,9 +2636,56 @@ async def snapwc_select_callback(event):
             )
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
-            await do_download_and_send(
+            dl_ok = await do_download_and_send(
                 event, status_msg, download_url, video_url, title=title
             )
+
+            # Retry once on failure: get fresh URL from SnapWC
+            if not dl_ok and video_url:
+                logger.info(f"[SNAPWC] Download failed, retrying with fresh URL...")
+                await safe_edit(status_msg, "🔄 Getting fresh download link...")
+                new_session = None
+                try:
+                    new_session = SnapWCSession()
+                    new_result = await new_session.run_full_flow(video_url)
+                    if new_result["success"]:
+                        new_dl = await new_session.continue_with_quality(index)
+                        if new_dl.get("success") and not new_dl.get("captcha"):
+                            fresh_url = new_dl["download_url"]
+                            fresh_title = new_dl.get("title", title)
+                            await safe_edit(
+                                status_msg,
+                                "✅ Fresh link obtained! Retrying download...",
+                            )
+                            await do_download_and_send(
+                                event,
+                                status_msg,
+                                fresh_url,
+                                video_url,
+                                title=fresh_title,
+                            )
+                        elif new_dl.get("captcha"):
+                            await safe_edit(
+                                status_msg, "🔐 Captcha on retry — run /snapwc again."
+                            )
+                        else:
+                            await safe_edit(
+                                status_msg,
+                                f"❌ Retry failed: {new_dl.get('error', 'Unknown')}",
+                            )
+                    else:
+                        await safe_edit(
+                            status_msg,
+                            f"❌ Retry failed: {new_result.get('error', 'Unknown')}",
+                        )
+                except Exception as retry_e:
+                    logger.error(f"[SNAPWC] Retry error: {retry_e}")
+                finally:
+                    if new_session:
+                        try:
+                            await new_session.close_browser()
+                        except Exception:
+                            pass
 
             snapwc_sessions.pop(session_id, None)
             user_state.pop(event.chat_id, None)
