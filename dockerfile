@@ -41,6 +41,7 @@ COPY bot.py .
 COPY FastTelethon.py .
 COPY github.py .
 COPY savep_handler.py .
+COPY snapwc_handler.py .
 
 # ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
