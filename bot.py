@@ -2558,14 +2558,6 @@ async def snapwc_command(event):
             buttons=buttons,
         )
 
-        buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")])
-
-        await safe_edit(
-            status_msg,
-            f"🎬 **SnapWC — Select Quality**\n\nFound **{len(qualities)}** options:",
-            buttons=buttons,
-        )
-
     except Exception as e:
         logger.error(f"[SNAPWC] Command error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ Error: {str(e)[:120]}")
@@ -2584,7 +2576,10 @@ async def snapwc_select_callback(event):
     if session_id not in snapwc_sessions:
         return await event.answer("❌ Session expired. Run /snapwc again.", alert=True)
 
-    session = snapwc_sessions[session_id]
+    session = snapwc_sessions.pop(session_id, None)
+    if not session:
+        return await event.answer("❌ Session expired. Run /snapwc again.", alert=True)
+
     await event.answer("⏳ Processing...", alert=False)
 
     try:

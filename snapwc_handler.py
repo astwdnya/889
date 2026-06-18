@@ -94,21 +94,25 @@ class SnapWCSession:
             pass
 
     async def navigate(self):
+        last_exc = None
         for retry in range(3):
             try:
                 await self.page.goto(
-                    "https://snapwc.com/sites", wait_until="load", timeout=60000
+                    "https://snapwc.com/sites",
+                    wait_until="domcontentloaded",
+                    timeout=90000,
                 )
+                await asyncio.sleep(2)
                 return
             except Exception as e:
+                last_exc = e
                 if retry < 2:
-                    await asyncio.sleep(3)
-                else:
-                    raise e
+                    await asyncio.sleep(5)
+        raise last_exc or Exception("Navigation failed")
 
     async def paste_url(self, video_url: str):
         await self.page.wait_for_selector(
-            'input[name="video-url-input"]', timeout=15000
+            'input[name="video-url-input"]', timeout=30000
         )
         el = self.page.locator('input[name="video-url-input"]')
         await el.click()
