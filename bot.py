@@ -2525,14 +2525,15 @@ async def snapwc_command(event):
             items = grouped.get(cat, [])
             if not items:
                 continue
-            msg_lines.append(f"\n{cat_icons.get(cat, '📁')} **{cat}**")
+            msg_lines.append(f"\n{cat_icons[cat]} **{cat}**")
             for q in items:
                 sz = f" ({q['size']})" if q.get("size") else ""
                 msg_lines.append(f"  {idx}. {q['label']}{sz}")
+                btn_emoji = cat_icons.get(q["category"], "📁")
                 buttons.append(
                     [
                         Button.inline(
-                            f"{idx}. {q['label']}{sz}",
+                            f"{btn_emoji} {q['label']}{sz}",
                             f"snapwc_q_{session_id}_{q['index']}",
                         )
                     ]
@@ -2617,11 +2618,13 @@ async def snapwc_select_callback(event):
             download_url = result["download_url"]
             title = result.get("title", "")
 
-            await safe_edit(event, "✅ Got download link! Downloading...")
+            status_msg = await event.client.send_message(
+                event.chat_id, "✅ Got download link! Downloading..."
+            )
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
             await do_download_and_send(
-                event, event.message, download_url, video_url, title=title
+                event, status_msg, download_url, video_url, title=title
             )
 
             snapwc_sessions.pop(session_id, None)
