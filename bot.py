@@ -2490,7 +2490,7 @@ async def snapwc_command(event):
 
     session = SnapWCSession()
     try:
-        result = await session.run_full_flow(url)
+        result = await asyncio.wait_for(session.run_full_flow(url), timeout=180)
 
         if not result["success"]:
             steps = result.get("steps", [])
@@ -2498,12 +2498,16 @@ async def snapwc_command(event):
             log = "\n".join(f"  • {s}" for s in steps)
             logger.error(f"[SNAPWC] run_full_flow failed: {err} | steps: {log}")
             await safe_edit(status_msg, f"❌ SnapWC error: {err}")
-            await session.close_browser()
-            return
-
-        qualities = result.get("qualities", [])
-        if not qualities:
-            await safe_edit(status_msg, "❌ No quality options found.")
+            ss = result.get("screenshot_b64", "")
+            if ss:
+                try:
+                    await event.client.send_file(
+                        event.chat_id,
+                        base64.b64decode(ss),
+                        caption=f"📸 SnapWC screenshot: {err[:80]}",
+                    )
+                except Exception:
+                    pass
             await session.close_browser()
             return
 
@@ -2560,7 +2564,17 @@ async def snapwc_command(event):
 
     except Exception as e:
         logger.error(f"[SNAPWC] Command error: {e}", exc_info=True)
-        await safe_edit(status_msg, f"❌ Error: {str(e)[:120]}")
+        await safe_edit(status_msg, f"❌ SnapWC error: {str(e)[:120]}")
+        try:
+            ss = await session.take_screenshot()
+            if ss:
+                await event.client.send_file(
+                    event.chat_id,
+                    base64.b64decode(ss),
+                    caption=f"📸 SnapWC error screenshot",
+                )
+        except Exception:
+            pass
         try:
             await session.close_browser()
         except Exception:
@@ -2717,7 +2731,16 @@ async def snapwc_select_callback(event):
             log = "\n".join(f"  • {s}" for s in steps)
             logger.error(f"[SNAPWC] continue_with_quality failed: {err}\n{log}")
             await safe_edit(event, f"❌ Error: {err}")
-            snapwc_sessions.pop(session_id, None)
+            ss = result.get("screenshot_b64", "")
+            if ss:
+                try:
+                    await event.client.send_file(
+                        event.chat_id,
+                        base64.b64decode(ss),
+                        caption=f"📸 SnapWC screenshot: {err[:80]}",
+                    )
+                except Exception:
+                    pass
             user_state.pop(event.chat_id, None)
 
     except Exception as e:

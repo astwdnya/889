@@ -38,6 +38,7 @@ class SnapWCSession:
         self.waiting_for_captcha = False
         self.done = False
         self.error = ""
+        self.screenshot_b64 = ""
 
     async def start_browser(self):
         self.playwright = await async_playwright().__aenter__()
@@ -92,6 +93,17 @@ class SnapWCSession:
                 await self.playwright.__aexit__(None, None, None)
         except Exception:
             pass
+
+    async def take_screenshot(self) -> str:
+        try:
+            page = getattr(self, "current_page", self.page) or self.page
+            if page:
+                buf = await page.screenshot(type="png", full_page=True)
+                self.screenshot_b64 = base64.b64encode(buf).decode()
+                return self.screenshot_b64
+        except Exception:
+            pass
+        return ""
 
     async def navigate(self):
         last_exc = None
@@ -554,8 +566,15 @@ class SnapWCSession:
                 "session": self,
             }
         except Exception as e:
+            await self.take_screenshot()
             await self.close_browser()
-            return {"success": False, "error": str(e), "steps": steps, "session": self}
+            return {
+                "success": False,
+                "error": str(e),
+                "steps": steps,
+                "screenshot_b64": self.screenshot_b64,
+                "session": self,
+            }
 
     async def continue_with_quality(self, index: int) -> dict:
         steps = []
@@ -591,20 +610,24 @@ class SnapWCSession:
                         "steps": steps,
                         "session": self,
                     }
+                await self.take_screenshot()
                 return {
                     "success": False,
                     "error": "Could not find Copy Download Link",
                     "steps": steps,
+                    "screenshot_b64": self.screenshot_b64,
                     "session": self,
                 }
 
             steps.append("Retrieving download URL...")
             url = await self.get_download_url()
             if not url:
+                await self.take_screenshot()
                 return {
                     "success": False,
                     "error": "Failed to get download URL",
                     "steps": steps,
+                    "screenshot_b64": self.screenshot_b64,
                     "session": self,
                 }
 
@@ -619,8 +642,15 @@ class SnapWCSession:
                 "session": self,
             }
         except Exception as e:
+            await self.take_screenshot()
             await self.close_browser()
-            return {"success": False, "error": str(e), "steps": steps, "session": self}
+            return {
+                "success": False,
+                "error": str(e),
+                "steps": steps,
+                "screenshot_b64": self.screenshot_b64,
+                "session": self,
+            }
 
     async def continue_after_captcha(self, code: str, index: int) -> dict:
         steps = []
@@ -644,20 +674,24 @@ class SnapWCSession:
             steps.append("Clicking Copy Download Link...")
             copied = await self.click_copy_link()
             if not copied:
+                await self.take_screenshot()
                 return {
                     "success": False,
                     "error": "Could not find Copy Download Link after captcha",
                     "steps": steps,
+                    "screenshot_b64": self.screenshot_b64,
                     "session": self,
                 }
 
             steps.append("Retrieving download URL...")
             url = await self.get_download_url()
             if not url:
+                await self.take_screenshot()
                 return {
                     "success": False,
                     "error": "Failed to get download URL after captcha",
                     "steps": steps,
+                    "screenshot_b64": self.screenshot_b64,
                     "session": self,
                 }
 
@@ -672,8 +706,15 @@ class SnapWCSession:
                 "session": self,
             }
         except Exception as e:
+            await self.take_screenshot()
             await self.close_browser()
-            return {"success": False, "error": str(e), "steps": steps, "session": self}
+            return {
+                "success": False,
+                "error": str(e),
+                "steps": steps,
+                "screenshot_b64": self.screenshot_b64,
+                "session": self,
+            }
 
 
 # ─── Standalone CLI usage ──────────────────────────────────────────
