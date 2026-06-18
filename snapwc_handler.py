@@ -456,19 +456,7 @@ class SnapWCSession:
     async def get_download_url(self) -> str:
         current = getattr(self, "current_page", self.page)
         for attempt in range(60):
-            # clipboard
-            try:
-                text = await current.evaluate("""async () => {
-                    try { const t = await navigator.clipboard.readText(); if (t && t.startsWith('http')) return t; } catch(e) {}
-                    return '';
-                }""")
-                if text and text.startswith("http"):
-                    self.download_url = text
-                    return text
-            except Exception:
-                pass
-
-            # scan DOM for /get? URLs
+            # 1) scan DOM for /get? URLs (converter URL — preferred)
             try:
                 url = await current.evaluate("""() => {
                     const a = document.querySelector('a[href*="/get?"]');
@@ -483,7 +471,7 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # scan ALL elements text (more thorough than body inner_text)
+            # 2) scan ALL elements for /get? or sf-converter.com URLs
             try:
                 url = await current.evaluate("""() => {
                     const els = document.querySelectorAll('*');
@@ -501,7 +489,7 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # regex on body inner_text
+            # 3) regex on body inner_text for /get? URLs
             try:
                 body = await current.inner_text("body")
                 for match in re.finditer(r'https?://[^\s"\']+/get\?[^\s"\']+', body):
@@ -510,7 +498,19 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # clipboard via hidden input
+            # 4) clipboard (last resort — often contains CDN URL, only accept converter URLs)
+            try:
+                text = await current.evaluate("""async () => {
+                    try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
+                    return '';
+                }""")
+                if text:
+                    self.download_url = text
+                    return text
+            except Exception:
+                pass
+
+            # 5) clipboard via hidden input (also filtered)
             try:
                 url = await current.evaluate("""async () => {
                     try {
@@ -521,11 +521,11 @@ class SnapWCSession:
                         const t = await navigator.clipboard.readText();
                         inp.value = t;
                         inp.remove();
-                        if (t.startsWith('http')) return t;
+                        if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t;
                     } catch(e) {}
                     return '';
                 }""")
-                if url and url.startswith("http"):
+                if url:
                     self.download_url = url
                     return url
             except Exception:
