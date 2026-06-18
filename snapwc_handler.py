@@ -213,7 +213,7 @@ class SnapWCSession:
                 except Exception:
                     pass
 
-                found.append({"label": t, "el": el, "category": cat, "size": size})
+                found.append({"label": t, "category": cat, "size": size})
 
             if found:
                 self.qualities = found
@@ -222,43 +222,48 @@ class SnapWCSession:
 
         raise Exception("No quality options found")
 
+    async def _click_download_icon_near(self, quality_el):
+        """Find file_download icon near a quality element and click it."""
+        dl_handle = await quality_el.evaluate_handle("""el => {
+            let parent = el.parentElement;
+            const findIcon = (p) => {
+                const icons = p.querySelectorAll('i.q-icon');
+                for (const ic of icons) {
+                    if (ic.textContent.trim() === 'file_download') return ic;
+                }
+                return null;
+            };
+            let icon = findIcon(el.parentElement || el);
+            if (icon) return icon;
+            for (let i = 0; i < 10; i++) {
+                if (!parent) break;
+                icon = findIcon(parent);
+                if (icon) return icon;
+                parent = parent.parentElement;
+            }
+            return null;
+        }""")
+        dl_elem = dl_handle.as_element() if dl_handle else None
+        if dl_elem:
+            box = await dl_elem.bounding_box()
+            if box:
+                await self.page.mouse.click(
+                    box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                )
+            else:
+                await dl_elem.click()
+        else:
+            await quality_el.click()
+
     async def select_and_click_download(self, index: int):
         if index < 0 or index >= len(self.qualities):
             raise ValueError(f"Invalid quality index: {index}")
 
-        target = self.qualities[index]
+        label = self.qualities[index]["label"]
+        quality_el = self.page.locator(f'div.q-item__label:text("{label}")').first
 
         async with self.page.context.expect_page(timeout=10000) as popup_info:
-            dl_handle = await target["el"].evaluate_handle("""el => {
-                let parent = el.parentElement;
-                const findIcon = (p) => {
-                    const icons = p.querySelectorAll('i.q-icon');
-                    for (const ic of icons) {
-                        if (ic.textContent.trim() === 'file_download') return ic;
-                    }
-                    return null;
-                };
-                let icon = findIcon(el.parentElement || el);
-                if (icon) return icon;
-                for (let i = 0; i < 10; i++) {
-                    if (!parent) break;
-                    icon = findIcon(parent);
-                    if (icon) return icon;
-                    parent = parent.parentElement;
-                }
-                return null;
-            }""")
-            dl_elem = dl_handle.as_element() if dl_handle else None
-            if dl_elem:
-                box = await dl_elem.bounding_box()
-                if box:
-                    await self.page.mouse.click(
-                        box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-                    )
-                else:
-                    await dl_elem.click()
-            else:
-                await target["el"].click()
+            await self._click_download_icon_near(quality_el)
 
         try:
             popup = await popup_info.value
@@ -468,14 +473,21 @@ class SnapWCSession:
         return ""
 
     async def run_full_flow(self, video_url: str) -> dict:
-        """Returns dict with: success, qualities, download_url, title, captcha, error"""
+        steps = []
         try:
+            steps.append("Starting browser...")
             await self.start_browser()
+            steps.append("Navigating to snapwc.com...")
             await self.navigate()
+            steps.append("Pasting URL...")
             await self.paste_url(video_url)
+            steps.append("Clicking Get Download Links...")
             await self.click_get_links()
+            steps.append("Waiting for conversion...")
             await self.wait_for_conversion()
+            steps.append("Parsing qualities...")
             await self.parse_qualities()
+            steps.append(f"Found {len(self.qualities)} quality options")
 
             return {
                 "success": True,
@@ -488,108 +500,130 @@ class SnapWCSession:
                     }
                     for i, q in enumerate(self.qualities)
                 ],
+                "steps": steps,
                 "session": self,
             }
         except Exception as e:
             await self.close_browser()
-            return {"success": False, "error": str(e), "session": self}
+            return {"success": False, "error": str(e), "steps": steps, "session": self}
 
     async def continue_with_quality(self, index: int) -> dict:
-        """After user selects quality: click download -> handle captcha -> get URL"""
+        steps = []
         try:
+            steps.append(f"Selecting quality #{index}...")
             await self.select_and_click_download(index)
+            steps.append("Checking for captcha...")
 
             captcha = await self.handle_captcha_auto()
             if captcha:
+                steps.append("Captcha detected!")
                 return {
                     "success": True,
                     "captcha": True,
                     "captcha_image": self.captcha_image_b64,
+                    "steps": steps,
                     "session": self,
                 }
 
+            steps.append("Waiting for download dialog...")
             await self.wait_for_dialog()
+            steps.append("Clicking Copy Download Link...")
             copied = await self.click_copy_link()
             if not copied:
-                # maybe captcha appeared during wait
+                steps.append("Copy link button not found, checking captcha again...")
                 captcha = await self.handle_captcha_auto()
                 if captcha:
+                    steps.append("Captcha detected on retry!")
                     return {
                         "success": True,
                         "captcha": True,
                         "captcha_image": self.captcha_image_b64,
+                        "steps": steps,
                         "session": self,
                     }
                 return {
                     "success": False,
                     "error": "Could not find Copy Download Link",
+                    "steps": steps,
                     "session": self,
                 }
 
+            steps.append("Retrieving download URL...")
             url = await self.get_download_url()
             if not url:
                 return {
                     "success": False,
                     "error": "Failed to get download URL",
+                    "steps": steps,
                     "session": self,
                 }
 
+            steps.append("Got download link! Cleaning up...")
             await self.close_browser()
             return {
                 "success": True,
                 "captcha": False,
                 "download_url": url,
                 "title": self.title_text,
+                "steps": steps,
                 "session": self,
             }
         except Exception as e:
             await self.close_browser()
-            return {"success": False, "error": str(e), "session": self}
+            return {"success": False, "error": str(e), "steps": steps, "session": self}
 
     async def continue_after_captcha(self, code: str, index: int) -> dict:
-        """Submit captcha code, then continue: click copy -> get URL"""
+        steps = []
         try:
+            steps.append("Submitting captcha code...")
             ok = await self.submit_captcha(code)
             if not ok:
                 return {
                     "success": False,
                     "error": "Captcha submission failed",
+                    "steps": steps,
                     "session": self,
                 }
 
+            steps.append("Captcha submitted, re-selecting quality...")
             await asyncio.sleep(2)
-
-            # re-select and click download after captcha
             await self.select_and_click_download(index)
 
+            steps.append("Waiting for download dialog...")
             await self.wait_for_dialog()
+            steps.append("Clicking Copy Download Link...")
             copied = await self.click_copy_link()
             if not copied:
                 return {
                     "success": False,
                     "error": "Could not find Copy Download Link after captcha",
+                    "steps": steps,
                     "session": self,
                 }
 
+            steps.append("Retrieving download URL...")
             url = await self.get_download_url()
             if not url:
                 return {
                     "success": False,
                     "error": "Failed to get download URL after captcha",
+                    "steps": steps,
                     "session": self,
                 }
 
+            steps.append("Got download link! Cleaning up...")
             await self.close_browser()
             return {
                 "success": True,
                 "captcha": False,
                 "download_url": url,
                 "title": self.title_text,
+                "steps": steps,
                 "session": self,
             }
         except Exception as e:
             await self.close_browser()
-            return {"success": False, "error": str(e), "session": self}
+            return {"success": False, "error": str(e), "steps": steps, "session": self}
 
 
 # ─── Standalone CLI usage ──────────────────────────────────────────

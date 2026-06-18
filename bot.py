@@ -2491,9 +2491,17 @@ async def snapwc_command(event):
         result = await session.run_full_flow(url)
 
         if not result["success"]:
-            await safe_edit(
-                status_msg, f"❌ SnapWC error: {result.get('error', 'Unknown')}"
-            )
+            steps = result.get("steps", [])
+            err = result.get("error", "Unknown")
+            log = "\n".join(f"  • {s}" for s in steps)
+            logger.error(f"[SNAPWC] run_full_flow failed: {err} | steps: {log}")
+            await safe_edit(status_msg, f"❌ SnapWC error: {err}")
+            await session.close_browser()
+            return
+
+        qualities = result.get("qualities", [])
+        if not qualities:
+            await safe_edit(status_msg, "❌ No quality options found.")
             await session.close_browser()
             return
 
@@ -2618,6 +2626,9 @@ async def snapwc_select_callback(event):
             download_url = result["download_url"]
             title = result.get("title", "")
 
+            steps = result.get("steps", [])
+            logger.info(f"[SNAPWC] Quality selected OK | steps: {' → '.join(steps)}")
+
             status_msg = await event.client.send_message(
                 event.chat_id, "✅ Got download link! Downloading..."
             )
@@ -2630,7 +2641,11 @@ async def snapwc_select_callback(event):
             snapwc_sessions.pop(session_id, None)
             user_state.pop(event.chat_id, None)
         else:
-            await safe_edit(event, f"❌ Error: {result.get('error', 'Unknown')}")
+            err = result.get("error", "Unknown")
+            steps = result.get("steps", [])
+            log = "\n".join(f"  • {s}" for s in steps)
+            logger.error(f"[SNAPWC] continue_with_quality failed: {err}\n{log}")
+            await safe_edit(event, f"❌ Error: {err}")
             snapwc_sessions.pop(session_id, None)
             user_state.pop(event.chat_id, None)
 
