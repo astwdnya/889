@@ -631,6 +631,38 @@ async def send_file_with_progress(
         pass
 
 
+# ====================== YT-DLP DOWNLOAD ======================
+async def download_youtube_ytdlp(
+    youtube_url: str, output_path: str, status_msg: Message
+) -> Tuple[Optional[str], Optional[str], int]:
+    await safe_edit(status_msg, "🎬 Downloading via yt-dlp (direct)...")
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "-f",
+        "best[ext=mp4]/best",
+        "-o",
+        output_path,
+        "--no-playlist",
+        "--no-warnings",
+        "--no-cache-dir",
+        "--geo-bypass",
+        youtube_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode == 0 and os.path.exists(output_path):
+        size = os.path.getsize(output_path)
+        if size > 0:
+            return output_path, None, size
+    err_msg = (
+        stderr.decode(errors="replace")[:200]
+        if stderr
+        else f"exit code {proc.returncode}"
+    )
+    return None, f"yt-dlp: {err_msg}", 0
+
+
 # ====================== DOWNLOAD AND SEND ======================
 async def do_download_and_send(
     event,
@@ -647,33 +679,58 @@ async def do_download_and_send(
         direct_url, status_msg, dl_id, referer=source_url, extra_headers=extra_headers
     )
 
-    # FIX: 403 → auto-retry via dirpy
+    # FIX: 403 → auto-retry via dirpy or yt-dlp
     if dl_error == "HTTP_403":
-        await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
-        (
-            found_urls,
-            session_headers,
-            intercept_err,
-            page_title,
-        ) = await extract_video_url_smart(source_url, status_msg)
-        if not found_urls:
-            await safe_edit(
-                status_msg, f"❌ Could not extract via Dirpy either:\n{intercept_err}"
-            )
-            return False
-        if page_title and not title:
-            title = page_title
-        direct_url = found_urls[0]
-        extra_headers = session_headers
-        dl_id2 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_r"
-        active_downloads[dl_id2] = {"paused": False, "cancelled": False}
-        filepath, dl_error, final_size = await download_with_controls(
-            direct_url,
-            status_msg,
-            dl_id2,
-            referer=source_url,
-            extra_headers=extra_headers,
+        # For YouTube googlevideo URLs, yt-dlp handles n-parameter, IP binding, TLS fingerprint
+        is_yt_googlevideo = "googlevideo.com" in direct_url and (
+            "youtube.com" in source_url or "youtu.be" in source_url
         )
+        if is_yt_googlevideo:
+            await safe_edit(
+                status_msg, "🔄 YouTube CDN 403 — trying yt-dlp directly..."
+            )
+            yt_path = os.path.join(OUTPUT_FOLDER, f"ytdlp_{int(time.time())}.mp4")
+            yt_filepath, yt_error, yt_size = await download_youtube_ytdlp(
+                source_url, yt_path, status_msg
+            )
+            if yt_filepath:
+                filepath = yt_filepath
+                dl_error = None
+                final_size = yt_size
+                await safe_edit(status_msg, "✅ yt-dlp download complete!")
+            else:
+                await safe_edit(
+                    status_msg,
+                    f"⚠️ yt-dlp failed ({yt_error}), trying Dirpy...",
+                )
+
+        if dl_error:  # still failed, try Dirpy
+            await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
+            (
+                found_urls,
+                session_headers,
+                intercept_err,
+                page_title,
+            ) = await extract_video_url_smart(source_url, status_msg)
+            if not found_urls:
+                await safe_edit(
+                    status_msg,
+                    f"❌ Could not extract via Dirpy either:\n{intercept_err}",
+                )
+                return False
+            if page_title and not title:
+                title = page_title
+            direct_url = found_urls[0]
+            extra_headers = session_headers
+            dl_id2 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_r"
+            active_downloads[dl_id2] = {"paused": False, "cancelled": False}
+            filepath, dl_error, final_size = await download_with_controls(
+                direct_url,
+                status_msg,
+                dl_id2,
+                referer=source_url,
+                extra_headers=extra_headers,
+            )
 
     if dl_error or not filepath:
         if dl_error != "Cancelled by user":
