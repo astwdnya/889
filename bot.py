@@ -1145,14 +1145,15 @@ async def do_download_and_send(
             return False
 
     # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
-    if not title and _is_youtube_source(source_url):
+    if _is_youtube_source(source_url):
         await safe_edit(status_msg, "📝 Fetching title & description from seostudio...")
         seo_meta = await get_youtube_meta_seostudio(source_url)
         if seo_meta.get("title"):
             title = seo_meta["title"]
-            await safe_edit(status_msg, f"✅ Title found: {title[:50]}...")
+            await safe_edit(status_msg, f"✅ Title: {seo_meta['title'][:50]}...")
         else:
-            await safe_edit(status_msg, "⚠️ Could not extract title from seostudio")
+            err = seo_meta.get("error", "unknown error")
+            await safe_edit(status_msg, f"⚠️ Seostudio failed: {err}")
         if seo_meta.get("description"):
             description = seo_meta["description"]
 
@@ -1219,6 +1220,7 @@ async def do_download_and_send(
                     f"📦 Size: {human_readable_size(fsize)}\n"
                     f"🔗 [Source]({source_url})"
                 ),
+                file_name=basename,
                 force_document=True,
             )
         except Exception as e:
@@ -2969,6 +2971,7 @@ async def generic_url_handler(event):
                 event.chat_id,
                 filepath,
                 caption=f"📎 **{basename}**\n📦 Size: {human_readable_size(size)}",
+                file_name=basename,
                 force_document=True,
             )
         except Exception as e:
