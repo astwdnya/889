@@ -794,6 +794,8 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
                     "--disable-infobars",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--disable-dev-shm-usage",
+                    "--single-process",
                     "--window-size=1280,800",
                 ],
             )
@@ -1157,11 +1159,18 @@ async def do_download_and_send(
     # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
     if _is_youtube_source(source_url):
         await safe_edit(status_msg, "📝 Fetching title & description...")
-        seo_meta = await get_youtube_meta_seostudio(source_url)
-        if seo_meta.get("title"):
-            title = seo_meta["title"]
-        if seo_meta.get("description"):
-            description = seo_meta["description"]
+        try:
+            seo_meta = await asyncio.wait_for(
+                get_youtube_meta_seostudio(source_url), timeout=90
+            )
+            if seo_meta.get("title"):
+                title = seo_meta["title"]
+            if seo_meta.get("description"):
+                description = seo_meta["description"]
+        except asyncio.TimeoutError:
+            logger.warning("[SEOSTUDIO] Timeout (90s) — skipping metadata")
+        except Exception as e:
+            logger.warning(f"[SEOSTUDIO] Error: {e}")
 
     import os as _os_audio
 
