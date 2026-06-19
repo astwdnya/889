@@ -28,6 +28,7 @@ from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Message,
+    DocumentAttributeAudio,
     DocumentAttributeVideo,
     InputMediaUploadedDocument,
 )
@@ -203,7 +204,9 @@ def build_progress_text(
 
 
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
-def _filename_from_url(url: str, cd_header: str = "", fallback_ext: str = "") -> str:
+def _filename_from_url(
+    url: str, cd_header: str = "", fallback_ext: str = "", original_url: str = ""
+) -> str:
     import urllib.parse as _up
     from pathlib import Path
 
@@ -219,6 +222,13 @@ def _filename_from_url(url: str, cd_header: str = "", fallback_ext: str = "") ->
         m = re.search(r'filename="([^"]*)"', cd_header)
         if m:
             name = m.group(1).strip()
+    if not name or "." not in name:
+        m = re.search(r"filename=([^;\s]+)", cd_header)
+        if m:
+            name = m.group(1).strip()
+    if not name or "." not in name:
+        if original_url:
+            name = Path(_up.urlparse(original_url).path).name
     if not name or "." not in name:
         name = Path(_up.urlparse(url).path).name
     if not name or "." not in name:
@@ -774,6 +784,8 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
         )
         ctx = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
         )
         page = await ctx.new_page()
         await page.goto(
@@ -788,7 +800,7 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
         await input_el.fill("")
         await input_el.type(url, delay=30)
 
-        extract_btn = page.locator("button.bg-gradient-info")
+        extract_btn = page.locator('span[wire:target="onYoutubeDescriptionExtractor"]')
         await extract_btn.wait_for(timeout=10000)
         await extract_btn.click()
 
@@ -911,19 +923,24 @@ async def send_file_with_progress(
     buttons=None,
     supports_streaming: bool = True,
 ):
+    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        await safe_edit(status_msg, "❌ File is empty or missing.")
+        return
     file_size = os.path.getsize(filepath)
     start_time = time.time()
     last_update = [0.0]
     last_bytes = [0]
     last_time = [start_time]
 
-    # اطلاعات ویدیو برای نمایش درست در تلگرام
     duration, width, height = await get_video_info(filepath)
-    thumb_path = await get_video_thumbnail(filepath)
+    is_audio = (duration and duration > 0 and width == 0 and height == 0) or (
+        os.path.splitext(filepath)[1].lower()
+        in (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
+    )
+    thumb_path = await get_video_thumbnail(filepath) if not is_audio else None
 
     async def progress_cb(current: int, total: int):
         now = time.time()
-        # هر 3 ثانیه یه بار آپدیت — کمتر فشار روی event loop
         if now - last_update[0] < 3.0 and current != total:
             return
         last_update[0] = now
@@ -939,27 +956,32 @@ async def send_file_with_progress(
 
     try:
         duration_int = int(duration) if duration else 0
-        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
         with open(filepath, "rb") as f:
             uploaded = await fast_upload_file(
                 client, f, progress_callback=progress_cb, connection_count=15
             )
 
-        # ساخت media با متادیتای ویدیو
-        attributes, mime_type = utils.get_attributes(
-            filepath,
-            attributes=[
-                DocumentAttributeVideo(
-                    duration=duration_int,
-                    w=width if width else 0,
-                    h=height if height else 0,
-                    supports_streaming=True,
-                )
-            ],
-        )
-        # آپلود thumbnail به تلگرام
+        if is_audio:
+            attributes, mime_type = utils.get_attributes(
+                filepath,
+                attributes=[
+                    DocumentAttributeAudio(duration=duration_int, title="Audio")
+                ],
+            )
+        else:
+            attributes, mime_type = utils.get_attributes(
+                filepath,
+                attributes=[
+                    DocumentAttributeVideo(
+                        duration=duration_int,
+                        w=width if width else 0,
+                        h=height if height else 0,
+                        supports_streaming=True,
+                    )
+                ],
+            )
         thumb_input = None
-        if thumb_path and os.path.exists(thumb_path):
+        if not is_audio and thumb_path and os.path.exists(thumb_path):
             with open(thumb_path, "rb") as tf:
                 thumb_input = await fast_upload_file(client, tf)
 
@@ -977,8 +999,28 @@ async def send_file_with_progress(
             buttons=buttons,
             parse_mode="markdown",
         )
+    except Exception as e:
+        err_str = str(e)
+        if "file parts" in err_str.lower():
+            await safe_edit(
+                status_msg, "⚠️ Fast upload failed, retrying with direct send..."
+            )
+            try:
+                await client.send_file(
+                    chat_id,
+                    filepath,
+                    caption=caption,
+                    buttons=buttons,
+                    parse_mode="markdown",
+                    supports_streaming=supports_streaming,
+                )
+            except Exception as e2:
+                await safe_edit(status_msg, f"❌ Upload failed: {str(e2)[:100]}")
+                return
+        else:
+            await safe_edit(status_msg, f"❌ Upload failed: {err_str[:100]}")
+            return
     finally:
-        # پاک کردن thumbnail موقت
         if thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
@@ -1120,22 +1162,16 @@ async def do_download_and_send(
         await safe_edit(status_msg, "🎵 Uploading audio...")
         try:
             _vd = vid_duration or 0
-            mins, secs = divmod(int(_vd), 60)
-            hours, mins = divmod(mins, 60)
-            dur_str = (
-                f" ⏱ {hours}:{mins:02d}:{secs:02d}"
-                if hours > 0
-                else f" ⏱ {mins}:{secs:02d}"
-            )
-            caption = f"🎵 {title}{dur_str}" if title else f"🎵 **Audio**{dur_str}"
-            desc_str = f"\n📝 {description}" if description else ""
-            if desc_str:
-                caption += desc_str
-            asize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+            caption = title or "Audio"
+            if description:
+                caption += f"\n\n{description}"
             await event.client.send_file(
                 event.chat_id,
                 filepath,
                 caption=caption,
+                attributes=[
+                    DocumentAttributeAudio(duration=int(_vd), title=title or "Audio")
+                ],
                 supports_streaming=True,
             )
         except Exception as e:
@@ -2876,18 +2912,12 @@ async def generic_url_handler(event):
         await safe_edit(status_msg, "🎵 Uploading audio...")
         try:
             _vd2 = vid_duration or 0
-            mins, secs = divmod(int(_vd2), 60)
-            hours, mins = divmod(mins, 60)
-            dur_str = (
-                f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
-                if hours > 0
-                else f" | ⏱ {mins}:{secs:02d}"
-            )
-            asize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+            basename = os.path.basename(filepath)
             await event.client.send_file(
                 event.chat_id,
                 filepath,
-                caption=f"🎵 **Audio**{dur_str}",
+                caption=basename,
+                attributes=[DocumentAttributeAudio(duration=int(_vd2), title=basename)],
                 supports_streaming=True,
             )
         except Exception as e:
