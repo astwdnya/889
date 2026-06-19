@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - v5
-# Fixes: 403 auto-dirpy + FFmpeg scale/rotation fix + size_input chat_id fix + pause/resume split
+# Telegram Ultimate Bot - v6
+# Fixes: YouTube IP-lock via yt-dlp + 403 auto-dirpy + FFmpeg scale/rotation + size_input chat_id + pause/resume split
 
 import asyncio
 import os
@@ -457,6 +457,144 @@ async def download_with_controls(
     return None, "Download failed", 0
 
 
+# ====================== YT-DLP YOUTUBE DOWNLOAD ======================
+def _is_youtube_source(url: str) -> bool:
+    """تشخیص اینکه لینک مربوط به صفحه یوتیوب هست یا نه (نه googlevideo)."""
+    u = url.lower()
+    return (
+        "youtube.com/watch" in u
+        or "youtu.be/" in u
+        or "youtube.com/shorts" in u
+        or "m.youtube.com" in u
+    )
+
+
+async def download_youtube_ytdlp(
+    youtube_url: str,
+    status_msg: Message,
+    dl_id: str,
+) -> Tuple[Optional[str], Optional[str], int]:
+    """
+    دانلود مستقیم یوتیوب با yt-dlp روی خود سرور.
+    این کار مشکل IP-lock و User-Agent mismatch رو کامل حل می‌کنه چون
+    لینک نهایی googlevideo با IP خود سرور ساخته می‌شه.
+    """
+    output_tmpl = os.path.join(OUTPUT_FOLDER, f"yt_{int(time.time())}.%(ext)s")
+
+    if dl_id not in active_downloads:
+        active_downloads[dl_id] = {"paused": False, "cancelled": False}
+
+    dl_buttons_cancel = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    await safe_edit(
+        status_msg,
+        "📥 Downloading via yt-dlp (server-side)...",
+        buttons=dl_buttons_cancel,
+    )
+    logger.info(f"[YTDLP] START | url={youtube_url[:120]}")
+
+    # فرمت: بهترین کیفیت mp4 ترکیبی، یا بهترین video+audio با merge
+    args = [
+        "yt-dlp",
+        "-f",
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format",
+        "mp4",
+        "--no-playlist",
+        "--no-warnings",
+        "--newline",
+        "--progress",
+        "-o",
+        output_tmpl,
+        youtube_url,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        last_update = 0.0
+        # خواندن خط‌به‌خط خروجی برای نمایش پیشرفت و چک کردن cancel
+        while True:
+            if active_downloads.get(dl_id, {}).get("cancelled"):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await status_msg.edit("🚫 Download cancelled.", buttons=None)
+                except Exception:
+                    pass
+                return None, "Cancelled by user", 0
+
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if proc.returncode is not None:
+                    break
+                continue
+
+            if not line:
+                break
+
+            text = line.decode(errors="replace").strip()
+            # خط‌های پیشرفت yt-dlp مثل: [download]  45.3% of 12.34MiB at 1.23MiB/s
+            m = re.search(
+                r"\[download\]\s+([\d.]+)%.*?of\s+([\d.]+\w+).*?at\s+([\d.]+\w+/s)",
+                text,
+            )
+            if m:
+                now = time.time()
+                if now - last_update >= 2.0:
+                    last_update = now
+                    percent = m.group(1)
+                    size = m.group(2)
+                    speed = m.group(3)
+                    await safe_edit(
+                        status_msg,
+                        f"📥 **Downloading (yt-dlp)**\n"
+                        f"📊 {percent}%  •  📦 {size}  •  🚀 {speed}",
+                        buttons=dl_buttons_cancel,
+                    )
+
+        await proc.wait()
+        active_downloads.pop(dl_id, None)
+
+        if proc.returncode != 0:
+            logger.warning(f"[YTDLP] failed | rc={proc.returncode}")
+            return None, "YTDLP_FAILED", 0
+
+        # پیدا کردن فایل خروجی
+        found = None
+        prefix = os.path.basename(output_tmpl).split("%")[0]
+        for fname in os.listdir(OUTPUT_FOLDER):
+            if fname.startswith(prefix):
+                found = os.path.join(OUTPUT_FOLDER, fname)
+                break
+
+        if not found or not os.path.exists(found) or os.path.getsize(found) == 0:
+            return None, "YTDLP_FAILED", 0
+
+        size = os.path.getsize(found)
+        logger.info(f"[YTDLP] DONE | size={human_readable_size(size)} | file={found}")
+        try:
+            await status_msg.edit("✅ Download complete!", buttons=None)
+        except Exception:
+            pass
+        return found, None, size
+
+    except FileNotFoundError:
+        active_downloads.pop(dl_id, None)
+        return None, "yt-dlp not installed on server", 0
+    except Exception as e:
+        active_downloads.pop(dl_id, None)
+        logger.error(f"[YTDLP] error: {e}")
+        return None, str(e)[:100], 0
+
+
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
 
@@ -631,38 +769,6 @@ async def send_file_with_progress(
         pass
 
 
-# ====================== YT-DLP DOWNLOAD ======================
-async def download_youtube_ytdlp(
-    youtube_url: str, output_path: str, status_msg: Message
-) -> Tuple[Optional[str], Optional[str], int]:
-    await safe_edit(status_msg, "🎬 Downloading via yt-dlp (direct)...")
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "-f",
-        "best[ext=mp4]/best",
-        "-o",
-        output_path,
-        "--no-playlist",
-        "--no-warnings",
-        "--no-cache-dir",
-        "--geo-bypass",
-        youtube_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode == 0 and os.path.exists(output_path):
-        size = os.path.getsize(output_path)
-        if size > 0:
-            return output_path, None, size
-    err_msg = (
-        stderr.decode(errors="replace")[:200]
-        if stderr
-        else f"exit code {proc.returncode}"
-    )
-    return None, f"yt-dlp: {err_msg}", 0
-
-
 # ====================== DOWNLOAD AND SEND ======================
 async def do_download_and_send(
     event,
@@ -675,36 +781,40 @@ async def do_download_and_send(
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
 
-    filepath, dl_error, final_size = await download_with_controls(
-        direct_url, status_msg, dl_id, referer=source_url, extra_headers=extra_headers
-    )
+    filepath = None
+    dl_error = None
+    final_size = 0
 
-    # FIX: 403 → auto-retry via dirpy or yt-dlp
-    if dl_error == "HTTP_403":
-        # For YouTube googlevideo URLs, yt-dlp handles n-parameter, IP binding, TLS fingerprint
-        is_yt_googlevideo = "googlevideo.com" in direct_url and (
-            "youtube.com" in source_url or "youtu.be" in source_url
+    # ===== اگه لینک یوتیوب هست، اول با yt-dlp روی سرور دانلود کن =====
+    # این کار مشکل IP-lock لینک‌های googlevideo رو کامل حل می‌کنه
+    if _is_youtube_source(source_url) or _is_youtube_source(direct_url):
+        yt_target = source_url if _is_youtube_source(source_url) else direct_url
+        filepath, dl_error, final_size = await download_youtube_ytdlp(
+            yt_target, status_msg, dl_id
         )
-        if is_yt_googlevideo:
-            await safe_edit(
-                status_msg, "🔄 YouTube CDN 403 — trying yt-dlp directly..."
-            )
-            yt_path = os.path.join(OUTPUT_FOLDER, f"ytdlp_{int(time.time())}.mp4")
-            yt_filepath, yt_error, yt_size = await download_youtube_ytdlp(
-                source_url, yt_path, status_msg
-            )
-            if yt_filepath:
-                filepath = yt_filepath
-                dl_error = None
-                final_size = yt_size
-                await safe_edit(status_msg, "✅ yt-dlp download complete!")
-            else:
-                await safe_edit(
-                    status_msg,
-                    f"⚠️ yt-dlp failed ({yt_error}), trying Dirpy...",
-                )
+        # اگه yt-dlp شکست خورد، با روش معمولی ادامه بده
+        if dl_error == "YTDLP_FAILED" or (
+            not filepath and dl_error != "Cancelled by user"
+        ):
+            await safe_edit(status_msg, "🔄 yt-dlp failed — trying direct download...")
+            filepath = None
+            dl_error = None
+            final_size = 0
 
-        if dl_error:  # still failed, try Dirpy
+    # ===== دانلود معمولی (اگه یوتیوب نبود یا yt-dlp شکست خورد) =====
+    if not filepath and dl_error != "Cancelled by user":
+        dl_id_direct = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_d"
+        active_downloads[dl_id_direct] = {"paused": False, "cancelled": False}
+        filepath, dl_error, final_size = await download_with_controls(
+            direct_url,
+            status_msg,
+            dl_id_direct,
+            referer=source_url,
+            extra_headers=extra_headers,
+        )
+
+        # FIX: 403 → auto-retry via dirpy
+        if dl_error == "HTTP_403":
             await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
             (
                 found_urls,
@@ -1286,8 +1396,6 @@ async def compress_video(
         audio_bitrate_k = audio_bitrate_bps // 1000
 
         # FIX: scale + format=yuv420p + noautorotate
-        # - format=yuv420p: مطمئن میشه pixel format با libx264 سازگاره
-        # - noautorotate: جلوگیری از تداخل rotation metadata با scale filter
         SCALE_VF = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
         COMMON_INPUT = ["-noautorotate", "-i", input_path]
 
@@ -1421,6 +1529,12 @@ async def process_dirpy_request(event, url: str):
     try:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
+
+        # ===== اگه لینک یوتیوب بود، مستقیم با yt-dlp =====
+        if _is_youtube_source(url):
+            await do_download_and_send(event, status_msg, url, url)
+            return
+
         (
             found_urls,
             session_headers,
@@ -2126,7 +2240,7 @@ async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     await event.reply(
-        "🚀 **Ultimate Bot v5**\n\n"
+        "🚀 **Ultimate Bot v6**\n\n"
         "• `/dirpy <url>` → Download video\n"
         "• `/snapwc <url>` → Download via SnapWC\n"
         "• `/savep <url>` → Download via SaveTheVideo\n"
@@ -2136,6 +2250,7 @@ async def start_cmd(event):
         "• `/github` → GitHub upload status\n"
         "• `/startgithub` → Enable GitHub upload\n"
         "• `/stopgithub` → Disable GitHub upload\n\n"
+        "**YouTube links → auto yt-dlp (server-side)**\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode="markdown",
@@ -2379,6 +2494,13 @@ async def generic_url_handler(event):
     logger.info(
         f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}"
     )
+
+    # ===== اگه لینک یوتیوب بود، مستقیم با do_download_and_send (که خودش yt-dlp رو صدا میزنه) =====
+    if _is_youtube_source(target_url):
+        status_msg = await event.reply("⏬ YouTube link detected — downloading...")
+        await do_download_and_send(event, status_msg, target_url, target_url)
+        return
+
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading...")
@@ -2724,6 +2846,7 @@ async def snapwc_select_callback(event):
             except Exception:
                 pass
 
+            snapwc_sessions[session_id] = session
             user_state[event.chat_id] = {
                 "action": "snapwc_captcha",
                 "session_id": session_id,
@@ -2914,12 +3037,12 @@ async def snapwc_cancel_callback(event):
 # ====================== MAIN ======================
 async def main():
     print("\n" + "=" * 60)
-    print("🚀 ULTIMATE BOT v5")
-    print("   FIX 1: 403 → auto-retry via Dirpy")
-    print("   FIX 2: FFmpeg -noautorotate + yuv420p")
-    print("   FIX 3: size_input uses chat_id (not sender_id)")
-    print("   FIX 4: pause/resume split callbacks")
-    print("   FIX 5: command pattern conflict resolved")
+    print("🚀 ULTIMATE BOT v6")
+    print("   FIX 1: YouTube IP-lock → server-side yt-dlp")
+    print("   FIX 2: 403 → auto-retry via Dirpy")
+    print("   FIX 3: FFmpeg -noautorotate + yuv420p")
+    print("   FIX 4: size_input uses chat_id (not sender_id)")
+    print("   FIX 5: pause/resume split callbacks")
     print("   FIX 6: detailed logging enabled")
     print("=" * 60)
     logger.info("[BOOT] Starting bot...")
