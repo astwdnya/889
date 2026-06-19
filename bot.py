@@ -779,57 +779,62 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
         pw = await async_playwright().__aenter__()
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+            ],
         )
         ctx = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
         )
         page = await ctx.new_page()
-        await page.goto(
-            "https://seostudio.tools/youtube-description-extractor",
-            wait_until="networkidle",
-            timeout=30000,
-        )
-        await asyncio.sleep(2)
 
-        input_el = page.locator("input#input")
-        await input_el.wait_for(timeout=15000)
-        await input_el.fill(url)
-        await page.evaluate(
-            'document.querySelector("input#input").dispatchEvent(new Event("change"))'
-        )
-        await asyncio.sleep(1)
+        for retry in range(3):
+            try:
+                await page.goto(
+                    "https://seostudio.tools/youtube-description-extractor",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                break
+            except Exception:
+                if retry < 2:
+                    await asyncio.sleep(3)
+                else:
+                    raise
 
-        extract_btn = page.locator("button.bg-gradient-info")
+        url_input = page.locator("#input")
+        await url_input.wait_for(timeout=15000)
+        await url_input.click()
+        await url_input.fill("")
+        await url_input.type(url, delay=30)
+
+        extract_btn = page.locator(
+            'span[wire\\:target="onYoutubeDescriptionExtractor"]'
+        )
         await extract_btn.wait_for(timeout=10000)
         await extract_btn.click()
 
-        textarea = page.locator("textarea#text")
+        textarea = page.locator("#text")
         await textarea.wait_for(timeout=30000)
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
-        try:
-            await page.wait_for_function(
-                'document.querySelector("textarea#text").value.trim().length > 10',
-                timeout=30000,
-            )
-        except Exception:
-            pass
+        content = await textarea.input_value()
 
-        text = await textarea.input_value()
-
-        if text and len(text.strip()) > 10:
-            lines = text.strip().split("\n", 1)
+        if content and len(content.strip()) > 20:
+            lines = content.strip().split("\n", 1)
             result["title"] = lines[0].strip()
             result["description"] = lines[1].strip() if len(lines) > 1 else ""
         else:
-            err_msg = f"Empty result after extraction (text len={len(text)})"
-            logger.warning(f"[SEOSTUDIO] {err_msg}")
-            result["error"] = err_msg
+            result["error"] = f"Empty result (len={len(content)})"
     except Exception as e:
-        err_msg = str(e)[:200]
-        logger.warning(f"[SEOSTUDIO] Error: {err_msg}")
-        result["error"] = err_msg
+        result["error"] = str(e)[:200]
     finally:
         if browser:
             try:
