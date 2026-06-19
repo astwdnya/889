@@ -5,7 +5,6 @@ import sys
 import time
 import random
 import base64
-import aiofiles
 from playwright.async_api import async_playwright
 
 URL_PATTERN = re.compile(r"https?://[^\s/$.?#].[^\s]*", re.IGNORECASE)
@@ -82,26 +81,6 @@ class SnapWCSession:
 
         self.page = await self.context.new_page()
         await self.page.add_init_script(STEALTH_JS)
-
-    async def download_through_browser(self, url: str, filepath: str) -> bool:
-        try:
-            resp = await self.context.request.get(
-                url,
-                headers={
-                    "Accept": "video/webm,video/ogg,video/mp4,video/*;q=0.9,*/*;q=0.5",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://www.youtube.com/",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                },
-            )
-            if resp.status != 200:
-                return False
-            buf = await resp.body()
-            async with aiofiles.open(filepath, "wb") as f:
-                await f.write(buf)
-            return True
-        except Exception:
-            return False
 
     async def close_browser(self):
         try:
@@ -474,33 +453,10 @@ class SnapWCSession:
             await asyncio.sleep(0.5)
         return False
 
-    async def _download_via_browser(self, url: str):
-        try:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            current = getattr(self, "current_page", self.page)
-            ctx = current.context
-            new_page = await ctx.new_page()
-            resp = await new_page.goto(
-                url, wait_until="domcontentloaded", timeout=60000
-            )
-            if resp and resp.ok:
-                body = await resp.body()
-                if len(body) > 1024:
-                    fname = f"snapwc_{int(time.time())}.mp4"
-                    fpath = os.path.join(OUTPUT_DIR, fname)
-                    async with aiofiles.open(fpath, "wb") as f:
-                        await f.write(body)
-                    await new_page.close()
-                    return fpath
-            await new_page.close()
-        except Exception:
-            pass
-        return ""
-
-    async def get_download_url(self) -> str:
+    async def get_download_url(self) -> dict:
         current = getattr(self, "current_page", self.page)
+        url = ""
         for attempt in range(60):
-            # 1) scan DOM for /get? URLs (converter URL — preferred)
             try:
                 url = await current.evaluate("""() => {
                     const a = document.querySelector('a[href*="/get?"]');
@@ -510,124 +466,91 @@ class SnapWCSession:
                     return null;
                 }""")
                 if url:
-                    self.download_url = url
-                    return url
+                    break
             except Exception:
                 pass
 
-            # 2) scan ALL elements for /get? or sf-converter.com URLs
-            try:
-                url = await current.evaluate("""() => {
-                    const els = document.querySelectorAll('*');
-                    for (const el of els) {
-                        const t = el.textContent.trim();
-                        if (t.startsWith('http://') || t.startsWith('https://')) {
-                            if (t.includes('/get?') || t.includes('sf-converter.com/get')) return t;
+            if not url:
+                try:
+                    url = await current.evaluate("""() => {
+                        const els = document.querySelectorAll('*');
+                        for (const el of els) {
+                            const t = el.textContent.trim();
+                            if (t.startsWith('http://') || t.startsWith('https://')) {
+                                if (t.includes('/get?') || t.includes('sf-converter.com/get')) return t;
+                            }
                         }
-                    }
-                    return null;
-                }""")
-                if url:
-                    self.download_url = url
-                    return url
-            except Exception:
-                pass
+                        return null;
+                    }""")
+                    if url:
+                        break
+                except Exception:
+                    pass
 
-            # 3) regex on body inner_text for /get? URLs
-            try:
-                body = await current.inner_text("body")
-                for match in re.finditer(r'https?://[^\s"\']+/get\?[^\s"\']+', body):
-                    self.download_url = match.group(0)
-                    return match.group(0)
-            except Exception:
-                pass
+            if not url:
+                try:
+                    body = await current.inner_text("body")
+                    for match in re.finditer(
+                        r'https?://[^\s"\']+/get\?[^\s"\']+', body
+                    ):
+                        url = match.group(0)
+                        break
+                    if url:
+                        break
+                except Exception:
+                    pass
 
-            # 4) clipboard (filtered — only converter URLs)
-            try:
-                text = await current.evaluate("""async () => {
-                    try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
-                    return '';
-                }""")
-                if text:
-                    self.download_url = text
-                    return text
-            except Exception:
-                pass
-
-            # 5) clipboard via hidden input (filtered)
-            try:
-                url = await current.evaluate("""async () => {
-                    try {
-                        const inp = document.createElement('input');
-                        inp.style.position = 'fixed'; inp.style.left = '-9999px';
-                        document.body.appendChild(inp);
-                        inp.focus();
-                        const t = await navigator.clipboard.readText();
-                        inp.value = t;
-                        inp.remove();
-                        if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t;
-                    } catch(e) {}
-                    return '';
-                }""")
-                if url:
-                    self.download_url = url
-                    return url
-            except Exception:
-                pass
-
-            # 6) catch-all: clipboard via execCommand (more reliable in headless)
-            try:
-                text = await current.evaluate("""() => {
-                    try {
-                        var inp = document.createElement('input');
-                        inp.style.position = 'fixed'; inp.style.left = 0; inp.style.top = 0;
-                        inp.style.width = '1px'; inp.style.height = '1px';
-                        document.body.appendChild(inp);
-                        inp.focus();
-                        inp.select();
-                        var ok = document.execCommand('paste');
-                        var val = inp.value.trim();
-                        inp.remove();
-                        if (ok && val && val.startsWith('http')) return val;
-                    } catch(e) {}
-                    return '';
-                }""")
-                if text:
-                    self.download_url = text
-                    return text
-            except Exception:
-                pass
-
-            # 7) catch-all: clipboard async API fallback
-            try:
-                text = await current.evaluate("""async () => {
-                    try { const t = await navigator.clipboard.readText(); if (t && t.startsWith('http')) return t; } catch(e) {}
-                    return '';
-                }""")
-                if text:
-                    self.download_url = text
-                    return text
-            except Exception:
-                pass
+            if not url:
+                try:
+                    text = await current.evaluate("""async () => {
+                        try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
+                        return '';
+                    }""")
+                    if text:
+                        url = text
+                        break
+                except Exception:
+                    pass
 
             await asyncio.sleep(0.5)
-        return ""
+
+        if not url:
+            return {"url": "", "headers": {}}
+
+        self.download_url = url
+
+        cookies_raw = []
+        try:
+            cookies_raw = await self.context.cookies()
+        except Exception:
+            pass
+
+        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies_raw)
+        headers = {
+            "Referer": "https://snapwc.com/sites",
+            "Origin": "https://sf-converter.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        }
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+
+        return {"url": url, "headers": headers}
 
     async def run_full_flow(self, video_url: str) -> dict:
         steps = []
         try:
             steps.append("Starting browser...")
-            await asyncio.wait_for(self.start_browser(), timeout=45)
+            await self.start_browser()
             steps.append("Navigating to snapwc.com...")
-            await asyncio.wait_for(self.navigate(), timeout=100)
+            await self.navigate()
             steps.append("Pasting URL...")
-            await asyncio.wait_for(self.paste_url(video_url), timeout=40)
+            await self.paste_url(video_url)
             steps.append("Clicking Get Download Links...")
-            await asyncio.wait_for(self.click_get_links(), timeout=20)
+            await self.click_get_links()
             steps.append("Waiting for conversion...")
-            await asyncio.wait_for(self.wait_for_conversion(), timeout=180)
+            await self.wait_for_conversion()
             steps.append("Parsing qualities...")
-            await asyncio.wait_for(self.parse_qualities(), timeout=130)
+            await self.parse_qualities()
             steps.append(f"Found {len(self.qualities)} quality options")
 
             return {
@@ -699,8 +622,10 @@ class SnapWCSession:
                 }
 
             steps.append("Retrieving download URL...")
-            url = await self.get_download_url()
-            if not url:
+            dl_info = await self.get_download_url()
+            dl_url = dl_info.get("url", "")
+            dl_headers = dl_info.get("headers", {})
+            if not dl_url:
                 await self.take_screenshot()
                 return {
                     "success": False,
@@ -710,19 +635,13 @@ class SnapWCSession:
                     "session": self,
                 }
 
-            steps.append("Downloading file via browser...")
-            filepath = await self._download_via_browser(url)
-            steps.append(
-                f"Downloaded to {filepath}"
-                if filepath
-                else "Download failed, falling back to URL"
-            )
+            steps.append("Got download link! Cleaning up...")
             await self.close_browser()
             return {
                 "success": True,
                 "captcha": False,
-                "download_url": url,
-                "filepath": filepath,
+                "download_url": dl_url,
+                "download_headers": dl_headers,
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
@@ -770,8 +689,10 @@ class SnapWCSession:
                 }
 
             steps.append("Retrieving download URL...")
-            url = await self.get_download_url()
-            if not url:
+            dl_info = await self.get_download_url()
+            dl_url = dl_info.get("url", "")
+            dl_headers = dl_info.get("headers", {})
+            if not dl_url:
                 await self.take_screenshot()
                 return {
                     "success": False,
@@ -786,7 +707,8 @@ class SnapWCSession:
             return {
                 "success": True,
                 "captcha": False,
-                "download_url": url,
+                "download_url": dl_url,
+                "download_headers": dl_headers,
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
@@ -804,9 +726,6 @@ class SnapWCSession:
 
 
 # ─── Standalone CLI usage ──────────────────────────────────────────
-OUTPUT_DIR = "output_files"
-
-
 async def main():
     print("SnapWC Video Downloader")
     video_url = input("Paste video URL: ").strip()
@@ -832,6 +751,7 @@ async def main():
 
     if result2["success"] and result2.get("download_url"):
         print(f"\nDownload URL: {result2['download_url']}")
+        print(f"Download headers: {result2.get('download_headers', {})}")
         print(f"Title: {result2.get('title', '')}")
     else:
         print(f"Error: {result2.get('error', 'Unknown')}")

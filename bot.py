@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Telegram Ultimate Bot - v6
-# Fixes: YouTube IP-lock via yt-dlp + 403 auto-dirpy + FFmpeg scale/rotation + size_input chat_id + pause/resume split
+# Telegram Ultimate Bot - v5
+# Fixes: 403 auto-dirpy + FFmpeg scale/rotation fix + size_input chat_id fix + pause/resume split
 
 import asyncio
 import os
@@ -28,7 +28,6 @@ from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Message,
-    DocumentAttributeAudio,
     DocumentAttributeVideo,
     InputMediaUploadedDocument,
 )
@@ -43,7 +42,6 @@ from github import (
 )
 from savep_handler import process_savep_request
 from snapwc_handler import SnapWCSession
-from y2mate import Y2MateSession
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -65,7 +63,6 @@ admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
-y2mate_sessions: Dict[str, Y2MateSession] = {}  # Y2Mate session references
 
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
@@ -204,119 +201,33 @@ def build_progress_text(
 
 
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
-def _filename_from_url(
-    url: str, cd_header: str = "", fallback_ext: str = "", original_url: str = ""
-) -> str:
-    import urllib.parse as _up
-    from pathlib import Path
-
-    name = ""
-    m = re.search(r"filename\*=([^;\s]+)", cd_header)
-    if m:
-        raw = m.group(1).strip()
-        if raw.startswith("UTF-8''"):
-            name = _up.unquote(raw[7:])
-        else:
-            name = raw.strip('"').strip("'")
-    if not name or "." not in name:
-        m = re.search(r'filename="([^"]*)"', cd_header)
-        if m:
-            name = m.group(1).strip()
-    if not name or "." not in name:
-        m = re.search(r"filename=([^;\s]+)", cd_header)
-        if m:
-            name = m.group(1).strip()
-    if not name or "." not in name:
-        if original_url:
-            name = Path(_up.urlparse(original_url).path).name
-    if not name or "." not in name:
-        name = Path(_up.urlparse(url).path).name
-    if not name or "." not in name:
-        name = f"file_{int(time.time())}"
-    name = name.split("?")[0].split("#")[0]
-    name = _up.unquote(name)
-    ext = os.path.splitext(name)[1]
-    base = os.path.splitext(name)[0][:80]
-    name = f"{base}{ext}" if ext else base
-    if not ext:
-        fe = fallback_ext.lstrip(".")
-        if fe:
-            name = f"{name}.{fe}"
-        else:
-            name = f"{name}.bin"
-    return name
-
-
 async def download_with_controls(
     url: str,
     status_msg: Message,
     dl_id: str,
     referer: Optional[str] = None,
     extra_headers: Optional[dict] = None,
-    fallback_ext: str = "",
 ) -> Tuple[Optional[str], Optional[str], int]:
     MAX_RETRIES = 3
     CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 
-    import urllib.parse as _up
-
-    is_googlevideo = (
-        "googlevideo.com" in url or "youtube.com" in url or "youtu.be" in url
-    )
-    yt_client = ""
-    if is_googlevideo:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive",
+    }
+    if referer:
+        headers["Referer"] = referer
         try:
-            qs = _up.parse_qs(_up.urlparse(url).query)
-            yt_client = (qs.get("c", [""])[0]).upper()
+            headers["Origin"] = "/".join(referer.split("/")[:3])
         except Exception:
             pass
-
-    headers = {
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-    }
-
-    if is_googlevideo:
-        if yt_client == "ANDROID_VR":
-            headers["User-Agent"] = (
-                "com.google.android.apps.youtube.vr.oculus/1.61.48 "
-                "(Linux; U; Android 12; GB) gzip"
-            )
-        elif yt_client == "ANDROID":
-            headers["User-Agent"] = (
-                "com.google.android.youtube/19.09.37 (Linux; U; Android 12) gzip"
-            )
-        elif yt_client == "IOS":
-            headers["User-Agent"] = (
-                "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)"
-            )
-        else:
-            headers["User-Agent"] = (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            )
-        # googlevideo URLs reject requests with Referer/Origin
-    else:
-        headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        )
-        if referer:
-            headers["Referer"] = referer
-            try:
-                headers["Origin"] = "/".join(referer.split("/")[:3])
-            except Exception:
-                pass
-
     if extra_headers:
         headers.update(extra_headers)
-    if is_googlevideo and "Range" not in headers:
-        headers["Range"] = "bytes=0-"
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
-    original_name = _filename_from_url(url, "", fallback_ext)
-    filepath = os.path.join(OUTPUT_FOLDER, f"dl_{int(time.time())}_{original_name}")
+    filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
     downloaded = 0
     total = 0
     last_update = 0.0
@@ -387,20 +298,15 @@ async def download_with_controls(
                                 0,
                             )
                         cd = response.headers.get("Content-Disposition", "")
-                        cd_name = _filename_from_url(
-                            str(response.url), cd, fallback_ext
-                        )
-                        filepath = os.path.join(
-                            OUTPUT_FOLDER, f"dl_{int(time.time())}_{cd_name}"
-                        )
+                        if "filename=" in cd:
+                            fm = re.search(r'filename="?([^";]+)', cd)
+                            if fm:
+                                ext = os.path.splitext(fm.group(1).strip())[1] or ".mp4"
+                                filepath = os.path.join(
+                                    OUTPUT_FOLDER, f"video_{int(time.time())}{ext}"
+                                )
 
-                    if response.status == 200 and downloaded > 0:
-                        downloaded = 0
-                        write_mode = "wb"
-                    elif response.status == 206 and downloaded > 0:
-                        write_mode = "ab"
-                    else:
-                        write_mode = "wb"
+                    write_mode = "ab" if downloaded > 0 else "wb"
                     async with aiofiles.open(filepath, write_mode) as f:
                         async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                             if active_downloads.get(dl_id, {}).get("cancelled"):
@@ -507,273 +413,6 @@ async def download_with_controls(
     return None, "Download failed", 0
 
 
-# ====================== YT-DLP YOUTUBE DOWNLOAD ======================
-def _is_youtube_source(url: str) -> bool:
-    """تشخیص اینکه لینک مربوط به صفحه یوتیوب هست یا نه (نه googlevideo)."""
-    u = url.lower()
-    return (
-        "youtube.com/watch" in u
-        or "youtu.be/" in u
-        or "youtube.com/shorts" in u
-        or "m.youtube.com" in u
-    )
-
-
-async def download_youtube_ytdlp(
-    youtube_url: str,
-    status_msg: Message,
-    dl_id: str,
-) -> Tuple[Optional[str], Optional[str], int]:
-    """
-    دانلود مستقیم یوتیوب با yt-dlp روی خود سرور.
-    این کار مشکل IP-lock و User-Agent mismatch رو کامل حل می‌کنه چون
-    لینک نهایی googlevideo با IP خود سرور ساخته می‌شه.
-    """
-    output_tmpl = os.path.join(OUTPUT_FOLDER, f"yt_{int(time.time())}.%(ext)s")
-
-    if dl_id not in active_downloads:
-        active_downloads[dl_id] = {"paused": False, "cancelled": False}
-
-    dl_buttons_cancel = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
-
-    await safe_edit(
-        status_msg,
-        "📥 Downloading via yt-dlp (server-side)...",
-        buttons=dl_buttons_cancel,
-    )
-    logger.info(f"[YTDLP] START | url={youtube_url[:120]}")
-
-    # فرمت: بهترین کیفیت mp4 ترکیبی، یا بهترین video+audio با merge
-    args = [
-        "yt-dlp",
-        "-f",
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format",
-        "mp4",
-        "--no-playlist",
-        "--no-warnings",
-        "--newline",
-        "--progress",
-        "-o",
-        output_tmpl,
-        youtube_url,
-    ]
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-
-        last_update = 0.0
-        # خواندن خط‌به‌خط خروجی برای نمایش پیشرفت و چک کردن cancel
-        while True:
-            if active_downloads.get(dl_id, {}).get("cancelled"):
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                try:
-                    await status_msg.edit("🚫 Download cancelled.", buttons=None)
-                except Exception:
-                    pass
-                return None, "Cancelled by user", 0
-
-            try:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=1.0)
-            except asyncio.TimeoutError:
-                if proc.returncode is not None:
-                    break
-                continue
-
-            if not line:
-                break
-
-            text = line.decode(errors="replace").strip()
-            # خط‌های پیشرفت yt-dlp مثل: [download]  45.3% of 12.34MiB at 1.23MiB/s
-            m = re.search(
-                r"\[download\]\s+([\d.]+)%.*?of\s+([\d.]+\w+).*?at\s+([\d.]+\w+/s)",
-                text,
-            )
-            if m:
-                now = time.time()
-                if now - last_update >= 2.0:
-                    last_update = now
-                    percent = m.group(1)
-                    size = m.group(2)
-                    speed = m.group(3)
-                    await safe_edit(
-                        status_msg,
-                        f"📥 **Downloading (yt-dlp)**\n"
-                        f"📊 {percent}%  •  📦 {size}  •  🚀 {speed}",
-                        buttons=dl_buttons_cancel,
-                    )
-
-        await proc.wait()
-        active_downloads.pop(dl_id, None)
-
-        if proc.returncode != 0:
-            logger.warning(f"[YTDLP] failed | rc={proc.returncode}")
-            return None, "YTDLP_FAILED", 0
-
-        # پیدا کردن فایل خروجی
-        found = None
-        prefix = os.path.basename(output_tmpl).split("%")[0]
-        for fname in os.listdir(OUTPUT_FOLDER):
-            if fname.startswith(prefix):
-                found = os.path.join(OUTPUT_FOLDER, fname)
-                break
-
-        if not found or not os.path.exists(found) or os.path.getsize(found) == 0:
-            return None, "YTDLP_FAILED", 0
-
-        size = os.path.getsize(found)
-        logger.info(f"[YTDLP] DONE | size={human_readable_size(size)} | file={found}")
-        try:
-            await status_msg.edit("✅ Download complete!", buttons=None)
-        except Exception:
-            pass
-        return found, None, size
-
-    except FileNotFoundError:
-        active_downloads.pop(dl_id, None)
-        return None, "yt-dlp not installed on server", 0
-    except Exception as e:
-        active_downloads.pop(dl_id, None)
-        logger.error(f"[YTDLP] error: {e}")
-        return None, str(e)[:100], 0
-
-
-async def get_youtube_meta_aiohttp(url: str) -> dict:
-    """Fetch YouTube title (oEmbed) + description (meta tag) with simple HTTP requests."""
-    result = {"title": "", "description": ""}
-    try:
-        async with aiohttp.ClientSession() as s:
-            oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
-            async with s.get(oembed_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    result["title"] = data.get("title", "")
-    except Exception:
-        pass
-    try:
-        import re as _re
-
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    html = await r.text()
-                    m = _re.search(
-                        r'<meta\s+name="description"\s+content="([^"]*)"',
-                        html,
-                        _re.IGNORECASE,
-                    )
-                    if m:
-                        result["description"] = m.group(1)
-    except Exception:
-        pass
-    return result
-
-
-# ====================== STREAMING DOWNLOAD (FFMPEG) ======================
-
-
-def is_stream_url(url: str) -> bool:
-    keywords = ["m3u8", "mp4", "play?", "stream", "video"]
-    return any(k in url.lower() for k in keywords)
-
-
-async def extract_m3u8_from_html(page_url: str) -> str | None:
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
-        }
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                page_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                if r.status != 200:
-                    return None
-                html = await r.text()
-                import re as _re
-
-                for m in _re.finditer(r'https?://[^"\']*\.m3u8[^"\'\s]*', html):
-                    return m.group(0)
-                for m in _re.finditer(r'https?://[^"\']*\.mp4[^"\'\s]*', html):
-                    return m.group(0)
-    except Exception:
-        pass
-    return None
-
-
-async def download_stream_ffmpeg(
-    url: str, filepath: str, referer: str = ""
-) -> tuple[bool, str]:
-    cmd = ["ffmpeg", "-y"]
-    if referer:
-        cmd.extend(
-            [
-                "-headers",
-                f"Referer: {referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\n",
-            ]
-        )
-    cmd.extend(["-i", url, "-c", "copy", filepath])
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-        if proc.returncode == 0:
-            return True, ""
-        err_text = (
-            stderr.decode(errors="replace")[-300:]
-            if stderr
-            else f"ffmpeg exit code {proc.returncode}"
-        )
-        return False, err_text
-    except asyncio.TimeoutError:
-        return False, "ffmpeg timed out (600s)"
-    except FileNotFoundError:
-        return False, "ffmpeg not found on server"
-    except Exception as e:
-        return False, str(e)[:100]
-
-
-async def try_stream_download(
-    url: str, status_msg, referer: str = ""
-) -> tuple[str | None, str | None]:
-    """Try ffmpeg stream download, then m3u8 extraction from page."""
-    stream_path = os.path.join(OUTPUT_FOLDER, f"stream_{int(time.time())}.mp4")
-    await safe_edit(status_msg, "🎬 Detected stream — trying ffmpeg...")
-    ok, err_msg = await download_stream_ffmpeg(url, stream_path, referer=referer)
-    if ok and os.path.exists(stream_path) and os.path.getsize(stream_path) > 1024:
-        return stream_path, None
-    await safe_edit(status_msg, "🔍 Trying to extract streaming URL from page...")
-    m3u8 = await extract_m3u8_from_html(url)
-    if m3u8:
-        stream_path2 = os.path.join(OUTPUT_FOLDER, f"stream_{int(time.time())}.mp4")
-        ok2, err_msg2 = await download_stream_ffmpeg(
-            m3u8, stream_path2, referer=referer
-        )
-        if (
-            ok2
-            and os.path.exists(stream_path2)
-            and os.path.getsize(stream_path2) > 1024
-        ):
-            return stream_path2, None
-        err_msg = err_msg2
-    if os.path.exists(stream_path):
-        try:
-            os.remove(stream_path)
-        except Exception:
-            pass
-    return None, err_msg or "Stream download failed"
-
-
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
 
@@ -868,24 +507,19 @@ async def send_file_with_progress(
     buttons=None,
     supports_streaming: bool = True,
 ):
-    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-        await safe_edit(status_msg, "❌ File is empty or missing.")
-        return None
     file_size = os.path.getsize(filepath)
     start_time = time.time()
     last_update = [0.0]
     last_bytes = [0]
     last_time = [start_time]
 
+    # اطلاعات ویدیو برای نمایش درست در تلگرام
     duration, width, height = await get_video_info(filepath)
-    is_audio = (duration and duration > 0 and width == 0 and height == 0) or (
-        os.path.splitext(filepath)[1].lower()
-        in (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
-    )
-    thumb_path = await get_video_thumbnail(filepath) if not is_audio else None
+    thumb_path = await get_video_thumbnail(filepath)
 
     async def progress_cb(current: int, total: int):
         now = time.time()
+        # هر 3 ثانیه یه بار آپدیت — کمتر فشار روی event loop
         if now - last_update[0] < 3.0 and current != total:
             return
         last_update[0] = now
@@ -901,32 +535,27 @@ async def send_file_with_progress(
 
     try:
         duration_int = int(duration) if duration else 0
+        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
         with open(filepath, "rb") as f:
             uploaded = await fast_upload_file(
                 client, f, progress_callback=progress_cb, connection_count=15
             )
 
-        if is_audio:
-            attributes, mime_type = utils.get_attributes(
-                filepath,
-                attributes=[
-                    DocumentAttributeAudio(duration=duration_int, title="Audio")
-                ],
-            )
-        else:
-            attributes, mime_type = utils.get_attributes(
-                filepath,
-                attributes=[
-                    DocumentAttributeVideo(
-                        duration=duration_int,
-                        w=width if width else 0,
-                        h=height if height else 0,
-                        supports_streaming=True,
-                    )
-                ],
-            )
+        # ساخت media با متادیتای ویدیو
+        attributes, mime_type = utils.get_attributes(
+            filepath,
+            attributes=[
+                DocumentAttributeVideo(
+                    duration=duration_int,
+                    w=width if width else 0,
+                    h=height if height else 0,
+                    supports_streaming=True,
+                )
+            ],
+        )
+        # آپلود thumbnail به تلگرام
         thumb_input = None
-        if not is_audio and thumb_path and os.path.exists(thumb_path):
+        if thumb_path and os.path.exists(thumb_path):
             with open(thumb_path, "rb") as tf:
                 thumb_input = await fast_upload_file(client, tf)
 
@@ -937,46 +566,25 @@ async def send_file_with_progress(
             thumb=thumb_input,
             force_file=False,
         )
-        sent = await client.send_file(
+        await client.send_file(
             chat_id,
             media,
             caption=caption,
             buttons=buttons,
             parse_mode="markdown",
         )
-        return sent
-    except Exception as e:
-        err_str = str(e)
-        if "file parts" in err_str.lower():
-            await safe_edit(
-                status_msg, "⚠️ Fast upload failed, retrying with direct send..."
-            )
-            try:
-                sent = await client.send_file(
-                    chat_id,
-                    filepath,
-                    caption=caption,
-                    buttons=buttons,
-                    parse_mode="markdown",
-                    supports_streaming=supports_streaming,
-                )
-                return sent
-            except Exception as e2:
-                await safe_edit(status_msg, f"❌ Upload failed: {str(e2)[:100]}")
-                return None
-        else:
-            await safe_edit(status_msg, f"❌ Upload failed: {err_str[:100]}")
-            return None
     finally:
+        # پاک کردن thumbnail موقت
         if thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
             except Exception:
                 pass
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
 
 # ====================== DOWNLOAD AND SEND ======================
@@ -987,202 +595,102 @@ async def do_download_and_send(
     source_url: str,
     extra_headers: Optional[dict] = None,
     title: str = "",
-    description: str = "",
-    skip_ytdlp: bool = False,
-    fallback_ext: str = "",
 ) -> bool:
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
 
-    filepath = None
-    dl_error = None
-    final_size = 0
+    filepath, dl_error, final_size = await download_with_controls(
+        direct_url, status_msg, dl_id, referer=source_url, extra_headers=extra_headers
+    )
 
-    # ===== اگه لینک یوتیوب هست و skip_ytdlp فعال نیست، اول با yt-dlp =====
-    if not skip_ytdlp and (
-        _is_youtube_source(source_url) or _is_youtube_source(direct_url)
-    ):
-        yt_target = source_url if _is_youtube_source(source_url) else direct_url
-        filepath, dl_error, final_size = await download_youtube_ytdlp(
-            yt_target, status_msg, dl_id
-        )
-        # اگه yt-dlp شکست خورد، با روش معمولی ادامه بده
-        if dl_error == "YTDLP_FAILED" or (
-            not filepath and dl_error != "Cancelled by user"
-        ):
-            await safe_edit(status_msg, "🔄 yt-dlp failed — trying direct download...")
-            filepath = None
-            dl_error = None
-            final_size = 0
-
-    # ===== دانلود معمولی (اگه یوتیوب نبود یا yt-dlp شکست خورد) =====
-    if not filepath and dl_error != "Cancelled by user":
-        dl_id_direct = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_d"
-        active_downloads[dl_id_direct] = {"paused": False, "cancelled": False}
+    # FIX: 403 → auto-retry via dirpy
+    if dl_error == "HTTP_403":
+        await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
+        (
+            found_urls,
+            session_headers,
+            intercept_err,
+            page_title,
+        ) = await extract_video_url_smart(source_url, status_msg)
+        if not found_urls:
+            await safe_edit(
+                status_msg, f"❌ Could not extract via Dirpy either:\n{intercept_err}"
+            )
+            return False
+        if page_title and not title:
+            title = page_title
+        direct_url = found_urls[0]
+        extra_headers = session_headers
+        dl_id2 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_r"
+        active_downloads[dl_id2] = {"paused": False, "cancelled": False}
         filepath, dl_error, final_size = await download_with_controls(
             direct_url,
             status_msg,
-            dl_id_direct,
+            dl_id2,
             referer=source_url,
             extra_headers=extra_headers,
-            fallback_ext=fallback_ext,
         )
 
-        # FIX: 403 → auto-retry via dirpy (فقط برای لینک صفحه ویدیو، نه فایل مستقیم)
-        if dl_error == "HTTP_403":
-            from urllib.parse import urlparse as _up
-            import os as _os
-
-            _ext = _os.path.splitext(_up(source_url).path)[1]
-            if _ext:
-                await safe_edit(
-                    status_msg, f"❌ Server returned 403 (blocked) for this file."
-                )
-                return False
-            await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
-            (
-                found_urls,
-                session_headers,
-                intercept_err,
-                page_title,
-            ) = await extract_video_url_smart(source_url, status_msg)
-            if not found_urls:
-                await safe_edit(
-                    status_msg,
-                    f"❌ Could not extract via Dirpy either:\n{intercept_err}",
-                )
-                return False
-            if page_title and not title:
-                title = page_title
-            direct_url = found_urls[0]
-            extra_headers = session_headers
-            dl_id2 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_r"
-            active_downloads[dl_id2] = {"paused": False, "cancelled": False}
-            filepath, dl_error, final_size = await download_with_controls(
-                direct_url,
-                status_msg,
-                dl_id2,
-                referer=source_url,
-                extra_headers=extra_headers,
-                fallback_ext=fallback_ext,
-            )
-
     if dl_error or not filepath:
-        if dl_error != "Cancelled by user" and is_stream_url(direct_url):
-            stream_fp, stream_err = await try_stream_download(
-                direct_url, status_msg, referer=source_url
-            )
-            if stream_fp:
-                filepath, dl_error = stream_fp, None
-                final_size = os.path.getsize(stream_fp)
-            else:
-                await safe_edit(status_msg, f"❌ Download failed: {stream_err}")
-                return False
-        elif dl_error != "Cancelled by user":
+        if dl_error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
-            return False
-        else:
-            return False
+        return False
 
-    import os as _os_audio
-
+    # بررسی کن فایل دانلود شده واقعاً ویدیو هست یا نه
     vid_duration, vw, vh = await get_video_info(filepath)
-
-    _audio_exts = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
-    _is_audio = (vid_duration and vid_duration > 0 and vw == 0 and vh == 0) or (
-        (not vid_duration or vid_duration <= 0)
-        and _os_audio.path.splitext(filepath)[1].lower() in _audio_exts
-    )
-
-    sent_msg = None
-
-    if _is_audio:
-        await safe_edit(status_msg, "🎵 Uploading audio...")
+    if vid_duration is None or vid_duration <= 0:
+        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
         try:
-            _vd = vid_duration or 0
-            sent_msg = await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption="🎵 Audio",
-                attributes=[DocumentAttributeAudio(duration=int(_vd), title="Audio")],
-                supports_streaming=True,
-            )
-        except Exception as e:
-            logger.error(f"Audio upload error: {e}")
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-            try:
-                os.remove(filepath)
-            except Exception:
-                pass
-            return False
-    elif vid_duration is None or vid_duration <= 0:
-        fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        basename = os.path.basename(filepath)
-        await safe_edit(status_msg, "📤 Uploading file...")
-        try:
-            sent_msg = await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption=f"📎 **{basename}**",
-                force_document=True,
-            )
-        except Exception as e:
-            logger.error(f"File upload error: {e}")
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-            try:
-                os.remove(filepath)
-            except Exception:
-                pass
-            return False
-    else:
-        await safe_edit(status_msg, "📤 Uploading...")
-        try:
-            dur_str = ""
-            if vid_duration and vid_duration > 0:
-                mins, secs = divmod(int(vid_duration), 60)
-                hours, mins = divmod(mins, 60)
-                if hours > 0:
-                    dur_str = f"\n⏱ Duration: {hours}:{mins:02d}:{secs:02d}"
-                else:
-                    dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
+            os.remove(filepath)
+        except Exception:
+            pass
+        return False
 
-            gh_line = ""
-            if GITHUB_ENABLED:
-                await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-                gh_url = await maybe_upload_github(
-                    event.client, event.chat_id, filepath, final_size
-                )
-                if gh_url:
-                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-            sent_msg = await send_file_with_progress(
-                client=event.client,
-                chat_id=event.chat_id,
-                filepath=filepath,
-                caption=(
-                    f"🎬 **Video Downloaded**\n"
-                    f"📦 Size: {human_readable_size(final_size)}"
-                    f"{dur_str}\n"
-                    f"🔗 [Source]({source_url})"
-                    f"\n⬇️ [DW Link]({direct_url})"
-                    f"{gh_line}"
-                ),
-                status_msg=status_msg,
-                supports_streaming=True,
-            )
-        except Exception as e:
-            logger.error(f"Upload error: {e}")
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-            try:
-                os.remove(filepath)
-            except Exception:
-                pass
-            return False
-
-    await safe_edit(status_msg, "✅ Done!")
+    await safe_edit(status_msg, "📤 Uploading...")
     try:
-        os.remove(filepath)
-    except Exception:
-        pass
+        dur_str = ""
+        if vid_duration and vid_duration > 0:
+            mins, secs = divmod(int(vid_duration), 60)
+            hours, mins = divmod(mins, 60)
+            if hours > 0:
+                dur_str = f"\n⏱ Duration: {hours}:{mins:02d}:{secs:02d}"
+            else:
+                dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
+
+        caption_start = f"🎬 {title}" if title else "🎬 **Video Downloaded**"
+
+        gh_line = ""
+        if GITHUB_ENABLED:
+            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+            gh_url = await maybe_upload_github(
+                event.client, event.chat_id, filepath, final_size
+            )
+            if gh_url:
+                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=filepath,
+            caption=(
+                f"{caption_start}\n"
+                f"📦 Size: {human_readable_size(final_size)}"
+                f"{dur_str}\n"
+                f"🔗 [Source]({source_url})\n"
+                f"⬇️ [DW Link]({direct_url})"
+                f"{gh_line}"
+            ),
+            status_msg=status_msg,
+            supports_streaming=True,
+        )
+        # پاک کردن خودکار فایل از سرور بعد از آپلود موفق
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        return False
     return True
 
 
@@ -1677,6 +1185,8 @@ async def compress_video(
         audio_bitrate_k = audio_bitrate_bps // 1000
 
         # FIX: scale + format=yuv420p + noautorotate
+        # - format=yuv420p: مطمئن میشه pixel format با libx264 سازگاره
+        # - noautorotate: جلوگیری از تداخل rotation metadata با scale filter
         SCALE_VF = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
         COMMON_INPUT = ["-noautorotate", "-i", input_path]
 
@@ -1810,12 +1320,6 @@ async def process_dirpy_request(event, url: str):
     try:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-
-        # ===== اگه لینک یوتیوب بود → y2mate =====
-        if _is_youtube_source(url):
-            await _start_y2mate_flow(event, status_msg, url)
-            return
-
         (
             found_urls,
             session_headers,
@@ -2521,9 +2025,8 @@ async def start_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     await event.reply(
-        "🚀 **Ultimate Bot v6**\n\n"
+        "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
-        "• `/yt <url>` → Download YouTube via Y2Mate\n"
         "• `/snapwc <url>` → Download via SnapWC\n"
         "• `/savep <url>` → Download via SaveTheVideo\n"
         "• `/pdf <url>` → Webpage to PDF\n"
@@ -2532,7 +2035,6 @@ async def start_cmd(event):
         "• `/github` → GitHub upload status\n"
         "• `/startgithub` → Enable GitHub upload\n"
         "• `/stopgithub` → Disable GitHub upload\n\n"
-        "**YouTube links → auto yt-dlp (server-side)**\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode="markdown",
@@ -2776,19 +2278,6 @@ async def generic_url_handler(event):
     logger.info(
         f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}"
     )
-
-    # ===== اگه لینک یوتیوب بود → برو به y2mate =====
-    if _is_youtube_source(target_url):
-        status_msg = await event.reply("🎬 YouTube detected — starting Y2Mate...")
-        await _start_y2mate_flow(event, status_msg, target_url)
-        return
-
-    # ===== اگه لینک pornhub بود → برو به snapwc =====
-    if "pornhub.com/view_video.php" in target_url.lower():
-        status_msg = await event.reply("🔞 PornHub detected — starting SnapWC...")
-        await _run_snapwc_flow(event, status_msg, target_url)
-        return
-
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading...")
@@ -2797,17 +2286,8 @@ async def generic_url_handler(event):
         target_url, status_msg, dl_id, referer=target_url
     )
 
-    # FIX: 403 → auto-dirpy (فقط برای لینک صفحه ویدیو، نه فایل مستقیم)
+    # FIX: 403 → auto-dirpy
     if error == "HTTP_403":
-        from urllib.parse import urlparse
-        import os as _os
-
-        _ext = _os.path.splitext(urlparse(target_url).path)[1]
-        if _ext:
-            await safe_edit(
-                status_msg, f"❌ Server returned 403 (blocked) for this file."
-            )
-            return
         await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
         await process_dirpy_request(event, target_url)
         try:
@@ -2817,72 +2297,17 @@ async def generic_url_handler(event):
         return
 
     if error or not filepath:
-        if error != "Cancelled by user" and is_stream_url(target_url):
-            stream_fp, stream_err = await try_stream_download(
-                target_url, status_msg, referer=target_url
-            )
-            if stream_fp:
-                filepath, error = stream_fp, None
-                size = os.path.getsize(stream_fp)
-            else:
-                await safe_edit(status_msg, f"❌ {stream_err}")
-                return
-        elif error != "Cancelled by user":
+        if error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ {error or 'Failed'}")
-            return
-        else:
-            return
-
-    import os as _os_audio2
-
-    # تشخیص نوع فایل با ffprobe
+        return
     vid_duration, vw, vh = await get_video_info(filepath)
-
-    # اگه فقط صدا داره → بصورت ویس بفرست
-    _audio_exts2 = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
-    _is_audio2 = (vid_duration and vid_duration > 0 and vw == 0 and vh == 0) or (
-        (not vid_duration or vid_duration <= 0)
-        and _os_audio2.path.splitext(filepath)[1].lower() in _audio_exts2
-    )
-    if _is_audio2:
-        await safe_edit(status_msg, "🎵 Uploading audio...")
-        try:
-            _vd2 = vid_duration or 0
-            basename = os.path.basename(filepath)
-            await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption=basename,
-                attributes=[DocumentAttributeAudio(duration=int(_vd2), title=basename)],
-                supports_streaming=True,
-            )
-        except Exception as e:
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-        return
-
-    # اگه ویدیو نیست → آپلود به عنوان فایل
     if vid_duration is None or vid_duration <= 0:
-        basename = os.path.basename(filepath)
-        await safe_edit(status_msg, "📤 Uploading file...")
-        try:
-            await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption=f"📎 **{basename}**\n📦 Size: {human_readable_size(size)}",
-                force_document=True,
-            )
-        except Exception as e:
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
         try:
             os.remove(filepath)
         except Exception:
             pass
         return
-
     await safe_edit(status_msg, "📤 Uploading...")
     try:
         dur_str = ""
@@ -3049,7 +2474,18 @@ async def vgh_no_callback(event):
 # ====================== SNAPWC HANDLERS ======================
 
 
-async def _run_snapwc_flow(event, status_msg, url: str):
+async def snapwc_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/snapwc <url>`", parse_mode="markdown")
+
+    url = parts[1].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    status_msg = await event.reply("🔄 Starting SnapWC session...")
     logger.info(f"[SNAPWC] START | chat={event.chat_id} | url={url[:120]}")
 
     session = SnapWCSession()
@@ -3127,65 +2563,22 @@ async def _run_snapwc_flow(event, status_msg, url: str):
         )
 
     except Exception as e:
-        logger.error(f"[SNAPWC] Error: {e}", exc_info=True)
+        logger.error(f"[SNAPWC] Command error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ SnapWC error: {str(e)[:120]}")
+        try:
+            ss = await session.take_screenshot()
+            if ss:
+                await event.client.send_file(
+                    event.chat_id,
+                    base64.b64decode(ss),
+                    caption=f"📸 SnapWC error screenshot",
+                )
+        except Exception:
+            pass
         try:
             await session.close_browser()
         except Exception:
             pass
-
-
-async def _upload_snapwc_file(event, status_msg, filepath: str, title: str) -> bool:
-    try:
-        import os as _os
-
-        vid_duration, vw, vh = await get_video_info(filepath)
-        is_audio = vid_duration and vid_duration > 0 and vw == 0 and vh == 0
-        if is_audio:
-            await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption=title or "Audio",
-                attributes=[
-                    DocumentAttributeAudio(
-                        duration=int(vid_duration or 0), title=title or "Audio"
-                    )
-                ],
-                supports_streaming=True,
-            )
-        else:
-            await send_file_with_progress(
-                client=event.client,
-                chat_id=event.chat_id,
-                filepath=filepath,
-                caption=f"🎬 {title}" if title else "🎬 **Video Downloaded**",
-                status_msg=status_msg,
-                supports_streaming=True,
-            )
-        try:
-            _os.remove(filepath)
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        logger.error(f"[SNAPWC] Upload error: {e}")
-        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        return False
-
-
-async def snapwc_command(event):
-    if event.sender_id not in AUTHORIZED_USERS:
-        return await event.reply("⛔ Unauthorized")
-    parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await event.reply("❌ Usage: `/snapwc <url>`", parse_mode="markdown")
-
-    url = parts[1].strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    status_msg = await event.reply("🔄 Starting SnapWC session...")
-    await _run_snapwc_flow(event, status_msg, url)
 
 
 async def snapwc_select_callback(event):
@@ -3230,7 +2623,6 @@ async def snapwc_select_callback(event):
             except Exception:
                 pass
 
-            snapwc_sessions[session_id] = session
             user_state[event.chat_id] = {
                 "action": "snapwc_captcha",
                 "session_id": session_id,
@@ -3243,6 +2635,7 @@ async def snapwc_select_callback(event):
 
         if result["success"]:
             download_url = result["download_url"]
+            download_headers = result.get("download_headers", {})
             title = result.get("title", "")
 
             steps = result.get("steps", [])
@@ -3253,25 +2646,14 @@ async def snapwc_select_callback(event):
             )
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
-            pre_filepath = result.get("filepath", "")
-            if (
-                pre_filepath
-                and os.path.exists(pre_filepath)
-                and os.path.getsize(pre_filepath) > 1048576
-            ):
-                await safe_edit(status_msg, "📤 Uploading pre-downloaded file...")
-                dl_ok = await _upload_snapwc_file(
-                    event, status_msg, pre_filepath, title
-                )
-            else:
-                dl_ok = await do_download_and_send(
-                    event,
-                    status_msg,
-                    download_url,
-                    video_url,
-                    title=title,
-                    fallback_ext="mp4",
-                )
+            dl_ok = await do_download_and_send(
+                event,
+                status_msg,
+                download_url,
+                video_url,
+                extra_headers=download_headers,
+                title=title,
+            )
 
             # Even if download failed, send the direct link to user
             if not dl_ok and download_url:
@@ -3304,6 +2686,7 @@ async def snapwc_select_callback(event):
                         new_dl = await new_session.continue_with_quality(index)
                         if new_dl.get("success") and not new_dl.get("captcha"):
                             fresh_url = new_dl["download_url"]
+                            fresh_headers = new_dl.get("download_headers", {})
                             fresh_title = new_dl.get("title", title)
                             await safe_edit(
                                 retry_msg, "🔄 Step 3/3: Retrying download..."
@@ -3313,8 +2696,8 @@ async def snapwc_select_callback(event):
                                 retry_msg,
                                 fresh_url,
                                 video_url,
+                                extra_headers=fresh_headers,
                                 title=fresh_title,
-                                fallback_ext="mp4",
                             )
                             if not retry_ok:
                                 await safe_edit(
@@ -3399,12 +2782,18 @@ async def snapwc_captcha_handler(event):
 
         if result["success"]:
             download_url = result["download_url"]
+            download_headers = result.get("download_headers", {})
             title = result.get("title", "")
 
             await safe_edit(status_msg, "✅ Captcha solved! Starting download...")
             video_url = state.get("video_url", "")
             await do_download_and_send(
-                event, status_msg, download_url, video_url, title=title
+                event,
+                status_msg,
+                download_url,
+                video_url,
+                extra_headers=download_headers,
+                title=title,
             )
         else:
             await safe_edit(status_msg, f"❌ {result.get('error', 'Captcha failed')}")
@@ -3435,181 +2824,15 @@ async def snapwc_cancel_callback(event):
         pass
 
 
-# ====================== Y2MATE HANDLERS ======================
-
-
-async def _start_y2mate_flow(event, status_msg, video_url: str):
-    logger.info(f"[Y2MATE] START | chat={event.chat_id} | url={video_url[:120]}")
-
-    session = Y2MateSession()
-    try:
-        result = await asyncio.wait_for(session.run_full_flow(video_url), timeout=180)
-
-        if not result["success"]:
-            err = result.get("error", "Unknown")
-            logger.error(f"[Y2MATE] run_full_flow failed: {err}")
-            await safe_edit(status_msg, f"❌ Y2Mate error: {err}")
-            ss = result.get("screenshot_b64", "")
-            if ss:
-                try:
-                    await event.client.send_file(
-                        event.chat_id,
-                        base64.b64decode(ss),
-                        caption=f"📸 Y2Mate screenshot: {err[:80]}",
-                    )
-                except Exception:
-                    pass
-            await session.close_browser()
-            return
-
-        qualities = result.get("qualities", [])
-        if not qualities:
-            await safe_edit(status_msg, "❌ No quality options found.")
-            await session.close_browser()
-            return
-
-        session_id = f"y2mate_{event.chat_id}_{event.id}_{int(time.time())}"
-        y2mate_sessions[session_id] = session
-        user_state[event.chat_id] = {
-            "action": "y2mate_quality",
-            "session_id": session_id,
-            "video_url": video_url,
-        }
-
-        msg_lines = [f"🎬 **Y2Mate — {len(qualities)} options:**\n"]
-        buttons = []
-        for q in qualities:
-            sz = f" ({q['size']})" if q.get("size") else ""
-            ext = "🎵" if q["format"] == "mp3" else "🎬"
-            msg_lines.append(f"  {q['index']}. {q['label']}{sz}")
-            buttons.append(
-                [
-                    Button.inline(
-                        f"{ext} {q['label']}{sz}", f"yt_q_{session_id}_{q['index']}"
-                    )
-                ]
-            )
-        buttons.append([Button.inline("❌ Cancel", f"yt_cancel_{session_id}")])
-
-        await safe_edit(status_msg, "\n".join(msg_lines), buttons=buttons)
-
-    except Exception as e:
-        logger.error(f"[Y2MATE] Error: {e}", exc_info=True)
-        await safe_edit(status_msg, f"❌ Y2Mate error: {str(e)[:120]}")
-        try:
-            await session.close_browser()
-        except Exception:
-            pass
-
-
-async def y2mate_command(event):
-    if event.sender_id not in AUTHORIZED_USERS:
-        return await event.reply("⛔ Unauthorized")
-    parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await event.reply("❌ Usage: `/yt <url>`", parse_mode="markdown")
-    url = parts[1].strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    status_msg = await event.reply("🔄 Starting Y2Mate session...")
-    await _start_y2mate_flow(event, status_msg, url)
-
-
-async def yt_select_callback(event):
-    data = event.data.decode()
-    prefix_removed = data.replace("yt_q_", "")
-    session_id = prefix_removed.rsplit("_", 1)[0]
-    index = int(prefix_removed.rsplit("_", 1)[1])
-
-    if session_id not in y2mate_sessions:
-        return await event.answer("❌ Session expired. Run /yt again.", alert=True)
-    session = y2mate_sessions.pop(session_id, None)
-    if not session:
-        return await event.answer("❌ Session expired.", alert=True)
-
-    await event.answer("⏳ Getting download link...", alert=False)
-    try:
-        result = await session.select_quality(index)
-        if result["success"]:
-            download_url = result["download_url"]
-            logger.info(f"[Y2MATE] Got download URL: {download_url[:100]}")
-
-            status_msg = await event.client.send_message(
-                event.chat_id, "✅ Got link! Downloading..."
-            )
-            video_url = user_state.get(event.chat_id, {}).get("video_url", "")
-
-            dl_ok = await do_download_and_send(
-                event,
-                status_msg,
-                download_url,
-                video_url,
-                title=session.title_text,
-                description="",
-                skip_ytdlp=True,
-                fallback_ext=session.qualities[index]["format"],
-            )
-            if not dl_ok and download_url:
-                try:
-                    await event.client.send_message(
-                        event.chat_id,
-                        f"⬇️ **Direct link (try manually):**\n`{download_url}`",
-                        parse_mode="markdown",
-                        link_preview=False,
-                    )
-                except Exception:
-                    pass
-        else:
-            err = result.get("error", "Unknown")
-            logger.error(f"[Y2MATE] select_quality failed: {err}")
-            await safe_edit(event, f"❌ Error: {err}")
-            ss = result.get("screenshot_b64", "")
-            if ss:
-                try:
-                    await event.client.send_file(
-                        event.chat_id,
-                        base64.b64decode(ss),
-                        caption=f"📸 Y2Mate screenshot: {err[:80]}",
-                    )
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.error(f"[Y2MATE] Select callback error: {e}", exc_info=True)
-        await safe_edit(event, f"❌ Error: {str(e)[:120]}")
-    finally:
-        user_state.pop(event.chat_id, None)
-        try:
-            await session.close_browser()
-        except Exception:
-            pass
-
-
-async def yt_cancel_callback(event):
-    data = event.data.decode()
-    session_id = data.replace("yt_cancel_", "")
-    if session_id in y2mate_sessions:
-        session = y2mate_sessions.pop(session_id)
-        try:
-            await session.close_browser()
-        except Exception:
-            pass
-    user_state.pop(event.chat_id, None)
-    await event.answer("❌ Cancelled", alert=False)
-    try:
-        await event.edit("❌ Y2Mate session cancelled.", buttons=None)
-    except Exception:
-        pass
-
-
 # ====================== MAIN ======================
 async def main():
     print("\n" + "=" * 60)
-    print("🚀 ULTIMATE BOT v6")
-    print("   FIX 1: YouTube IP-lock → server-side yt-dlp")
-    print("   FIX 2: 403 → auto-retry via Dirpy")
-    print("   FIX 3: FFmpeg -noautorotate + yuv420p")
-    print("   FIX 4: size_input uses chat_id (not sender_id)")
-    print("   FIX 5: pause/resume split callbacks")
+    print("🚀 ULTIMATE BOT v5")
+    print("   FIX 1: 403 → auto-retry via Dirpy")
+    print("   FIX 2: FFmpeg -noautorotate + yuv420p")
+    print("   FIX 3: size_input uses chat_id (not sender_id)")
+    print("   FIX 4: pause/resume split callbacks")
+    print("   FIX 5: command pattern conflict resolved")
     print("   FIX 6: detailed logging enabled")
     print("=" * 60)
     logger.info("[BOOT] Starting bot...")
@@ -3687,12 +2910,6 @@ async def main():
     client.add_event_handler(
         snapwc_cancel_callback, events.CallbackQuery(pattern=r"snapwc_cancel_(.+)")
     )
-    client.add_event_handler(
-        yt_select_callback, events.CallbackQuery(pattern=r"yt_q_(.+)")
-    )
-    client.add_event_handler(
-        yt_cancel_callback, events.CallbackQuery(pattern=r"yt_cancel_(.+)")
-    )
 
     # ===== Command handlers =====
     client.add_event_handler(
@@ -3716,9 +2933,6 @@ async def main():
     )
     client.add_event_handler(
         snapwc_command, events.NewMessage(pattern=r"^/snapwc(\s|$)", incoming=True)
-    )
-    client.add_event_handler(
-        y2mate_command, events.NewMessage(pattern=r"^/yt(\s|$)", incoming=True)
     )
     client.add_event_handler(
         savep_command, events.NewMessage(pattern=r"^/savep(\s|$)", incoming=True)
