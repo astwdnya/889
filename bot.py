@@ -57,7 +57,7 @@ MAX_FILE_SIZE_MB = 2000
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-HEALTH_PORT = int(os.environ.get("PORT", 10000))
+HEALTH_PORT = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT", "10000"))
 
 video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
@@ -1152,13 +1152,18 @@ async def do_download_and_send(
     # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
     if _is_youtube_source(source_url):
         await safe_edit(status_msg, "📝 Fetching title & description from seostudio...")
-        seo_meta = await get_youtube_meta_seostudio(source_url)
+        try:
+            seo_meta = await asyncio.wait_for(
+                get_youtube_meta_seostudio(source_url), timeout=90
+            )
+        except asyncio.TimeoutError:
+            seo_meta = {"error": "seostudio timed out (90s)"}
         if seo_meta.get("title"):
             title = seo_meta["title"]
             await safe_edit(status_msg, f"✅ Title: {seo_meta['title'][:50]}...")
         else:
             err = seo_meta.get("error", "unknown error")
-            await safe_edit(status_msg, f"⚠️ Seostudio failed: {err}")
+            await safe_edit(status_msg, f"⚠️ Seostudio: {err}")
         if seo_meta.get("description"):
             description = seo_meta["description"]
 
