@@ -783,8 +783,10 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
         ]
     )
+    logger.info("[SEOSTUDIO] Launching browser...")
     try:
         async with async_playwright() as pw:
+            logger.info("[SEOSTUDIO] Playwright started")
             browser = await pw.chromium.launch(
                 headless=True,
                 args=[
@@ -799,6 +801,7 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
                     "--window-size=1280,800",
                 ],
             )
+            logger.info("[SEOSTUDIO] Browser launched")
             ctx = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent=user_agent,
@@ -809,13 +812,18 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
 
             for retry in range(3):
                 try:
+                    logger.info(f"[SEOSTUDIO] Page goto attempt {retry + 1}/3...")
                     await page.goto(
                         "https://seostudio.tools/youtube-description-extractor",
                         wait_until="domcontentloaded",
                         timeout=60000,
                     )
+                    logger.info("[SEOSTUDIO] Page loaded")
                     break
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        f"[SEOSTUDIO] Goto failed (attempt {retry + 1}): {e}"
+                    )
                     if retry < 2:
                         await asyncio.sleep(3)
                     else:
@@ -825,6 +833,7 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
             await url_input.wait_for(timeout=15000)
             await url_input.click()
             await url_input.fill("")
+            logger.info("[SEOSTUDIO] URL typed, clicking extract...")
             await url_input.type(url, delay=30)
 
             extract_btn = page.locator(
@@ -832,18 +841,23 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
             )
             await extract_btn.wait_for(timeout=10000)
             await extract_btn.click()
+            logger.info("[SEOSTUDIO] Extract clicked, waiting for result...")
 
             textarea = page.locator("#text")
             await textarea.wait_for(timeout=20000)
             await asyncio.sleep(2)
 
             content = await textarea.input_value()
+            logger.info(
+                f"[SEOSTUDIO] Got content (len={len(content) if content else 0})"
+            )
             if content:
                 lines = content.strip().split("\n", 1)
                 result["title"] = lines[0].strip()
                 result["description"] = lines[1].strip() if len(lines) > 1 else ""
+                logger.info(f"[SEOSTUDIO] Title: {result['title'][:80]}")
     except Exception as e:
-        logger.warning(f"[SEOSTUDIO] Error: {e}")
+        logger.warning(f"[SEOSTUDIO] Error: {e}", exc_info=True)
     return result
 
 
@@ -1260,14 +1274,17 @@ async def do_download_and_send(
             seo_meta = await asyncio.wait_for(
                 get_youtube_meta_seostudio(source_url), timeout=90
             )
-            if seo_meta.get("title"):
-                seo_title = seo_meta["title"]
-            if seo_meta.get("description"):
-                seo_desc = seo_meta["description"]
+            seo_title = seo_meta.get("title", "")
+            seo_desc = seo_meta.get("description", "")
         except asyncio.TimeoutError:
-            logger.warning("[SEOSTUDIO] Timeout (90s) — skipping metadata")
+            await event.client.send_message(
+                event.chat_id,
+                "⏱ Seostudio timed out (90s) — title/description not available",
+            )
         except Exception as e:
-            logger.warning(f"[SEOSTUDIO] Error: {e}")
+            await event.client.send_message(
+                event.chat_id, f"❌ Seostudio error: {str(e)[:200]}"
+            )
 
     if sent_msg and (seo_title or seo_desc):
         info_parts = []
@@ -1280,8 +1297,8 @@ async def do_download_and_send(
                 if seo_desc:
                     new_caption += f"\n\n📝 {seo_desc}"
                 await sent_msg.edit(caption=new_caption)
-            except Exception as e:
-                logger.warning(f"[SEOSTUDIO] Caption edit failed: {e}")
+            except Exception:
+                pass
         if seo_desc:
             info_parts.append(seo_desc)
         info_text = "\n\n".join(info_parts)
@@ -1290,8 +1307,8 @@ async def do_download_and_send(
                 await event.client.send_message(
                     event.chat_id, info_text, parse_mode="markdown"
                 )
-            except Exception as e:
-                logger.warning(f"[SEOSTUDIO] Info message failed: {e}")
+            except Exception:
+                pass
 
     try:
         os.remove(filepath)
