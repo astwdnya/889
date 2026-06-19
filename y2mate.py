@@ -30,8 +30,13 @@ class Y2MateSession:
     async def start_browser(self):
         self.playwright = await async_playwright().__aenter__()
         self.browser = await self.playwright.chromium.launch(
-            headless=False,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+            ],
         )
         self.context = await self.browser.new_context(
             viewport={"width": 1280, "height": 720},
