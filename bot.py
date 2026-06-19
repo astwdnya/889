@@ -234,7 +234,10 @@ def _filename_from_url(
     if not name or "." not in name:
         name = f"file_{int(time.time())}"
     name = name.split("?")[0].split("#")[0]
+    name = _up.unquote(name)
     ext = os.path.splitext(name)[1]
+    base = os.path.splitext(name)[0][:80]
+    name = f"{base}{ext}" if ext else base
     if not ext:
         fe = fallback_ext.lstrip(".")
         if fe:
@@ -771,98 +774,6 @@ async def try_stream_download(
     return None, err_msg or "Stream download failed"
 
 
-async def get_youtube_meta_seostudio(url: str) -> dict:
-    """Extract YouTube title + description from seostudio.tools using Playwright."""
-    result = {"title": "", "description": ""}
-    import random
-
-    user_agent = random.choice(
-        [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        ]
-    )
-    logger.info("[SEOSTUDIO] Launching browser...")
-    try:
-        async with async_playwright() as pw:
-            logger.info("[SEOSTUDIO] Playwright started")
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-web-security",
-                    "--disable-infobars",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-dev-shm-usage",
-                    "--single-process",
-                    "--window-size=1280,800",
-                ],
-            )
-            logger.info("[SEOSTUDIO] Browser launched")
-            ctx = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent=user_agent,
-                locale="en-US",
-                timezone_id="America/New_York",
-            )
-            page = await ctx.new_page()
-
-            for retry in range(3):
-                try:
-                    logger.info(f"[SEOSTUDIO] Page goto attempt {retry + 1}/3...")
-                    await page.goto(
-                        "https://seostudio.tools/youtube-description-extractor",
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-                    logger.info("[SEOSTUDIO] Page loaded")
-                    break
-                except Exception as e:
-                    logger.warning(
-                        f"[SEOSTUDIO] Goto failed (attempt {retry + 1}): {e}"
-                    )
-                    if retry < 2:
-                        await asyncio.sleep(3)
-                    else:
-                        raise
-
-            await asyncio.sleep(3)
-            logger.info("[SEOSTUDIO] Waiting for input field...")
-            url_input = page.locator("#input")
-            await url_input.wait_for(timeout=30000)
-            await url_input.click()
-            await url_input.fill("")
-            logger.info("[SEOSTUDIO] URL typed, clicking extract...")
-            await url_input.type(url, delay=30)
-
-            extract_btn = page.locator(
-                'span[wire\\:target="onYoutubeDescriptionExtractor"]'
-            )
-            await extract_btn.wait_for(timeout=10000)
-            await extract_btn.click()
-            logger.info("[SEOSTUDIO] Extract clicked, waiting for result...")
-
-            textarea = page.locator("#text")
-            await textarea.wait_for(timeout=20000)
-            await asyncio.sleep(2)
-
-            content = await textarea.input_value()
-            logger.info(
-                f"[SEOSTUDIO] Got content (len={len(content) if content else 0})"
-            )
-            if content:
-                lines = content.strip().split("\n", 1)
-                result["title"] = lines[0].strip()
-                result["description"] = lines[1].strip() if len(lines) > 1 else ""
-                logger.info(f"[SEOSTUDIO] Title: {result['title'][:80]}")
-    except Exception as e:
-        logger.warning(f"[SEOSTUDIO] Error: {e}", exc_info=True)
-    return result
-
-
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
 
@@ -1267,51 +1178,7 @@ async def do_download_and_send(
                 pass
             return False
 
-    # ===== بعد از آپلود: گرفتن تایتل و دیسکریپشن از seostudio =====
-    seo_title = ""
-    seo_desc = ""
-    if _is_youtube_source(source_url):
-        await safe_edit(status_msg, "📝 Fetching title & description...")
-        try:
-            seo_meta = await asyncio.wait_for(
-                get_youtube_meta_seostudio(source_url), timeout=90
-            )
-            seo_title = seo_meta.get("title", "")
-            seo_desc = seo_meta.get("description", "")
-        except asyncio.TimeoutError:
-            await event.client.send_message(
-                event.chat_id,
-                "⏱ Seostudio timed out (90s) — title/description not available",
-            )
-        except Exception as e:
-            await event.client.send_message(
-                event.chat_id, f"❌ Seostudio error: {str(e)[:200]}"
-            )
-
-    if sent_msg and (seo_title or seo_desc):
-        info_parts = []
-        if seo_title:
-            info_parts.append(f"**{seo_title}**")
-            try:
-                new_caption = f"🎬 {seo_title}"
-                if _is_audio:
-                    new_caption = f"🎵 {seo_title}"
-                if seo_desc:
-                    new_caption += f"\n\n📝 {seo_desc}"
-                await sent_msg.edit(caption=new_caption)
-            except Exception:
-                pass
-        if seo_desc:
-            info_parts.append(seo_desc)
-        info_text = "\n\n".join(info_parts)
-        if info_text:
-            try:
-                await event.client.send_message(
-                    event.chat_id, info_text, parse_mode="markdown"
-                )
-            except Exception:
-                pass
-
+    await safe_edit(status_msg, "✅ Done!")
     try:
         os.remove(filepath)
     except Exception:
@@ -2916,6 +2783,12 @@ async def generic_url_handler(event):
         await _start_y2mate_flow(event, status_msg, target_url)
         return
 
+    # ===== اگه لینک pornhub بود → برو به snapwc =====
+    if "pornhub.com/view_video.php" in target_url.lower():
+        status_msg = await event.reply("🔞 PornHub detected — starting SnapWC...")
+        await _run_snapwc_flow(event, status_msg, target_url)
+        return
+
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading...")
@@ -3176,18 +3049,7 @@ async def vgh_no_callback(event):
 # ====================== SNAPWC HANDLERS ======================
 
 
-async def snapwc_command(event):
-    if event.sender_id not in AUTHORIZED_USERS:
-        return await event.reply("⛔ Unauthorized")
-    parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await event.reply("❌ Usage: `/snapwc <url>`", parse_mode="markdown")
-
-    url = parts[1].strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    status_msg = await event.reply("🔄 Starting SnapWC session...")
+async def _run_snapwc_flow(event, status_msg, url: str):
     logger.info(f"[SNAPWC] START | chat={event.chat_id} | url={url[:120]}")
 
     session = SnapWCSession()
@@ -3265,22 +3127,27 @@ async def snapwc_command(event):
         )
 
     except Exception as e:
-        logger.error(f"[SNAPWC] Command error: {e}", exc_info=True)
+        logger.error(f"[SNAPWC] Error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ SnapWC error: {str(e)[:120]}")
-        try:
-            ss = await session.take_screenshot()
-            if ss:
-                await event.client.send_file(
-                    event.chat_id,
-                    base64.b64decode(ss),
-                    caption=f"📸 SnapWC error screenshot",
-                )
-        except Exception:
-            pass
         try:
             await session.close_browser()
         except Exception:
             pass
+
+
+async def snapwc_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/snapwc <url>`", parse_mode="markdown")
+
+    url = parts[1].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    status_msg = await event.reply("🔄 Starting SnapWC session...")
+    await _run_snapwc_flow(event, status_msg, url)
 
 
 async def snapwc_select_callback(event):
