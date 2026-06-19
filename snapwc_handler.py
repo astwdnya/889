@@ -531,23 +531,30 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # 6) catch-all: scan ALL elements for ANY http(s) URL
+            # 6) catch-all: clipboard via execCommand (more reliable in headless)
             try:
-                url = await current.evaluate("""() => {
-                    const els = document.querySelectorAll('*');
-                    for (const el of els) {
-                        const t = el.textContent.trim();
-                        if (t.startsWith('http://') || t.startsWith('https://')) return t;
-                    }
-                    return null;
+                text = await current.evaluate("""() => {
+                    try {
+                        var inp = document.createElement('input');
+                        inp.style.position = 'fixed'; inp.style.left = 0; inp.style.top = 0;
+                        inp.style.width = '1px'; inp.style.height = '1px';
+                        document.body.appendChild(inp);
+                        inp.focus();
+                        inp.select();
+                        var ok = document.execCommand('paste');
+                        var val = inp.value.trim();
+                        inp.remove();
+                        if (ok && val && val.startsWith('http')) return val;
+                    } catch(e) {}
+                    return '';
                 }""")
-                if url:
-                    self.download_url = url
-                    return url
+                if text:
+                    self.download_url = text
+                    return text
             except Exception:
                 pass
 
-            # 7) catch-all: clipboard any http URL
+            # 7) catch-all: clipboard async API fallback
             try:
                 text = await current.evaluate("""async () => {
                     try { const t = await navigator.clipboard.readText(); if (t && t.startsWith('http')) return t; } catch(e) {}
