@@ -663,6 +663,171 @@ async def get_youtube_meta_aiohttp(url: str) -> dict:
     return result
 
 
+# ====================== STREAMING DOWNLOAD (FFMPEG) ======================
+
+
+def is_stream_url(url: str) -> bool:
+    keywords = ["m3u8", "mp4", "play?", "stream", "video"]
+    return any(k in url.lower() for k in keywords)
+
+
+async def extract_m3u8_from_html(page_url: str) -> str | None:
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                page_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status != 200:
+                    return None
+                html = await r.text()
+                import re as _re
+
+                for m in _re.finditer(r'https?://[^"\']*\.m3u8[^"\'\s]*', html):
+                    return m.group(0)
+                for m in _re.finditer(r'https?://[^"\']*\.mp4[^"\'\s]*', html):
+                    return m.group(0)
+    except Exception:
+        pass
+    return None
+
+
+async def download_stream_ffmpeg(
+    url: str, filepath: str, referer: str = ""
+) -> tuple[bool, str]:
+    cmd = ["ffmpeg", "-y"]
+    if referer:
+        cmd.extend(
+            [
+                "-headers",
+                f"Referer: {referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\n",
+            ]
+        )
+    cmd.extend(["-i", url, "-c", "copy", filepath])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        if proc.returncode == 0:
+            return True, ""
+        err_text = (
+            stderr.decode(errors="replace")[-300:]
+            if stderr
+            else f"ffmpeg exit code {proc.returncode}"
+        )
+        return False, err_text
+    except asyncio.TimeoutError:
+        return False, "ffmpeg timed out (600s)"
+    except FileNotFoundError:
+        return False, "ffmpeg not found on server"
+    except Exception as e:
+        return False, str(e)[:100]
+
+
+async def try_stream_download(
+    url: str, status_msg, referer: str = ""
+) -> tuple[str | None, str | None]:
+    """Try ffmpeg stream download, then m3u8 extraction from page."""
+    stream_path = os.path.join(OUTPUT_FOLDER, f"stream_{int(time.time())}.mp4")
+    await safe_edit(status_msg, "🎬 Detected stream — trying ffmpeg...")
+    ok, err_msg = await download_stream_ffmpeg(url, stream_path, referer=referer)
+    if ok and os.path.exists(stream_path) and os.path.getsize(stream_path) > 1024:
+        return stream_path, None
+    await safe_edit(status_msg, "🔍 Trying to extract streaming URL from page...")
+    m3u8 = await extract_m3u8_from_html(url)
+    if m3u8:
+        stream_path2 = os.path.join(OUTPUT_FOLDER, f"stream_{int(time.time())}.mp4")
+        ok2, err_msg2 = await download_stream_ffmpeg(
+            m3u8, stream_path2, referer=referer
+        )
+        if (
+            ok2
+            and os.path.exists(stream_path2)
+            and os.path.getsize(stream_path2) > 1024
+        ):
+            return stream_path2, None
+        err_msg = err_msg2
+    if os.path.exists(stream_path):
+        try:
+            os.remove(stream_path)
+        except Exception:
+            pass
+    return None, err_msg or "Stream download failed"
+
+
+# ====================== STREAMING DOWNLOAD (FFMPEG) ======================
+
+
+def is_stream_url(url: str) -> bool:
+    keywords = ["m3u8", "mp4", "play?", "stream", "video"]
+    return any(k in url.lower() for k in keywords)
+
+
+async def extract_m3u8_from_html(page_url: str) -> str | None:
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                page_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status != 200:
+                    return None
+                html = await r.text()
+                import re as _re
+
+                for m in _re.finditer(r'https?://[^"\']*\.m3u8[^"\'\s]*', html):
+                    return m.group(0)
+                for m in _re.finditer(r'https?://[^"\']*\.mp4[^"\'\s]*', html):
+                    return m.group(0)
+    except Exception:
+        pass
+    return None
+
+
+async def download_stream_ffmpeg(
+    url: str, filepath: str, referer: str = ""
+) -> tuple[bool, str]:
+    cmd = ["ffmpeg", "-y"]
+    if referer:
+        cmd.extend(
+            [
+                "-headers",
+                f"Referer: {referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\n",
+            ]
+        )
+    cmd.extend(["-i", url, "-c", "copy", filepath])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        if proc.returncode == 0:
+            return True, ""
+        err_text = (
+            stderr.decode(errors="replace")[-300:]
+            if stderr
+            else f"ffmpeg exit code {proc.returncode}"
+        )
+        return False, err_text
+    except asyncio.TimeoutError:
+        return False, "ffmpeg timed out (600s)"
+    except FileNotFoundError:
+        return False, "ffmpeg not found on server"
+    except Exception as e:
+        return False, str(e)[:100]
+
+
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
 
@@ -926,18 +1091,38 @@ async def do_download_and_send(
             )
 
     if dl_error or not filepath:
-        if dl_error != "Cancelled by user":
+        if dl_error != "Cancelled by user" and is_stream_url(direct_url):
+            stream_fp, stream_err = await try_stream_download(
+                direct_url, status_msg, referer=source_url
+            )
+            if stream_fp:
+                filepath, dl_error = stream_fp, None
+                final_size = os.path.getsize(stream_fp)
+            else:
+                await safe_edit(status_msg, f"❌ Download failed: {stream_err}")
+                return False
+        elif dl_error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
-        return False
+            return False
+        else:
+            return False
+
+    import os as _os_audio
 
     # تشخیص نوع فایل با ffprobe — هر فرمت ویدیویی رو میشناسه
     vid_duration, vw, vh = await get_video_info(filepath)
 
     # ===== اگه فقط صدا داره (مثل mp3) → بصورت ویس بفرست =====
-    if vid_duration and vid_duration > 0 and vw == 0 and vh == 0:
+    _audio_exts = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
+    _is_audio = (vid_duration and vid_duration > 0 and vw == 0 and vh == 0) or (
+        (not vid_duration or vid_duration <= 0)
+        and _os_audio.path.splitext(filepath)[1].lower() in _audio_exts
+    )
+    if _is_audio:
         await safe_edit(status_msg, "🎵 Uploading audio...")
         try:
-            mins, secs = divmod(int(vid_duration), 60)
+            _vd = vid_duration or 0
+            mins, secs = divmod(int(_vd), 60)
             hours, mins = divmod(mins, 60)
             dur_str = (
                 f" ⏱ {hours}:{mins:02d}:{secs:02d}"
@@ -2663,18 +2848,38 @@ async def generic_url_handler(event):
         return
 
     if error or not filepath:
-        if error != "Cancelled by user":
+        if error != "Cancelled by user" and is_stream_url(target_url):
+            stream_fp, stream_err = await try_stream_download(
+                target_url, status_msg, referer=target_url
+            )
+            if stream_fp:
+                filepath, error = stream_fp, None
+                size = os.path.getsize(stream_fp)
+            else:
+                await safe_edit(status_msg, f"❌ {stream_err}")
+                return
+        elif error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ {error or 'Failed'}")
-        return
+            return
+        else:
+            return
+
+    import os as _os_audio2
 
     # تشخیص نوع فایل با ffprobe
     vid_duration, vw, vh = await get_video_info(filepath)
 
     # اگه فقط صدا داره → بصورت ویس بفرست
-    if vid_duration and vid_duration > 0 and vw == 0 and vh == 0:
+    _audio_exts2 = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
+    _is_audio2 = (vid_duration and vid_duration > 0 and vw == 0 and vh == 0) or (
+        (not vid_duration or vid_duration <= 0)
+        and _os_audio2.path.splitext(filepath)[1].lower() in _audio_exts2
+    )
+    if _is_audio2:
         await safe_edit(status_msg, "🎵 Uploading audio...")
         try:
-            mins, secs = divmod(int(vid_duration), 60)
+            _vd2 = vid_duration or 0
+            mins, secs = divmod(int(_vd2), 60)
             hours, mins = divmod(mins, 60)
             dur_str = (
                 f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
