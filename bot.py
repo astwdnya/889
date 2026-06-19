@@ -312,7 +312,7 @@ async def download_with_controls(
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
     original_name = _filename_from_url(url, "", fallback_ext)
-    filepath = os.path.join(OUTPUT_FOLDER, f"dl_{int(time.time())}_{original_name}")
+    filepath = os.path.join(OUTPUT_FOLDER, f"{int(time.time())}_{original_name}")
     downloaded = 0
     total = 0
     last_update = 0.0
@@ -387,7 +387,7 @@ async def download_with_controls(
                             str(response.url), cd, fallback_ext, original_url=url
                         )
                         filepath = os.path.join(
-                            OUTPUT_FOLDER, f"dl_{int(time.time())}_{cd_name}"
+                            OUTPUT_FOLDER, f"{int(time.time())}_{cd_name}"
                         )
 
                     if response.status == 200 and downloaded > 0:
@@ -823,9 +823,13 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
             result["title"] = lines[0].strip()
             result["description"] = lines[1].strip() if len(lines) > 1 else ""
         else:
-            logger.warning(f"[SEOSTUDIO] Empty result after extraction")
+            err_msg = f"Empty result after extraction (text len={len(text)})"
+            logger.warning(f"[SEOSTUDIO] {err_msg}")
+            result["error"] = err_msg
     except Exception as e:
-        logger.warning(f"[SEOSTUDIO] Error: {e}")
+        err_msg = str(e)[:200]
+        logger.warning(f"[SEOSTUDIO] Error: {err_msg}")
+        result["error"] = err_msg
     finally:
         if browser:
             try:
@@ -935,6 +939,14 @@ async def send_file_with_progress(
     supports_streaming: bool = True,
 ):
     file_size = os.path.getsize(filepath)
+    if file_size <= 0:
+        logger.error(f"Upload failed: empty file {filepath}")
+        await safe_edit(status_msg, "❌ File is empty (0 bytes)")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return
     start_time = time.time()
     last_update = [0.0]
     last_bytes = [0]
@@ -962,12 +974,6 @@ async def send_file_with_progress(
 
     try:
         duration_int = int(duration) if duration else 0
-        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
-        with open(filepath, "rb") as f:
-            uploaded = await fast_upload_file(
-                client, f, progress_callback=progress_cb, connection_count=15
-            )
-
         # ساخت media با متادیتای ویدیو
         attributes, mime_type = utils.get_attributes(
             filepath,
@@ -986,20 +992,39 @@ async def send_file_with_progress(
             with open(thumb_path, "rb") as tf:
                 thumb_input = await fast_upload_file(client, tf)
 
-        media = InputMediaUploadedDocument(
-            file=uploaded,
-            mime_type=mime_type,
-            attributes=attributes,
-            thumb=thumb_input,
-            force_file=False,
-        )
-        await client.send_file(
-            chat_id,
-            media,
-            caption=caption,
-            buttons=buttons,
-            parse_mode="markdown",
-        )
+        # تلاش با fast upload
+        try:
+            with open(filepath, "rb") as f:
+                uploaded = await fast_upload_file(
+                    client, f, progress_callback=progress_cb, connection_count=15
+                )
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type=mime_type,
+                attributes=attributes,
+                thumb=thumb_input,
+                force_file=False,
+            )
+            await client.send_file(
+                chat_id,
+                media,
+                caption=caption,
+                buttons=buttons,
+                parse_mode="markdown",
+            )
+        except Exception as e1:
+            logger.warning(f"Fast upload failed ({e1}), trying direct upload...")
+            await client.send_file(
+                chat_id,
+                filepath,
+                caption=caption,
+                buttons=buttons,
+                attributes=attributes,
+                thumb=thumb_path,
+                supports_streaming=True,
+                parse_mode="markdown",
+                progress_callback=progress_cb,
+            )
     finally:
         # پاک کردن thumbnail موقت
         if thumb_path and os.path.exists(thumb_path):
@@ -1121,10 +1146,13 @@ async def do_download_and_send(
 
     # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
     if not title and _is_youtube_source(source_url):
-        await safe_edit(status_msg, "📝 Fetching title & description...")
+        await safe_edit(status_msg, "📝 Fetching title & description from seostudio...")
         seo_meta = await get_youtube_meta_seostudio(source_url)
         if seo_meta.get("title"):
             title = seo_meta["title"]
+            await safe_edit(status_msg, f"✅ Title found: {title[:50]}...")
+        else:
+            await safe_edit(status_msg, "⚠️ Could not extract title from seostudio")
         if seo_meta.get("description"):
             description = seo_meta["description"]
 
@@ -1176,7 +1204,11 @@ async def do_download_and_send(
     # ===== اگه ویدیو نیست، مستقیم به عنوان فایل آپلود کن =====
     if vid_duration is None or vid_duration <= 0:
         fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        basename = os.path.basename(filepath)
+        basename = (
+            os.path.basename(filepath).split("_", 1)[-1]
+            if os.path.basename(filepath)[0].isdigit()
+            else os.path.basename(filepath)
+        )
         await safe_edit(status_msg, "📤 Uploading file...")
         try:
             await event.client.send_file(
@@ -2928,6 +2960,9 @@ async def generic_url_handler(event):
     # اگه ویدیو نیست → آپلود به عنوان فایل
     if vid_duration is None or vid_duration <= 0:
         basename = os.path.basename(filepath)
+        _parts2 = basename.split("_", 1)
+        if len(_parts2) > 1 and _parts2[0].isdigit():
+            basename = _parts2[1]
         await safe_edit(status_msg, "📤 Uploading file...")
         try:
             await event.client.send_file(
