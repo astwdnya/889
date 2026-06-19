@@ -211,25 +211,60 @@ async def download_with_controls(
     MAX_RETRIES = 3
     CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 
+    import urllib.parse as _up
+
     is_googlevideo = (
         "googlevideo.com" in url or "youtube.com" in url or "youtu.be" in url
     )
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "video/webm,video/ogg,video/mp4,video/*;q=0.9,application/ogg;q=0.7,*/*;q=0.5",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
-    }
-    if referer:
-        headers["Referer"] = referer
+    yt_client = ""
+    if is_googlevideo:
         try:
-            headers["Origin"] = "/".join(referer.split("/")[:3])
+            qs = _up.parse_qs(_up.urlparse(url).query)
+            yt_client = (qs.get("c", [""])[0]).upper()
         except Exception:
             pass
+
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
+
+    if is_googlevideo:
+        if yt_client == "ANDROID_VR":
+            headers["User-Agent"] = (
+                "com.google.android.apps.youtube.vr.oculus/1.61.48 "
+                "(Linux; U; Android 12; GB) gzip"
+            )
+        elif yt_client == "ANDROID":
+            headers["User-Agent"] = (
+                "com.google.android.youtube/19.09.37 (Linux; U; Android 12) gzip"
+            )
+        elif yt_client == "IOS":
+            headers["User-Agent"] = (
+                "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)"
+            )
+        else:
+            headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            )
+        # googlevideo URLs reject requests with Referer/Origin
+    else:
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        )
+        headers["Sec-Fetch-Dest"] = "video"
+        headers["Sec-Fetch-Mode"] = "no-cors"
+        headers["Sec-Fetch-Site"] = "cross-site"
+        if referer:
+            headers["Referer"] = referer
+            try:
+                headers["Origin"] = "/".join(referer.split("/")[:3])
+            except Exception:
+                pass
+
     if extra_headers:
         headers.update(extra_headers)
     if is_googlevideo and "Range" not in headers:

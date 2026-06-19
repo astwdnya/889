@@ -5,6 +5,7 @@ import sys
 import time
 import random
 import base64
+import aiofiles
 from playwright.async_api import async_playwright
 
 URL_PATTERN = re.compile(r"https?://[^\s/$.?#].[^\s]*", re.IGNORECASE)
@@ -81,6 +82,26 @@ class SnapWCSession:
 
         self.page = await self.context.new_page()
         await self.page.add_init_script(STEALTH_JS)
+
+    async def download_through_browser(self, url: str, filepath: str) -> bool:
+        try:
+            resp = await self.context.request.get(
+                url,
+                headers={
+                    "Accept": "video/webm,video/ogg,video/mp4,video/*;q=0.9,*/*;q=0.5",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.youtube.com/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                },
+            )
+            if resp.status != 200:
+                return False
+            buf = await resp.body()
+            async with aiofiles.open(filepath, "wb") as f:
+                await f.write(buf)
+            return True
+        except Exception:
+            return False
 
     async def close_browser(self):
         try:
