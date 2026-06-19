@@ -854,8 +854,17 @@ async def do_download_and_send(
             fallback_ext=fallback_ext,
         )
 
-        # FIX: 403 → auto-retry via dirpy
+        # FIX: 403 → auto-retry via dirpy (فقط برای لینک صفحه ویدیو، نه فایل مستقیم)
         if dl_error == "HTTP_403":
+            from urllib.parse import urlparse as _up
+            import os as _os
+
+            _ext = _os.path.splitext(_up(source_url).path)[1]
+            if _ext:
+                await safe_edit(
+                    status_msg, f"❌ Server returned 403 (blocked) for this file."
+                )
+                return False
             await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
             (
                 found_urls,
@@ -891,6 +900,34 @@ async def do_download_and_send(
 
     # تشخیص نوع فایل با ffprobe — هر فرمت ویدیویی رو میشناسه
     vid_duration, vw, vh = await get_video_info(filepath)
+
+    # ===== اگه فقط صدا داره (مثل mp3) → بصورت ویس بفرست =====
+    if vid_duration and vid_duration > 0 and vw == 0 and vh == 0:
+        await safe_edit(status_msg, "🎵 Uploading audio...")
+        try:
+            mins, secs = divmod(int(vid_duration), 60)
+            hours, mins = divmod(mins, 60)
+            dur_str = (
+                f" ⏱ {hours}:{mins:02d}:{secs:02d}"
+                if hours > 0
+                else f" ⏱ {mins}:{secs:02d}"
+            )
+            caption = f"🎵 {title}{dur_str}" if title else f"🎵 **Audio**{dur_str}"
+            await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption=caption,
+                voice_note=True,
+                supports_streaming=True,
+            )
+        except Exception as e:
+            logger.error(f"Audio upload error: {e}")
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+        return True
 
     # ===== اگه ویدیو نیست، مستقیم به عنوان فایل آپلود کن =====
     if vid_duration is None or vid_duration <= 0:
@@ -2569,8 +2606,17 @@ async def generic_url_handler(event):
         target_url, status_msg, dl_id, referer=target_url
     )
 
-    # FIX: 403 → auto-dirpy
+    # FIX: 403 → auto-dirpy (فقط برای لینک صفحه ویدیو، نه فایل مستقیم)
     if error == "HTTP_403":
+        from urllib.parse import urlparse
+        import os as _os
+
+        _ext = _os.path.splitext(urlparse(target_url).path)[1]
+        if _ext:
+            await safe_edit(
+                status_msg, f"❌ Server returned 403 (blocked) for this file."
+            )
+            return
         await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
         await process_dirpy_request(event, target_url)
         try:
@@ -2586,6 +2632,32 @@ async def generic_url_handler(event):
 
     # تشخیص نوع فایل با ffprobe
     vid_duration, vw, vh = await get_video_info(filepath)
+
+    # اگه فقط صدا داره → بصورت ویس بفرست
+    if vid_duration and vid_duration > 0 and vw == 0 and vh == 0:
+        await safe_edit(status_msg, "🎵 Uploading audio...")
+        try:
+            mins, secs = divmod(int(vid_duration), 60)
+            hours, mins = divmod(mins, 60)
+            dur_str = (
+                f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
+                if hours > 0
+                else f" | ⏱ {mins}:{secs:02d}"
+            )
+            await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption=f"🎵 **Audio**{dur_str}",
+                voice_note=True,
+                supports_streaming=True,
+            )
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+        return
 
     # اگه ویدیو نیست → آپلود به عنوان فایل
     if vid_duration is None or vid_duration <= 0:
