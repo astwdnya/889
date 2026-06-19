@@ -943,7 +943,7 @@ async def send_file_with_progress(
 ):
     if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
         await safe_edit(status_msg, "❌ File is empty or missing.")
-        return
+        return None
     file_size = os.path.getsize(filepath)
     start_time = time.time()
     last_update = [0.0]
@@ -1010,13 +1010,14 @@ async def send_file_with_progress(
             thumb=thumb_input,
             force_file=False,
         )
-        await client.send_file(
+        sent = await client.send_file(
             chat_id,
             media,
             caption=caption,
             buttons=buttons,
             parse_mode="markdown",
         )
+        return sent
     except Exception as e:
         err_str = str(e)
         if "file parts" in err_str.lower():
@@ -1024,7 +1025,7 @@ async def send_file_with_progress(
                 status_msg, "⚠️ Fast upload failed, retrying with direct send..."
             )
             try:
-                await client.send_file(
+                sent = await client.send_file(
                     chat_id,
                     filepath,
                     caption=caption,
@@ -1032,23 +1033,23 @@ async def send_file_with_progress(
                     parse_mode="markdown",
                     supports_streaming=supports_streaming,
                 )
+                return sent
             except Exception as e2:
                 await safe_edit(status_msg, f"❌ Upload failed: {str(e2)[:100]}")
-                return
+                return None
         else:
             await safe_edit(status_msg, f"❌ Upload failed: {err_str[:100]}")
-            return
+            return None
     finally:
         if thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
             except Exception:
                 pass
-
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
 
 # ====================== DOWNLOAD AND SEND ======================
@@ -1156,7 +1157,103 @@ async def do_download_and_send(
         else:
             return False
 
-    # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
+    import os as _os_audio
+
+    vid_duration, vw, vh = await get_video_info(filepath)
+
+    _audio_exts = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
+    _is_audio = (vid_duration and vid_duration > 0 and vw == 0 and vh == 0) or (
+        (not vid_duration or vid_duration <= 0)
+        and _os_audio.path.splitext(filepath)[1].lower() in _audio_exts
+    )
+
+    sent_msg = None
+
+    if _is_audio:
+        await safe_edit(status_msg, "🎵 Uploading audio...")
+        try:
+            _vd = vid_duration or 0
+            sent_msg = await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption="🎵 Audio",
+                attributes=[DocumentAttributeAudio(duration=int(_vd), title="Audio")],
+                supports_streaming=True,
+            )
+        except Exception as e:
+            logger.error(f"Audio upload error: {e}")
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+            return False
+    elif vid_duration is None or vid_duration <= 0:
+        fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        basename = os.path.basename(filepath)
+        await safe_edit(status_msg, "📤 Uploading file...")
+        try:
+            sent_msg = await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption=f"📎 **{basename}**",
+                force_document=True,
+            )
+        except Exception as e:
+            logger.error(f"File upload error: {e}")
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+            return False
+    else:
+        await safe_edit(status_msg, "📤 Uploading...")
+        try:
+            dur_str = ""
+            if vid_duration and vid_duration > 0:
+                mins, secs = divmod(int(vid_duration), 60)
+                hours, mins = divmod(mins, 60)
+                if hours > 0:
+                    dur_str = f"\n⏱ Duration: {hours}:{mins:02d}:{secs:02d}"
+                else:
+                    dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
+
+            gh_line = ""
+            if GITHUB_ENABLED:
+                await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+                gh_url = await maybe_upload_github(
+                    event.client, event.chat_id, filepath, final_size
+                )
+                if gh_url:
+                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+            sent_msg = await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=(
+                    f"🎬 **Video Downloaded**\n"
+                    f"📦 Size: {human_readable_size(final_size)}"
+                    f"{dur_str}\n"
+                    f"🔗 [Source]({source_url})"
+                    f"\n⬇️ [DW Link]({direct_url})"
+                    f"{gh_line}"
+                ),
+                status_msg=status_msg,
+                supports_streaming=True,
+            )
+        except Exception as e:
+            logger.error(f"Upload error: {e}")
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+            return False
+
+    # ===== بعد از آپلود: گرفتن تایتل و دیسکریپشن از seostudio =====
+    seo_title = ""
+    seo_desc = ""
     if _is_youtube_source(source_url):
         await safe_edit(status_msg, "📝 Fetching title & description...")
         try:
@@ -1164,120 +1261,42 @@ async def do_download_and_send(
                 get_youtube_meta_seostudio(source_url), timeout=90
             )
             if seo_meta.get("title"):
-                title = seo_meta["title"]
+                seo_title = seo_meta["title"]
             if seo_meta.get("description"):
-                description = seo_meta["description"]
+                seo_desc = seo_meta["description"]
         except asyncio.TimeoutError:
             logger.warning("[SEOSTUDIO] Timeout (90s) — skipping metadata")
         except Exception as e:
             logger.warning(f"[SEOSTUDIO] Error: {e}")
 
-    import os as _os_audio
+    if sent_msg and (seo_title or seo_desc):
+        info_parts = []
+        if seo_title:
+            info_parts.append(f"**{seo_title}**")
+            try:
+                new_caption = f"🎬 {seo_title}"
+                if _is_audio:
+                    new_caption = f"🎵 {seo_title}"
+                if seo_desc:
+                    new_caption += f"\n\n📝 {seo_desc}"
+                await sent_msg.edit(caption=new_caption)
+            except Exception as e:
+                logger.warning(f"[SEOSTUDIO] Caption edit failed: {e}")
+        if seo_desc:
+            info_parts.append(seo_desc)
+        info_text = "\n\n".join(info_parts)
+        if info_text:
+            try:
+                await event.client.send_message(
+                    event.chat_id, info_text, parse_mode="markdown"
+                )
+            except Exception as e:
+                logger.warning(f"[SEOSTUDIO] Info message failed: {e}")
 
-    # تشخیص نوع فایل با ffprobe — هر فرمت ویدیویی رو میشناسه
-    vid_duration, vw, vh = await get_video_info(filepath)
-
-    # ===== اگه فقط صدا داره (مثل mp3) → بصورت ویس بفرست =====
-    _audio_exts = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus")
-    _is_audio = (vid_duration and vid_duration > 0 and vw == 0 and vh == 0) or (
-        (not vid_duration or vid_duration <= 0)
-        and _os_audio.path.splitext(filepath)[1].lower() in _audio_exts
-    )
-    if _is_audio:
-        await safe_edit(status_msg, "🎵 Uploading audio...")
-        try:
-            _vd = vid_duration or 0
-            caption = title or "Audio"
-            if description:
-                caption += f"\n\n{description}"
-            await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption=caption,
-                attributes=[
-                    DocumentAttributeAudio(duration=int(_vd), title=title or "Audio")
-                ],
-                supports_streaming=True,
-            )
-        except Exception as e:
-            logger.error(f"Audio upload error: {e}")
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-        return True
-
-    # ===== اگه ویدیو نیست، مستقیم به عنوان فایل آپلود کن =====
-    if vid_duration is None or vid_duration <= 0:
-        fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        basename = os.path.basename(filepath)
-        await safe_edit(status_msg, "📤 Uploading file...")
-        try:
-            await event.client.send_file(
-                event.chat_id,
-                filepath,
-                caption=(
-                    f"📎 **{basename}**\n"
-                    f"📦 Size: {human_readable_size(fsize)}\n"
-                    f"🔗 [Source]({source_url})"
-                ),
-                force_document=True,
-            )
-        except Exception as e:
-            logger.error(f"File upload error: {e}")
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-        return True
-
-    await safe_edit(status_msg, "📤 Uploading...")
     try:
-        dur_str = ""
-        if vid_duration and vid_duration > 0:
-            mins, secs = divmod(int(vid_duration), 60)
-            hours, mins = divmod(mins, 60)
-            if hours > 0:
-                dur_str = f"\n⏱ Duration: {hours}:{mins:02d}:{secs:02d}"
-            else:
-                dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
-
-        caption_start = f"🎬 {title}" if title else "🎬 **Video Downloaded**"
-        desc_str = f"\n📝 {description}" if description else ""
-
-        gh_line = ""
-        if GITHUB_ENABLED:
-            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-            gh_url = await maybe_upload_github(
-                event.client, event.chat_id, filepath, final_size
-            )
-            if gh_url:
-                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-        await send_file_with_progress(
-            client=event.client,
-            chat_id=event.chat_id,
-            filepath=filepath,
-            caption=(
-                f"{caption_start}{desc_str}\n"
-                f"📦 Size: {human_readable_size(final_size)}"
-                f"{dur_str}\n"
-                f"🔗 [Source]({source_url})"
-                f"\n⬇️ [DW Link]({direct_url})"
-                f"{gh_line}"
-            ),
-            status_msg=status_msg,
-            supports_streaming=True,
-        )
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        return False
+        os.remove(filepath)
+    except Exception:
+        pass
     return True
 
 
