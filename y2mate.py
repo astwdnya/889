@@ -352,9 +352,14 @@ async def download_with_resume(url: str, filepath: str):
                         print(f"  HTTP {resp.status} — keeping {downloaded} bytes")
                         return
                     before = downloaded
-                    async with aiofiles.open(
-                        filepath, "ab" if downloaded > 0 else "wb"
-                    ) as f:
+                    if resp.status == 200 and downloaded > 0:
+                        downloaded = 0
+                        mode = "wb"
+                    elif resp.status == 206 and downloaded > 0:
+                        mode = "ab"
+                    else:
+                        mode = "wb"
+                    async with aiofiles.open(filepath, mode) as f:
                         try:
                             async for chunk in resp.content.iter_chunked(CHUNK):
                                 await f.write(chunk)

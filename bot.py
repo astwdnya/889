@@ -352,7 +352,13 @@ async def download_with_controls(
                                     OUTPUT_FOLDER, f"video_{int(time.time())}{ext}"
                                 )
 
-                    write_mode = "ab" if downloaded > 0 else "wb"
+                    if response.status == 200 and downloaded > 0:
+                        downloaded = 0
+                        write_mode = "wb"
+                    elif response.status == 206 and downloaded > 0:
+                        write_mode = "ab"
+                    else:
+                        write_mode = "wb"
                     async with aiofiles.open(filepath, write_mode) as f:
                         async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                             if active_downloads.get(dl_id, {}).get("cancelled"):
