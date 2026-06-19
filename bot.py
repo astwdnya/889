@@ -632,6 +632,32 @@ async def download_youtube_ytdlp(
         return None, str(e)[:100], 0
 
 
+async def get_youtube_metadata(url: str) -> dict:
+    """Fetch YouTube video metadata (title, description, uploader) using yt-dlp."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp",
+            "--dump-json",
+            "--no-download",
+            "--no-playlist",
+            "--no-warnings",
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return {}
+        data = json.loads(stdout.decode())
+        return {
+            "title": data.get("title", ""),
+            "description": data.get("description", "") or "",
+            "uploader": data.get("uploader", "") or data.get("channel", "") or "",
+        }
+    except Exception:
+        return {}
+
+
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
 # FIX: pause و resume دو callback جدا دارن — قبلاً toggle بود که race condition داشت
 
@@ -814,6 +840,7 @@ async def do_download_and_send(
     source_url: str,
     extra_headers: Optional[dict] = None,
     title: str = "",
+    description: str = "",
     skip_ytdlp: bool = False,
     fallback_ext: str = "",
 ) -> bool:
@@ -913,6 +940,9 @@ async def do_download_and_send(
                 else f" ⏱ {mins}:{secs:02d}"
             )
             caption = f"🎵 {title}{dur_str}" if title else f"🎵 **Audio**{dur_str}"
+            desc_str = f"\n📝 {description}" if description else ""
+            if desc_str:
+                caption += desc_str
             await event.client.send_file(
                 event.chat_id,
                 filepath,
@@ -966,6 +996,7 @@ async def do_download_and_send(
                 dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
 
         caption_start = f"🎬 {title}" if title else "🎬 **Video Downloaded**"
+        desc_str = f"\n📝 {description}" if description else ""
 
         gh_line = ""
         if GITHUB_ENABLED:
@@ -980,7 +1011,7 @@ async def do_download_and_send(
             chat_id=event.chat_id,
             filepath=filepath,
             caption=(
-                f"{caption_start}\n"
+                f"{caption_start}{desc_str}\n"
                 f"📦 Size: {human_readable_size(final_size)}"
                 f"{dur_str}\n"
                 f"🔗 [Source]({source_url})"
@@ -3285,12 +3316,17 @@ async def yt_select_callback(event):
             )
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
 
+            meta = await get_youtube_metadata(video_url)
+            yt_title = meta.get("title") or session.title_text or ""
+            yt_desc = meta.get("description", "")
+
             dl_ok = await do_download_and_send(
                 event,
                 status_msg,
                 download_url,
                 video_url,
-                title=session.title_text,
+                title=yt_title,
+                description=yt_desc,
                 skip_ytdlp=True,
                 fallback_ext=session.qualities[index]["format"],
             )
