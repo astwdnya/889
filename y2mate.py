@@ -200,8 +200,6 @@ class Y2MateSession:
         if index < 0 or index >= len(self.qualities):
             return {"success": False, "error": "Invalid index"}
 
-        if index >= len(self._buttons):
-            return {"success": False, "error": "Button reference lost"}
         self._captured_dl_url = None
         self._captured_dl_urls = []
         q = self.qualities[index]
@@ -213,26 +211,27 @@ class Y2MateSession:
                 tab_link = iframe.locator(f'a.nav-link[data-tab="{tab}"]')
                 await tab_link.wait_for(timeout=5000)
                 await tab_link.click()
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(3)
             except Exception:
                 pass
 
-        btn = self._buttons[index]
+        iframe = await self._get_iframe()
+        if not iframe:
+            return {"success": False, "error": "Iframe lost"}
         try:
+            await iframe.wait_for_selector("table.table", timeout=15000)
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+        try:
+            btn = iframe.locator(
+                f'button[data-note="{q["note"]}"][data-format="{q["format"]}"]'
+            )
+            await btn.wait_for(timeout=15000)
             await btn.click()
         except Exception:
-            if not iframe:
-                iframe = await self._get_iframe()
-            if not iframe:
-                return {"success": False, "error": "Iframe lost"}
-            try:
-                btn2 = iframe.locator(
-                    f'button[data-note="{q["note"]}"][data-format="{q["format"]}"]'
-                )
-                await btn2.wait_for(timeout=10000)
-                await btn2.click()
-            except Exception:
-                return {"success": False, "error": "Quality button not found in iframe"}
+            return {"success": False, "error": "Quality button not found in iframe"}
         await asyncio.sleep(3)
 
         iframe = await self._get_iframe()

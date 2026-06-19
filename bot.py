@@ -864,6 +864,38 @@ async def do_download_and_send(
             pass
         return False
 
+    # =====  faststart: moov atom برای استریم در تلگرام (مخصوص iOS/Windows)  =====
+    await safe_edit(status_msg, "🔄 Optimizing for streaming...")
+    fastpath = ""
+    try:
+        fastpath = filepath + "_fast.mp4"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-i",
+            filepath,
+            "-movflags",
+            "+faststart",
+            "-c",
+            "copy",
+            "-y",
+            fastpath,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+        if rc == 0 and os.path.exists(fastpath) and os.path.getsize(fastpath) > 1024:
+            os.remove(filepath)
+            filepath = fastpath
+            final_size = os.path.getsize(filepath)
+        elif os.path.exists(fastpath):
+            os.remove(fastpath)
+    except Exception:
+        try:
+            if os.path.exists(fastpath):
+                os.remove(fastpath)
+        except Exception:
+            pass
+
     await safe_edit(status_msg, "📤 Uploading...")
     try:
         dur_str = ""
