@@ -4,12 +4,9 @@ import os
 import sys
 import time
 import base64
-import logging
 import aiohttp
 import aiofiles
 from playwright.async_api import async_playwright
-
-logger = logging.getLogger("Y2Mate")
 
 OUTPUT_FOLDER = "output_files"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -131,43 +128,29 @@ class Y2MateSession:
             el = await self.page.query_selector("h3.video-title")
             if el:
                 self.title_text = (await el.inner_text()).strip()
-                logger.info(
-                    f"extract_title: found via h3.video-title -> {self.title_text[:60]}"
-                )
                 return
-        except Exception as e:
-            logger.warning(f"extract_title: h3.video-title failed: {e}")
+        except Exception:
+            pass
         try:
             el = await self.page.query_selector(".video-title")
             if el:
                 self.title_text = (await el.inner_text()).strip()
-                logger.info(
-                    f"extract_title: found via .video-title -> {self.title_text[:60]}"
-                )
                 return
-        except Exception as e:
-            logger.warning(f"extract_title: .video-title failed: {e}")
+        except Exception:
+            pass
         try:
             el = await self.page.query_selector("h3")
             if el:
                 txt = (await el.inner_text()).strip()
                 if txt and len(txt) > 5:
                     self.title_text = txt
-                    logger.info(
-                        f"extract_title: found via h3 -> {self.title_text[:60]}"
-                    )
                     return
-        except Exception as e:
-            logger.warning(f"extract_title: h3 failed: {e}")
+        except Exception:
+            pass
         try:
             self.title_text = (await self.page.title()).strip()
-            logger.info(
-                f"extract_title: found via page.title -> {self.title_text[:60]}"
-            )
-        except Exception as e:
-            logger.warning(f"extract_title: page.title failed: {e}")
-        if not self.title_text:
-            logger.warning("extract_title: ALL methods failed, title is empty")
+        except Exception:
+            pass
 
     async def _get_iframe(self):
         try:

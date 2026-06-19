@@ -14,7 +14,6 @@ from typing import Optional, Tuple, Dict
 
 from flask import Flask
 from threading import Thread
-from dotenv import load_dotenv
 
 import aiohttp
 import aiofiles
@@ -26,10 +25,9 @@ from aiohttp import ClientTimeout
 from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button, utils
-from telethon.errors import FloodWaitError, NeedMemberInvalidError
+from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Message,
-    DocumentAttributeAudio,
     DocumentAttributeVideo,
     InputMediaUploadedDocument,
 )
@@ -46,14 +44,10 @@ from savep_handler import process_savep_request
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
 
-load_dotenv()
-
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = os.environ.get(
-    "BOT_TOKEN", "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
-)
-API_ID = int(os.environ.get("API_ID", 2040))
-API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
+BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
+API_ID = 2040
+API_HASH = "b18441a1ff607e10a989891a5462e627"
 
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913, 8228738080}
 ADMIN_ID = 818185073
@@ -62,7 +56,7 @@ MAX_FILE_SIZE_MB = 2000
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-HEALTH_PORT = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT", "10000"))
+HEALTH_PORT = int(os.environ.get("PORT", 10000))
 
 video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
@@ -209,9 +203,7 @@ def build_progress_text(
 
 
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
-def _filename_from_url(
-    url: str, cd_header: str = "", fallback_ext: str = "", original_url: str = ""
-) -> str:
+def _filename_from_url(url: str, cd_header: str = "", fallback_ext: str = "") -> str:
     import urllib.parse as _up
     from pathlib import Path
 
@@ -228,13 +220,7 @@ def _filename_from_url(
         if m:
             name = m.group(1).strip()
     if not name or "." not in name:
-        m = re.search(r"filename=([^;\s]+)", cd_header)
-        if m:
-            name = m.group(1).strip().strip('"').strip("'")
-    if not name or "." not in name:
         name = Path(_up.urlparse(url).path).name
-    if (not name or "." not in name) and original_url:
-        name = Path(_up.urlparse(original_url).path).name
     if not name or "." not in name:
         name = f"file_{int(time.time())}"
     name = name.split("?")[0].split("#")[0]
@@ -317,7 +303,7 @@ async def download_with_controls(
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
     original_name = _filename_from_url(url, "", fallback_ext)
-    filepath = os.path.join(OUTPUT_FOLDER, f"{int(time.time())}_{original_name}")
+    filepath = os.path.join(OUTPUT_FOLDER, f"dl_{int(time.time())}_{original_name}")
     downloaded = 0
     total = 0
     last_update = 0.0
@@ -389,10 +375,10 @@ async def download_with_controls(
                             )
                         cd = response.headers.get("Content-Disposition", "")
                         cd_name = _filename_from_url(
-                            str(response.url), cd, fallback_ext, original_url=url
+                            str(response.url), cd, fallback_ext
                         )
                         filepath = os.path.join(
-                            OUTPUT_FOLDER, f"{int(time.time())}_{cd_name}"
+                            OUTPUT_FOLDER, f"dl_{int(time.time())}_{cd_name}"
                         )
 
                     if response.status == 200 and downloaded > 0:
@@ -784,62 +770,39 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
         pw = await async_playwright().__aenter__()
         browser = await pw.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
-            ],
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
         ctx = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            locale="en-US",
-            timezone_id="America/New_York",
         )
         page = await ctx.new_page()
-
-        for retry in range(3):
-            try:
-                await page.goto(
-                    "https://seostudio.tools/youtube-description-extractor",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-                break
-            except Exception:
-                if retry < 2:
-                    await asyncio.sleep(3)
-                else:
-                    raise
-
-        url_input = page.locator("#input")
-        await url_input.wait_for(timeout=15000)
-        await url_input.click()
-        await url_input.fill("")
-        await url_input.type(url, delay=30)
-
-        extract_btn = page.locator(
-            'span[wire\\:target="onYoutubeDescriptionExtractor"]'
+        await page.goto(
+            "https://seostudio.tools/youtube-description-extractor",
+            wait_until="domcontentloaded",
+            timeout=30000,
         )
+        await asyncio.sleep(2)
+
+        input_el = page.locator("input#input")
+        await input_el.wait_for(timeout=15000)
+        await input_el.fill("")
+        await input_el.type(url, delay=30)
+
+        extract_btn = page.locator("button.bg-gradient-info")
         await extract_btn.wait_for(timeout=10000)
         await extract_btn.click()
 
-        textarea = page.locator("#text")
+        textarea = page.locator("textarea#text")
         await textarea.wait_for(timeout=30000)
         await asyncio.sleep(2)
+        text = await textarea.input_value()
 
-        content = await textarea.input_value()
-
-        if content and len(content.strip()) > 20:
-            lines = content.strip().split("\n", 1)
+        if text:
+            lines = text.strip().split("\n", 1)
             result["title"] = lines[0].strip()
             result["description"] = lines[1].strip() if len(lines) > 1 else ""
-        else:
-            result["error"] = f"Empty result (len={len(content)})"
     except Exception as e:
-        result["error"] = str(e)[:200]
+        logger.warning(f"[SEOSTUDIO] Error: {e}")
     finally:
         if browser:
             try:
@@ -949,14 +912,6 @@ async def send_file_with_progress(
     supports_streaming: bool = True,
 ):
     file_size = os.path.getsize(filepath)
-    if file_size <= 0:
-        logger.error(f"Upload failed: empty file {filepath}")
-        await safe_edit(status_msg, "❌ File is empty (0 bytes)")
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-        return
     start_time = time.time()
     last_update = [0.0]
     last_bytes = [0]
@@ -984,6 +939,12 @@ async def send_file_with_progress(
 
     try:
         duration_int = int(duration) if duration else 0
+        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
+        with open(filepath, "rb") as f:
+            uploaded = await fast_upload_file(
+                client, f, progress_callback=progress_cb, connection_count=15
+            )
+
         # ساخت media با متادیتای ویدیو
         attributes, mime_type = utils.get_attributes(
             filepath,
@@ -1002,39 +963,20 @@ async def send_file_with_progress(
             with open(thumb_path, "rb") as tf:
                 thumb_input = await fast_upload_file(client, tf)
 
-        # تلاش با fast upload
-        try:
-            with open(filepath, "rb") as f:
-                uploaded = await fast_upload_file(
-                    client, f, progress_callback=progress_cb, connection_count=15
-                )
-            media = InputMediaUploadedDocument(
-                file=uploaded,
-                mime_type=mime_type,
-                attributes=attributes,
-                thumb=thumb_input,
-                force_file=False,
-            )
-            await client.send_file(
-                chat_id,
-                media,
-                caption=caption,
-                buttons=buttons,
-                parse_mode="markdown",
-            )
-        except Exception as e1:
-            logger.warning(f"Fast upload failed ({e1}), trying direct upload...")
-            await client.send_file(
-                chat_id,
-                filepath,
-                caption=caption,
-                buttons=buttons,
-                attributes=attributes,
-                thumb=thumb_path,
-                supports_streaming=True,
-                parse_mode="markdown",
-                progress_callback=progress_cb,
-            )
+        media = InputMediaUploadedDocument(
+            file=uploaded,
+            mime_type=mime_type,
+            attributes=attributes,
+            thumb=thumb_input,
+            force_file=False,
+        )
+        await client.send_file(
+            chat_id,
+            media,
+            caption=caption,
+            buttons=buttons,
+            parse_mode="markdown",
+        )
     finally:
         # پاک کردن thumbnail موقت
         if thumb_path and os.path.exists(thumb_path):
@@ -1155,20 +1097,11 @@ async def do_download_and_send(
             return False
 
     # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
-    if _is_youtube_source(source_url):
-        await safe_edit(status_msg, "📝 Fetching title & description from seostudio...")
-        try:
-            seo_meta = await asyncio.wait_for(
-                get_youtube_meta_seostudio(source_url), timeout=90
-            )
-        except asyncio.TimeoutError:
-            seo_meta = {"error": "seostudio timed out (90s)"}
+    if not title and _is_youtube_source(source_url):
+        await safe_edit(status_msg, "📝 Fetching title & description...")
+        seo_meta = await get_youtube_meta_seostudio(source_url)
         if seo_meta.get("title"):
             title = seo_meta["title"]
-            await safe_edit(status_msg, f"✅ Title: {seo_meta['title'][:50]}...")
-        else:
-            err = seo_meta.get("error", "unknown error")
-            await safe_edit(status_msg, f"⚠️ Seostudio: {err}")
         if seo_meta.get("description"):
             description = seo_meta["description"]
 
@@ -1203,9 +1136,6 @@ async def do_download_and_send(
                 event.chat_id,
                 filepath,
                 caption=caption,
-                attributes=[
-                    DocumentAttributeAudio(duration=int(_vd), title=title or "Audio")
-                ],
                 supports_streaming=True,
             )
         except Exception as e:
@@ -1220,11 +1150,7 @@ async def do_download_and_send(
     # ===== اگه ویدیو نیست، مستقیم به عنوان فایل آپلود کن =====
     if vid_duration is None or vid_duration <= 0:
         fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        basename = (
-            os.path.basename(filepath).split("_", 1)[-1]
-            if os.path.basename(filepath)[0].isdigit()
-            else os.path.basename(filepath)
-        )
+        basename = os.path.basename(filepath)
         await safe_edit(status_msg, "📤 Uploading file...")
         try:
             await event.client.send_file(
@@ -1235,7 +1161,6 @@ async def do_download_and_send(
                     f"📦 Size: {human_readable_size(fsize)}\n"
                     f"🔗 [Source]({source_url})"
                 ),
-                file_name=basename,
                 force_document=True,
             )
         except Exception as e:
@@ -2963,7 +2888,6 @@ async def generic_url_handler(event):
                 event.chat_id,
                 filepath,
                 caption=f"🎵 **Audio**{dur_str}",
-                attributes=[DocumentAttributeAudio(duration=int(_vd2), title="Audio")],
                 supports_streaming=True,
             )
         except Exception as e:
@@ -2977,16 +2901,12 @@ async def generic_url_handler(event):
     # اگه ویدیو نیست → آپلود به عنوان فایل
     if vid_duration is None or vid_duration <= 0:
         basename = os.path.basename(filepath)
-        _parts2 = basename.split("_", 1)
-        if len(_parts2) > 1 and _parts2[0].isdigit():
-            basename = _parts2[1]
         await safe_edit(status_msg, "📤 Uploading file...")
         try:
             await event.client.send_file(
                 event.chat_id,
                 filepath,
                 caption=f"📎 **{basename}**\n📦 Size: {human_readable_size(size)}",
-                file_name=basename,
                 force_document=True,
             )
         except Exception as e:
@@ -3690,12 +3610,6 @@ async def main():
         try:
             await client.start(bot_token=BOT_TOKEN)
             break
-        except (NeedMemberInvalidError, ValueError) as e:
-            logger.critical(
-                f"[BOOT] Invalid API_ID/API_HASH or BOT_TOKEN: {e}. "
-                "Check your .env file or Render env vars."
-            )
-            return
         except FloodWaitError as e:
             wait = e.seconds + 5
             logger.warning(
