@@ -203,6 +203,25 @@ def build_progress_text(
 
 
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
+def _filename_from_url(url: str, cd_header: str = "") -> str:
+    import urllib.parse as _up
+    from pathlib import Path
+
+    name = ""
+    if 'filename="' in cd_header or "filename*=" in cd_header:
+        m = re.search(r"filename\*?=([^;\s]+)", cd_header)
+        if m:
+            name = m.group(1).strip().strip('"').strip("'")
+            if name.startswith("UTF-8''"):
+                name = _up.unquote(name[7:])
+    if not name or "." not in name:
+        name = Path(_up.urlparse(url).path).name
+    if not name or "." not in name:
+        name = f"file_{int(time.time())}.bin"
+    name = name.split("?")[0].split("#")[0]
+    return name
+
+
 async def download_with_controls(
     url: str,
     status_msg: Message,
@@ -270,7 +289,8 @@ async def download_with_controls(
         headers["Range"] = "bytes=0-"
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
-    filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
+    original_name = _filename_from_url(url, "")
+    filepath = os.path.join(OUTPUT_FOLDER, f"dl_{int(time.time())}_{original_name}")
     downloaded = 0
     total = 0
     last_update = 0.0
@@ -341,13 +361,10 @@ async def download_with_controls(
                                 0,
                             )
                         cd = response.headers.get("Content-Disposition", "")
-                        if "filename=" in cd:
-                            fm = re.search(r'filename="?([^";]+)', cd)
-                            if fm:
-                                ext = os.path.splitext(fm.group(1).strip())[1] or ".mp4"
-                                filepath = os.path.join(
-                                    OUTPUT_FOLDER, f"video_{int(time.time())}{ext}"
-                                )
+                        cd_name = _filename_from_url(url, cd)
+                        filepath = os.path.join(
+                            OUTPUT_FOLDER, f"dl_{int(time.time())}_{cd_name}"
+                        )
 
                     if response.status == 200 and downloaded > 0:
                         downloaded = 0
@@ -854,47 +871,33 @@ async def do_download_and_send(
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
         return False
 
-    # بررسی کن فایل دانلود شده واقعاً ویدیو هست یا نه
+    # تشخیص نوع فایل با ffprobe — هر فرمت ویدیویی رو میشناسه
     vid_duration, vw, vh = await get_video_info(filepath)
-    if vid_duration is None or vid_duration <= 0:
-        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-        return False
 
-    # =====  faststart: moov atom برای استریم در تلگرام (مخصوص iOS/Windows)  =====
-    await safe_edit(status_msg, "🔄 Optimizing for streaming...")
-    fastpath = ""
-    try:
-        fastpath = filepath + "_fast.mp4"
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-i",
-            filepath,
-            "-movflags",
-            "+faststart",
-            "-c",
-            "copy",
-            "-y",
-            fastpath,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        rc = await proc.wait()
-        if rc == 0 and os.path.exists(fastpath) and os.path.getsize(fastpath) > 1024:
-            os.remove(filepath)
-            filepath = fastpath
-            final_size = os.path.getsize(filepath)
-        elif os.path.exists(fastpath):
-            os.remove(fastpath)
-    except Exception:
+    # ===== اگه ویدیو نیست، مستقیم به عنوان فایل آپلود کن =====
+    if vid_duration is None or vid_duration <= 0:
+        fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        basename = os.path.basename(filepath)
+        await safe_edit(status_msg, "📤 Uploading file...")
         try:
-            if os.path.exists(fastpath):
-                os.remove(fastpath)
+            await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption=(
+                    f"📎 **{basename}**\n"
+                    f"📦 Size: {human_readable_size(fsize)}\n"
+                    f"🔗 [Source]({source_url})"
+                ),
+                force_document=True,
+            )
+        except Exception as e:
+            logger.error(f"File upload error: {e}")
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        try:
+            os.remove(filepath)
         except Exception:
             pass
+        return True
 
     await safe_edit(status_msg, "📤 Uploading...")
     try:
@@ -925,14 +928,13 @@ async def do_download_and_send(
                 f"{caption_start}\n"
                 f"📦 Size: {human_readable_size(final_size)}"
                 f"{dur_str}\n"
-                f"🔗 [Source]({source_url})\n"
-                f"⬇️ [DW Link]({direct_url})"
+                f"🔗 [Source]({source_url})"
+                f"\n⬇️ [DW Link]({direct_url})"
                 f"{gh_line}"
             ),
             status_msg=status_msg,
             supports_streaming=True,
         )
-        # پاک کردن خودکار فایل از سرور بعد از آپلود موفق
         try:
             os.remove(filepath)
         except Exception:
@@ -2563,14 +2565,29 @@ async def generic_url_handler(event):
         if error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ {error or 'Failed'}")
         return
+
+    # تشخیص نوع فایل با ffprobe
     vid_duration, vw, vh = await get_video_info(filepath)
+
+    # اگه ویدیو نیست → آپلود به عنوان فایل
     if vid_duration is None or vid_duration <= 0:
-        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
+        basename = os.path.basename(filepath)
+        await safe_edit(status_msg, "📤 Uploading file...")
+        try:
+            await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption=f"📎 **{basename}**\n📦 Size: {human_readable_size(size)}",
+                force_document=True,
+            )
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
         try:
             os.remove(filepath)
         except Exception:
             pass
         return
+
     await safe_edit(status_msg, "📤 Uploading...")
     try:
         dur_str = ""

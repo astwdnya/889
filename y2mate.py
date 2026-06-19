@@ -208,28 +208,37 @@ class Y2MateSession:
         if iframe:
             tab = "mp4" if q["format"] == "mp4" else "mp3"
             try:
-                tab_link = iframe.locator(f'a.nav-link[data-tab="{tab}"]')
-                await tab_link.wait_for(timeout=5000)
-                await tab_link.click()
+                await iframe.evaluate(f'''
+                    document.querySelector('a.nav-link[data-tab="{tab}"]')?.click()
+                ''')
                 await asyncio.sleep(3)
             except Exception:
-                pass
+                try:
+                    tab_link = iframe.locator(f'a.nav-link[data-tab="{tab}"]')
+                    await tab_link.wait_for(timeout=5000)
+                    await tab_link.click()
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
 
         iframe = await self._get_iframe()
         if not iframe:
             return {"success": False, "error": "Iframe lost"}
-        try:
-            await iframe.wait_for_selector("table.table", timeout=15000)
-        except Exception:
-            pass
         await asyncio.sleep(1)
 
         try:
-            btn = iframe.locator(
-                f'button[data-note="{q["note"]}"][data-format="{q["format"]}"]'
-            )
-            await btn.wait_for(timeout=15000)
-            await btn.click()
+            clicked = await iframe.evaluate(f'''
+                (() => {{
+                    const btn = document.querySelector(
+                        'button[data-note="{q["note"]}"][data-format="{q["format"]}"]'
+                    );
+                    if (!btn) return false;
+                    btn.click();
+                    return true;
+                }})()
+            ''')
+            if not clicked:
+                return {"success": False, "error": "Quality button not found in iframe"}
         except Exception:
             return {"success": False, "error": "Quality button not found in iframe"}
         await asyncio.sleep(3)
