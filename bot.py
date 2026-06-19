@@ -28,6 +28,7 @@ from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Message,
+    DocumentAttributeAudio,
     DocumentAttributeVideo,
     InputMediaUploadedDocument,
 )
@@ -203,7 +204,9 @@ def build_progress_text(
 
 
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
-def _filename_from_url(url: str, cd_header: str = "", fallback_ext: str = "") -> str:
+def _filename_from_url(
+    url: str, cd_header: str = "", fallback_ext: str = "", original_url: str = ""
+) -> str:
     import urllib.parse as _up
     from pathlib import Path
 
@@ -220,7 +223,13 @@ def _filename_from_url(url: str, cd_header: str = "", fallback_ext: str = "") ->
         if m:
             name = m.group(1).strip()
     if not name or "." not in name:
+        m = re.search(r"filename=([^;\s]+)", cd_header)
+        if m:
+            name = m.group(1).strip().strip('"').strip("'")
+    if not name or "." not in name:
         name = Path(_up.urlparse(url).path).name
+    if (not name or "." not in name) and original_url:
+        name = Path(_up.urlparse(original_url).path).name
     if not name or "." not in name:
         name = f"file_{int(time.time())}"
     name = name.split("?")[0].split("#")[0]
@@ -375,7 +384,7 @@ async def download_with_controls(
                             )
                         cd = response.headers.get("Content-Disposition", "")
                         cd_name = _filename_from_url(
-                            str(response.url), cd, fallback_ext
+                            str(response.url), cd, fallback_ext, original_url=url
                         )
                         filepath = os.path.join(
                             OUTPUT_FOLDER, f"dl_{int(time.time())}_{cd_name}"
@@ -778,15 +787,18 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
         page = await ctx.new_page()
         await page.goto(
             "https://seostudio.tools/youtube-description-extractor",
-            wait_until="domcontentloaded",
+            wait_until="networkidle",
             timeout=30000,
         )
         await asyncio.sleep(2)
 
         input_el = page.locator("input#input")
         await input_el.wait_for(timeout=15000)
-        await input_el.fill("")
-        await input_el.type(url, delay=30)
+        await input_el.fill(url)
+        await page.evaluate(
+            'document.querySelector("input#input").dispatchEvent(new Event("change"))'
+        )
+        await asyncio.sleep(1)
 
         extract_btn = page.locator("button.bg-gradient-info")
         await extract_btn.wait_for(timeout=10000)
@@ -794,13 +806,24 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
 
         textarea = page.locator("textarea#text")
         await textarea.wait_for(timeout=30000)
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
+
+        try:
+            await page.wait_for_function(
+                'document.querySelector("textarea#text").value.trim().length > 10',
+                timeout=30000,
+            )
+        except Exception:
+            pass
+
         text = await textarea.input_value()
 
-        if text:
+        if text and len(text.strip()) > 10:
             lines = text.strip().split("\n", 1)
             result["title"] = lines[0].strip()
             result["description"] = lines[1].strip() if len(lines) > 1 else ""
+        else:
+            logger.warning(f"[SEOSTUDIO] Empty result after extraction")
     except Exception as e:
         logger.warning(f"[SEOSTUDIO] Error: {e}")
     finally:
@@ -1136,6 +1159,9 @@ async def do_download_and_send(
                 event.chat_id,
                 filepath,
                 caption=caption,
+                attributes=[
+                    DocumentAttributeAudio(duration=int(_vd), title=title or "Audio")
+                ],
                 supports_streaming=True,
             )
         except Exception as e:
@@ -2888,6 +2914,7 @@ async def generic_url_handler(event):
                 event.chat_id,
                 filepath,
                 caption=f"🎵 **Audio**{dur_str}",
+                attributes=[DocumentAttributeAudio(duration=int(_vd2), title="Audio")],
                 supports_streaming=True,
             )
         except Exception as e:
