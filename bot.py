@@ -211,11 +211,18 @@ async def download_with_controls(
     MAX_RETRIES = 3
     CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 
+    is_googlevideo = (
+        "googlevideo.com" in url or "youtube.com" in url or "youtu.be" in url
+    )
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "video/webm,video/ogg,video/mp4,video/*;q=0.9,application/ogg;q=0.7,*/*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
     }
     if referer:
         headers["Referer"] = referer
@@ -225,6 +232,8 @@ async def download_with_controls(
             pass
     if extra_headers:
         headers.update(extra_headers)
+    if is_googlevideo and "Range" not in headers:
+        headers["Range"] = "bytes=0-"
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
     filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
