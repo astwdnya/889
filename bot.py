@@ -761,71 +761,60 @@ async def try_stream_download(
     return None, err_msg or "Stream download failed"
 
 
-# ====================== STREAMING DOWNLOAD (FFMPEG) ======================
-
-
-def is_stream_url(url: str) -> bool:
-    keywords = ["m3u8", "mp4", "play?", "stream", "video"]
-    return any(k in url.lower() for k in keywords)
-
-
-async def extract_m3u8_from_html(page_url: str) -> str | None:
+async def get_youtube_meta_seostudio(url: str) -> dict:
+    """Extract YouTube title + description from seostudio.tools using Playwright."""
+    result = {"title": "", "description": ""}
+    pw = None
+    browser = None
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
-        }
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                page_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                if r.status != 200:
-                    return None
-                html = await r.text()
-                import re as _re
-
-                for m in _re.finditer(r'https?://[^"\']*\.m3u8[^"\'\s]*', html):
-                    return m.group(0)
-                for m in _re.finditer(r'https?://[^"\']*\.mp4[^"\'\s]*', html):
-                    return m.group(0)
-    except Exception:
-        pass
-    return None
-
-
-async def download_stream_ffmpeg(
-    url: str, filepath: str, referer: str = ""
-) -> tuple[bool, str]:
-    cmd = ["ffmpeg", "-y"]
-    if referer:
-        cmd.extend(
-            [
-                "-headers",
-                f"Referer: {referer}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nAccept: */*\r\n",
-            ]
+        pw = await async_playwright().__aenter__()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
         )
-    cmd.extend(["-i", url, "-c", "copy", filepath])
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-        if proc.returncode == 0:
-            return True, ""
-        err_text = (
-            stderr.decode(errors="replace")[-300:]
-            if stderr
-            else f"ffmpeg exit code {proc.returncode}"
+        page = await ctx.new_page()
+        await page.goto(
+            "https://seostudio.tools/youtube-description-extractor",
+            wait_until="domcontentloaded",
+            timeout=30000,
         )
-        return False, err_text
-    except asyncio.TimeoutError:
-        return False, "ffmpeg timed out (600s)"
-    except FileNotFoundError:
-        return False, "ffmpeg not found on server"
+        await asyncio.sleep(2)
+
+        input_el = page.locator("input#input")
+        await input_el.wait_for(timeout=15000)
+        await input_el.fill("")
+        await input_el.type(url, delay=30)
+
+        extract_btn = page.locator("button.bg-gradient-info")
+        await extract_btn.wait_for(timeout=10000)
+        await extract_btn.click()
+
+        textarea = page.locator("textarea#text")
+        await textarea.wait_for(timeout=30000)
+        await asyncio.sleep(2)
+        text = await textarea.input_value()
+
+        if text:
+            lines = text.strip().split("\n", 1)
+            result["title"] = lines[0].strip()
+            result["description"] = lines[1].strip() if len(lines) > 1 else ""
     except Exception as e:
-        return False, str(e)[:100]
+        logger.warning(f"[SEOSTUDIO] Error: {e}")
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.__aexit__(None, None, None)
+            except Exception:
+                pass
+    return result
 
 
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
@@ -1107,6 +1096,15 @@ async def do_download_and_send(
         else:
             return False
 
+    # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
+    if not title and _is_youtube_source(source_url):
+        await safe_edit(status_msg, "📝 Fetching title & description...")
+        seo_meta = await get_youtube_meta_seostudio(source_url)
+        if seo_meta.get("title"):
+            title = seo_meta["title"]
+        if seo_meta.get("description"):
+            description = seo_meta["description"]
+
     import os as _os_audio
 
     # تشخیص نوع فایل با ffprobe — هر فرمت ویدیویی رو میشناسه
@@ -1138,7 +1136,6 @@ async def do_download_and_send(
                 event.chat_id,
                 filepath,
                 caption=caption,
-                voice_note=asize < 10 * 1024 * 1024,
                 supports_streaming=True,
             )
         except Exception as e:
@@ -2891,7 +2888,6 @@ async def generic_url_handler(event):
                 event.chat_id,
                 filepath,
                 caption=f"🎵 **Audio**{dur_str}",
-                voice_note=asize < 10 * 1024 * 1024,
                 supports_streaming=True,
             )
         except Exception as e:
@@ -3528,17 +3524,13 @@ async def yt_select_callback(event):
             )
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
 
-            meta = await get_youtube_meta_aiohttp(video_url)
-            yt_title = meta.get("title") or session.title_text or ""
-            yt_desc = meta.get("description", "")
-
             dl_ok = await do_download_and_send(
                 event,
                 status_msg,
                 download_url,
                 video_url,
-                title=yt_title,
-                description=yt_desc,
+                title=session.title_text,
+                description="",
                 skip_ytdlp=True,
                 fallback_ext=session.qualities[index]["format"],
             )
