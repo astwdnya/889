@@ -14,6 +14,7 @@ from typing import Optional, Tuple, Dict
 
 from flask import Flask
 from threading import Thread
+from dotenv import load_dotenv
 
 import aiohttp
 import aiofiles
@@ -25,7 +26,7 @@ from aiohttp import ClientTimeout
 from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button, utils
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, NeedMemberInvalidError
 from telethon.tl.types import (
     Message,
     DocumentAttributeAudio,
@@ -45,10 +46,14 @@ from savep_handler import process_savep_request
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
 
+load_dotenv()
+
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
-API_ID = 2040
-API_HASH = "b18441a1ff607e10a989891a5462e627"
+BOT_TOKEN = os.environ.get(
+    "BOT_TOKEN", "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
+)
+API_ID = int(os.environ.get("API_ID", 2040))
+API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
 
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913, 8228738080}
 ADMIN_ID = 818185073
@@ -3685,6 +3690,12 @@ async def main():
         try:
             await client.start(bot_token=BOT_TOKEN)
             break
+        except (NeedMemberInvalidError, ValueError) as e:
+            logger.critical(
+                f"[BOOT] Invalid API_ID/API_HASH or BOT_TOKEN: {e}. "
+                "Check your .env file or Render env vars."
+            )
+            return
         except FloodWaitError as e:
             wait = e.seconds + 5
             logger.warning(
