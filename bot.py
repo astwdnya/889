@@ -3216,7 +3216,12 @@ async def snapwc_select_callback(event):
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
             dl_ok = await do_download_and_send(
-                event, status_msg, download_url, video_url, title=title
+                event,
+                status_msg,
+                download_url,
+                video_url,
+                title=title,
+                fallback_ext="mp4",
             )
 
             # Even if download failed, send the direct link to user
@@ -3260,6 +3265,7 @@ async def snapwc_select_callback(event):
                                 fresh_url,
                                 video_url,
                                 title=fresh_title,
+                                fallback_ext="mp4",
                             )
                             if not retry_ok:
                                 await safe_edit(
