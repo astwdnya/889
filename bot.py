@@ -203,22 +203,34 @@ def build_progress_text(
 
 
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
-def _filename_from_url(url: str, cd_header: str = "") -> str:
+def _filename_from_url(url: str, cd_header: str = "", fallback_ext: str = "") -> str:
     import urllib.parse as _up
     from pathlib import Path
 
     name = ""
-    if 'filename="' in cd_header or "filename*=" in cd_header:
-        m = re.search(r"filename\*?=([^;\s]+)", cd_header)
+    m = re.search(r"filename\*=([^;\s]+)", cd_header)
+    if m:
+        raw = m.group(1).strip()
+        if raw.startswith("UTF-8''"):
+            name = _up.unquote(raw[7:])
+        else:
+            name = raw.strip('"').strip("'")
+    if not name or "." not in name:
+        m = re.search(r'filename="([^"]*)"', cd_header)
         if m:
-            name = m.group(1).strip().strip('"').strip("'")
-            if name.startswith("UTF-8''"):
-                name = _up.unquote(name[7:])
+            name = m.group(1).strip()
     if not name or "." not in name:
         name = Path(_up.urlparse(url).path).name
     if not name or "." not in name:
-        name = f"file_{int(time.time())}.bin"
+        name = f"file_{int(time.time())}"
     name = name.split("?")[0].split("#")[0]
+    ext = os.path.splitext(name)[1]
+    if not ext:
+        fe = fallback_ext.lstrip(".")
+        if fe:
+            name = f"{name}.{fe}"
+        else:
+            name = f"{name}.bin"
     return name
 
 
@@ -228,6 +240,7 @@ async def download_with_controls(
     dl_id: str,
     referer: Optional[str] = None,
     extra_headers: Optional[dict] = None,
+    fallback_ext: str = "",
 ) -> Tuple[Optional[str], Optional[str], int]:
     MAX_RETRIES = 3
     CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
@@ -289,7 +302,7 @@ async def download_with_controls(
         headers["Range"] = "bytes=0-"
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
-    original_name = _filename_from_url(url, "")
+    original_name = _filename_from_url(url, "", fallback_ext)
     filepath = os.path.join(OUTPUT_FOLDER, f"dl_{int(time.time())}_{original_name}")
     downloaded = 0
     total = 0
@@ -361,7 +374,9 @@ async def download_with_controls(
                                 0,
                             )
                         cd = response.headers.get("Content-Disposition", "")
-                        cd_name = _filename_from_url(url, cd)
+                        cd_name = _filename_from_url(
+                            str(response.url), cd, fallback_ext
+                        )
                         filepath = os.path.join(
                             OUTPUT_FOLDER, f"dl_{int(time.time())}_{cd_name}"
                         )
@@ -800,6 +815,7 @@ async def do_download_and_send(
     extra_headers: Optional[dict] = None,
     title: str = "",
     skip_ytdlp: bool = False,
+    fallback_ext: str = "",
 ) -> bool:
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
@@ -835,6 +851,7 @@ async def do_download_and_send(
             dl_id_direct,
             referer=source_url,
             extra_headers=extra_headers,
+            fallback_ext=fallback_ext,
         )
 
         # FIX: 403 → auto-retry via dirpy
@@ -864,6 +881,7 @@ async def do_download_and_send(
                 dl_id2,
                 referer=source_url,
                 extra_headers=extra_headers,
+                fallback_ext=fallback_ext,
             )
 
     if dl_error or not filepath:
@@ -3202,6 +3220,7 @@ async def yt_select_callback(event):
                 video_url,
                 title=session.title_text,
                 skip_ytdlp=True,
+                fallback_ext=session.qualities[index]["format"],
             )
             if not dl_ok and download_url:
                 try:
