@@ -498,7 +498,7 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # 4) clipboard (last resort — often contains CDN URL, only accept converter URLs)
+            # 4) clipboard (filtered — only converter URLs)
             try:
                 text = await current.evaluate("""async () => {
                     try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
@@ -510,7 +510,7 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # 5) clipboard via hidden input (also filtered)
+            # 5) clipboard via hidden input (filtered)
             try:
                 url = await current.evaluate("""async () => {
                     try {
@@ -528,6 +528,34 @@ class SnapWCSession:
                 if url:
                     self.download_url = url
                     return url
+            except Exception:
+                pass
+
+            # 6) catch-all: scan ALL elements for ANY http(s) URL
+            try:
+                url = await current.evaluate("""() => {
+                    const els = document.querySelectorAll('*');
+                    for (const el of els) {
+                        const t = el.textContent.trim();
+                        if (t.startsWith('http://') || t.startsWith('https://')) return t;
+                    }
+                    return null;
+                }""")
+                if url:
+                    self.download_url = url
+                    return url
+            except Exception:
+                pass
+
+            # 7) catch-all: clipboard any http URL
+            try:
+                text = await current.evaluate("""async () => {
+                    try { const t = await navigator.clipboard.readText(); if (t && t.startsWith('http')) return t; } catch(e) {}
+                    return '';
+                }""")
+                if text:
+                    self.download_url = text
+                    return text
             except Exception:
                 pass
 
