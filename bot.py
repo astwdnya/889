@@ -829,8 +829,10 @@ async def get_youtube_meta_seostudio(url: str) -> dict:
                     else:
                         raise
 
+            await asyncio.sleep(3)
+            logger.info("[SEOSTUDIO] Waiting for input field...")
             url_input = page.locator("#input")
-            await url_input.wait_for(timeout=15000)
+            await url_input.wait_for(timeout=30000)
             await url_input.click()
             await url_input.fill("")
             logger.info("[SEOSTUDIO] URL typed, clicking extract...")
