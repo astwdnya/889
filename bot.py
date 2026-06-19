@@ -774,58 +774,74 @@ async def try_stream_download(
 async def get_youtube_meta_seostudio(url: str) -> dict:
     """Extract YouTube title + description from seostudio.tools using Playwright."""
     result = {"title": "", "description": ""}
-    pw = None
-    browser = None
+    import random
+
+    user_agent = random.choice(
+        [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        ]
+    )
     try:
-        pw = await async_playwright().__aenter__()
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-        )
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        page = await ctx.new_page()
-        await page.goto(
-            "https://seostudio.tools/youtube-description-extractor",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        await asyncio.sleep(2)
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-web-security",
+                    "--disable-infobars",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-size=1280,800",
+                ],
+            )
+            ctx = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=user_agent,
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+            page = await ctx.new_page()
 
-        input_el = page.locator("input#input")
-        await input_el.wait_for(timeout=15000)
-        await input_el.fill("")
-        await input_el.type(url, delay=30)
+            for retry in range(3):
+                try:
+                    await page.goto(
+                        "https://seostudio.tools/youtube-description-extractor",
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                    break
+                except Exception:
+                    if retry < 2:
+                        await asyncio.sleep(3)
+                    else:
+                        raise
 
-        extract_btn = page.locator('span[wire:target="onYoutubeDescriptionExtractor"]')
-        await extract_btn.wait_for(timeout=10000)
-        await extract_btn.click()
+            url_input = page.locator("#input")
+            await url_input.wait_for(timeout=15000)
+            await url_input.click()
+            await url_input.fill("")
+            await url_input.type(url, delay=30)
 
-        textarea = page.locator("textarea#text")
-        await textarea.wait_for(timeout=30000)
-        await asyncio.sleep(2)
-        text = await textarea.input_value()
+            extract_btn = page.locator(
+                'span[wire\\:target="onYoutubeDescriptionExtractor"]'
+            )
+            await extract_btn.wait_for(timeout=10000)
+            await extract_btn.click()
 
-        if text:
-            lines = text.strip().split("\n", 1)
-            result["title"] = lines[0].strip()
-            result["description"] = lines[1].strip() if len(lines) > 1 else ""
+            textarea = page.locator("#text")
+            await textarea.wait_for(timeout=20000)
+            await asyncio.sleep(2)
+
+            content = await textarea.input_value()
+            if content:
+                lines = content.strip().split("\n", 1)
+                result["title"] = lines[0].strip()
+                result["description"] = lines[1].strip() if len(lines) > 1 else ""
     except Exception as e:
         logger.warning(f"[SEOSTUDIO] Error: {e}")
-    finally:
-        if browser:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        if pw:
-            try:
-                await pw.__aexit__(None, None, None)
-            except Exception:
-                pass
     return result
 
 
@@ -1139,7 +1155,7 @@ async def do_download_and_send(
             return False
 
     # ===== گرفتن تایتل و دیسکریپشن از seostudio (بعد از دانلود) =====
-    if not title and _is_youtube_source(source_url):
+    if _is_youtube_source(source_url):
         await safe_edit(status_msg, "📝 Fetching title & description...")
         seo_meta = await get_youtube_meta_seostudio(source_url)
         if seo_meta.get("title"):
