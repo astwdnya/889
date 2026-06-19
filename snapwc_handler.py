@@ -474,6 +474,29 @@ class SnapWCSession:
             await asyncio.sleep(0.5)
         return False
 
+    async def _download_via_browser(self, url: str):
+        try:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            current = getattr(self, "current_page", self.page)
+            ctx = current.context
+            new_page = await ctx.new_page()
+            resp = await new_page.goto(
+                url, wait_until="domcontentloaded", timeout=60000
+            )
+            if resp and resp.ok:
+                body = await resp.body()
+                if len(body) > 1024:
+                    fname = f"snapwc_{int(time.time())}.mp4"
+                    fpath = os.path.join(OUTPUT_DIR, fname)
+                    async with aiofiles.open(fpath, "wb") as f:
+                        await f.write(body)
+                    await new_page.close()
+                    return fpath
+            await new_page.close()
+        except Exception:
+            pass
+        return ""
+
     async def get_download_url(self) -> str:
         current = getattr(self, "current_page", self.page)
         for attempt in range(60):
@@ -594,17 +617,17 @@ class SnapWCSession:
         steps = []
         try:
             steps.append("Starting browser...")
-            await self.start_browser()
+            await asyncio.wait_for(self.start_browser(), timeout=45)
             steps.append("Navigating to snapwc.com...")
-            await self.navigate()
+            await asyncio.wait_for(self.navigate(), timeout=100)
             steps.append("Pasting URL...")
-            await self.paste_url(video_url)
+            await asyncio.wait_for(self.paste_url(video_url), timeout=40)
             steps.append("Clicking Get Download Links...")
-            await self.click_get_links()
+            await asyncio.wait_for(self.click_get_links(), timeout=20)
             steps.append("Waiting for conversion...")
-            await self.wait_for_conversion()
+            await asyncio.wait_for(self.wait_for_conversion(), timeout=180)
             steps.append("Parsing qualities...")
-            await self.parse_qualities()
+            await asyncio.wait_for(self.parse_qualities(), timeout=130)
             steps.append(f"Found {len(self.qualities)} quality options")
 
             return {
@@ -687,12 +710,19 @@ class SnapWCSession:
                     "session": self,
                 }
 
-            steps.append("Got download link! Cleaning up...")
+            steps.append("Downloading file via browser...")
+            filepath = await self._download_via_browser(url)
+            steps.append(
+                f"Downloaded to {filepath}"
+                if filepath
+                else "Download failed, falling back to URL"
+            )
             await self.close_browser()
             return {
                 "success": True,
                 "captcha": False,
                 "download_url": url,
+                "filepath": filepath,
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
@@ -774,6 +804,9 @@ class SnapWCSession:
 
 
 # ─── Standalone CLI usage ──────────────────────────────────────────
+OUTPUT_DIR = "output_files"
+
+
 async def main():
     print("SnapWC Video Downloader")
     video_url = input("Paste video URL: ").strip()

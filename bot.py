@@ -3135,6 +3135,44 @@ async def _run_snapwc_flow(event, status_msg, url: str):
             pass
 
 
+async def _upload_snapwc_file(event, status_msg, filepath: str, title: str) -> bool:
+    try:
+        import os as _os
+
+        vid_duration, vw, vh = await get_video_info(filepath)
+        is_audio = vid_duration and vid_duration > 0 and vw == 0 and vh == 0
+        if is_audio:
+            await event.client.send_file(
+                event.chat_id,
+                filepath,
+                caption=title or "Audio",
+                attributes=[
+                    DocumentAttributeAudio(
+                        duration=int(vid_duration or 0), title=title or "Audio"
+                    )
+                ],
+                supports_streaming=True,
+            )
+        else:
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=f"🎬 {title}" if title else "🎬 **Video Downloaded**",
+                status_msg=status_msg,
+                supports_streaming=True,
+            )
+        try:
+            _os.remove(filepath)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.error(f"[SNAPWC] Upload error: {e}")
+        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+        return False
+
+
 async def snapwc_command(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
@@ -3215,14 +3253,25 @@ async def snapwc_select_callback(event):
             )
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
-            dl_ok = await do_download_and_send(
-                event,
-                status_msg,
-                download_url,
-                video_url,
-                title=title,
-                fallback_ext="mp4",
-            )
+            pre_filepath = result.get("filepath", "")
+            if (
+                pre_filepath
+                and os.path.exists(pre_filepath)
+                and os.path.getsize(pre_filepath) > 1048576
+            ):
+                await safe_edit(status_msg, "📤 Uploading pre-downloaded file...")
+                dl_ok = await _upload_snapwc_file(
+                    event, status_msg, pre_filepath, title
+                )
+            else:
+                dl_ok = await do_download_and_send(
+                    event,
+                    status_msg,
+                    download_url,
+                    video_url,
+                    title=title,
+                    fallback_ext="mp4",
+                )
 
             # Even if download failed, send the direct link to user
             if not dl_ok and download_url:
