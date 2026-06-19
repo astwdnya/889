@@ -257,10 +257,7 @@ async def download_with_controls(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
-        headers["Sec-Fetch-Dest"] = "video"
-        headers["Sec-Fetch-Mode"] = "no-cors"
-        headers["Sec-Fetch-Site"] = "cross-site"
-        if referer:
+        if referer and referer != url:
             headers["Referer"] = referer
             try:
                 headers["Origin"] = "/".join(referer.split("/")[:3])
