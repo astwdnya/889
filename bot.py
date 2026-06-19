@@ -42,6 +42,7 @@ from github import (
 )
 from savep_handler import process_savep_request
 from snapwc_handler import SnapWCSession
+from y2mate import Y2MateSession
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -63,6 +64,7 @@ admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
+y2mate_sessions: Dict[str, Y2MateSession] = {}  # Y2Mate session references
 
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
@@ -777,6 +779,7 @@ async def do_download_and_send(
     source_url: str,
     extra_headers: Optional[dict] = None,
     title: str = "",
+    skip_ytdlp: bool = False,
 ) -> bool:
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
@@ -785,9 +788,10 @@ async def do_download_and_send(
     dl_error = None
     final_size = 0
 
-    # ===== اگه لینک یوتیوب هست، اول با yt-dlp روی سرور دانلود کن =====
-    # این کار مشکل IP-lock لینک‌های googlevideo رو کامل حل می‌کنه
-    if _is_youtube_source(source_url) or _is_youtube_source(direct_url):
+    # ===== اگه لینک یوتیوب هست و skip_ytdlp فعال نیست، اول با yt-dlp =====
+    if not skip_ytdlp and (
+        _is_youtube_source(source_url) or _is_youtube_source(direct_url)
+    ):
         yt_target = source_url if _is_youtube_source(source_url) else direct_url
         filepath, dl_error, final_size = await download_youtube_ytdlp(
             yt_target, status_msg, dl_id
@@ -1530,9 +1534,9 @@ async def process_dirpy_request(event, url: str):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        # ===== اگه لینک یوتیوب بود، مستقیم با yt-dlp =====
+        # ===== اگه لینک یوتیوب بود → y2mate =====
         if _is_youtube_source(url):
-            await do_download_and_send(event, status_msg, url, url)
+            await _start_y2mate_flow(event, status_msg, url)
             return
 
         (
@@ -2242,6 +2246,7 @@ async def start_cmd(event):
     await event.reply(
         "🚀 **Ultimate Bot v6**\n\n"
         "• `/dirpy <url>` → Download video\n"
+        "• `/yt <url>` → Download YouTube via Y2Mate\n"
         "• `/snapwc <url>` → Download via SnapWC\n"
         "• `/savep <url>` → Download via SaveTheVideo\n"
         "• `/pdf <url>` → Webpage to PDF\n"
@@ -2495,10 +2500,10 @@ async def generic_url_handler(event):
         f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}"
     )
 
-    # ===== اگه لینک یوتیوب بود، مستقیم با do_download_and_send (که خودش yt-dlp رو صدا میزنه) =====
+    # ===== اگه لینک یوتیوب بود → برو به y2mate =====
     if _is_youtube_source(target_url):
-        status_msg = await event.reply("⏬ YouTube link detected — downloading...")
-        await do_download_and_send(event, status_msg, target_url, target_url)
+        status_msg = await event.reply("🎬 YouTube detected — starting Y2Mate...")
+        await _start_y2mate_flow(event, status_msg, target_url)
         return
 
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
@@ -3034,6 +3039,170 @@ async def snapwc_cancel_callback(event):
         pass
 
 
+# ====================== Y2MATE HANDLERS ======================
+
+
+async def _start_y2mate_flow(event, status_msg, video_url: str):
+    logger.info(f"[Y2MATE] START | chat={event.chat_id} | url={video_url[:120]}")
+
+    session = Y2MateSession()
+    try:
+        result = await asyncio.wait_for(session.run_full_flow(video_url), timeout=180)
+
+        if not result["success"]:
+            err = result.get("error", "Unknown")
+            logger.error(f"[Y2MATE] run_full_flow failed: {err}")
+            await safe_edit(status_msg, f"❌ Y2Mate error: {err}")
+            ss = result.get("screenshot_b64", "")
+            if ss:
+                try:
+                    await event.client.send_file(
+                        event.chat_id,
+                        base64.b64decode(ss),
+                        caption=f"📸 Y2Mate screenshot: {err[:80]}",
+                    )
+                except Exception:
+                    pass
+            await session.close_browser()
+            return
+
+        qualities = result.get("qualities", [])
+        if not qualities:
+            await safe_edit(status_msg, "❌ No quality options found.")
+            await session.close_browser()
+            return
+
+        session_id = f"y2mate_{event.chat_id}_{event.id}_{int(time.time())}"
+        y2mate_sessions[session_id] = session
+        user_state[event.chat_id] = {
+            "action": "y2mate_quality",
+            "session_id": session_id,
+            "video_url": video_url,
+        }
+
+        msg_lines = [f"🎬 **Y2Mate — {len(qualities)} options:**\n"]
+        buttons = []
+        for q in qualities:
+            sz = f" ({q['size']})" if q.get("size") else ""
+            ext = "🎵" if q["format"] == "mp3" else "🎬"
+            msg_lines.append(f"  {q['index']}. {q['label']}{sz}")
+            buttons.append(
+                [
+                    Button.inline(
+                        f"{ext} {q['label']}{sz}", f"yt_q_{session_id}_{q['index']}"
+                    )
+                ]
+            )
+        buttons.append([Button.inline("❌ Cancel", f"yt_cancel_{session_id}")])
+
+        await safe_edit(status_msg, "\n".join(msg_lines), buttons=buttons)
+
+    except Exception as e:
+        logger.error(f"[Y2MATE] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ Y2Mate error: {str(e)[:120]}")
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+
+
+async def y2mate_command(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("❌ Usage: `/yt <url>`", parse_mode="markdown")
+    url = parts[1].strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    status_msg = await event.reply("🔄 Starting Y2Mate session...")
+    await _start_y2mate_flow(event, status_msg, url)
+
+
+async def yt_select_callback(event):
+    data = event.data.decode()
+    prefix_removed = data.replace("yt_q_", "")
+    session_id = prefix_removed.rsplit("_", 1)[0]
+    index = int(prefix_removed.rsplit("_", 1)[1])
+
+    if session_id not in y2mate_sessions:
+        return await event.answer("❌ Session expired. Run /yt again.", alert=True)
+    session = y2mate_sessions.pop(session_id, None)
+    if not session:
+        return await event.answer("❌ Session expired.", alert=True)
+
+    await event.answer("⏳ Getting download link...", alert=False)
+    try:
+        result = await session.select_quality(index)
+        if result["success"]:
+            download_url = result["download_url"]
+            logger.info(f"[Y2MATE] Got download URL: {download_url[:100]}")
+
+            status_msg = await event.client.send_message(
+                event.chat_id, "✅ Got link! Downloading..."
+            )
+            video_url = user_state.get(event.chat_id, {}).get("video_url", "")
+
+            dl_ok = await do_download_and_send(
+                event,
+                status_msg,
+                download_url,
+                video_url,
+                title=session.title_text,
+                skip_ytdlp=True,
+            )
+            if not dl_ok and download_url:
+                try:
+                    await event.client.send_message(
+                        event.chat_id,
+                        f"⬇️ **Direct link (try manually):**\n`{download_url}`",
+                        parse_mode="markdown",
+                        link_preview=False,
+                    )
+                except Exception:
+                    pass
+        else:
+            err = result.get("error", "Unknown")
+            logger.error(f"[Y2MATE] select_quality failed: {err}")
+            await safe_edit(event, f"❌ Error: {err}")
+            ss = result.get("screenshot_b64", "")
+            if ss:
+                try:
+                    await event.client.send_file(
+                        event.chat_id,
+                        base64.b64decode(ss),
+                        caption=f"📸 Y2Mate screenshot: {err[:80]}",
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"[Y2MATE] Select callback error: {e}", exc_info=True)
+        await safe_edit(event, f"❌ Error: {str(e)[:120]}")
+    finally:
+        user_state.pop(event.chat_id, None)
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+
+
+async def yt_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("yt_cancel_", "")
+    if session_id in y2mate_sessions:
+        session = y2mate_sessions.pop(session_id)
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+    user_state.pop(event.chat_id, None)
+    await event.answer("❌ Cancelled", alert=False)
+    try:
+        await event.edit("❌ Y2Mate session cancelled.", buttons=None)
+    except Exception:
+        pass
+
+
 # ====================== MAIN ======================
 async def main():
     print("\n" + "=" * 60)
@@ -3120,6 +3289,12 @@ async def main():
     client.add_event_handler(
         snapwc_cancel_callback, events.CallbackQuery(pattern=r"snapwc_cancel_(.+)")
     )
+    client.add_event_handler(
+        yt_select_callback, events.CallbackQuery(pattern=r"yt_q_(.+)")
+    )
+    client.add_event_handler(
+        yt_cancel_callback, events.CallbackQuery(pattern=r"yt_cancel_(.+)")
+    )
 
     # ===== Command handlers =====
     client.add_event_handler(
@@ -3143,6 +3318,9 @@ async def main():
     )
     client.add_event_handler(
         snapwc_command, events.NewMessage(pattern=r"^/snapwc(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        y2mate_command, events.NewMessage(pattern=r"^/yt(\s|$)", incoming=True)
     )
     client.add_event_handler(
         savep_command, events.NewMessage(pattern=r"^/savep(\s|$)", incoming=True)
