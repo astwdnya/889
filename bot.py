@@ -261,7 +261,7 @@ async def download_with_controls(
     headers = {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate",
     }
 
     if is_googlevideo:
@@ -289,7 +289,7 @@ async def download_with_controls(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
-        if referer and referer != url:
+        if referer:
             headers["Referer"] = referer
             try:
                 headers["Origin"] = "/".join(referer.split("/")[:3])
@@ -632,30 +632,35 @@ async def download_youtube_ytdlp(
         return None, str(e)[:100], 0
 
 
-async def get_youtube_metadata(url: str) -> dict:
-    """Fetch YouTube video metadata (title, description, uploader) using yt-dlp."""
+async def get_youtube_meta_aiohttp(url: str) -> dict:
+    """Fetch YouTube title (oEmbed) + description (meta tag) with simple HTTP requests."""
+    result = {"title": "", "description": ""}
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp",
-            "--dump-json",
-            "--no-download",
-            "--no-playlist",
-            "--no-warnings",
-            url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return {}
-        data = json.loads(stdout.decode())
-        return {
-            "title": data.get("title", ""),
-            "description": data.get("description", "") or "",
-            "uploader": data.get("uploader", "") or data.get("channel", "") or "",
-        }
+        async with aiohttp.ClientSession() as s:
+            oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+            async with s.get(oembed_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    result["title"] = data.get("title", "")
     except Exception:
-        return {}
+        pass
+    try:
+        import re as _re
+
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    html = await r.text()
+                    m = _re.search(
+                        r'<meta\s+name="description"\s+content="([^"]*)"',
+                        html,
+                        _re.IGNORECASE,
+                    )
+                    if m:
+                        result["description"] = m.group(1)
+    except Exception:
+        pass
+    return result
 
 
 # ====================== PAUSE / RESUME / CANCEL CALLBACKS ======================
@@ -943,11 +948,12 @@ async def do_download_and_send(
             desc_str = f"\n📝 {description}" if description else ""
             if desc_str:
                 caption += desc_str
+            asize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
             await event.client.send_file(
                 event.chat_id,
                 filepath,
                 caption=caption,
-                voice_note=True,
+                voice_note=asize < 10 * 1024 * 1024,
                 supports_streaming=True,
             )
         except Exception as e:
@@ -2675,11 +2681,12 @@ async def generic_url_handler(event):
                 if hours > 0
                 else f" | ⏱ {mins}:{secs:02d}"
             )
+            asize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
             await event.client.send_file(
                 event.chat_id,
                 filepath,
                 caption=f"🎵 **Audio**{dur_str}",
-                voice_note=True,
+                voice_note=asize < 10 * 1024 * 1024,
                 supports_streaming=True,
             )
         except Exception as e:
@@ -3316,7 +3323,7 @@ async def yt_select_callback(event):
             )
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
 
-            meta = await get_youtube_metadata(video_url)
+            meta = await get_youtube_meta_aiohttp(video_url)
             yt_title = meta.get("title") or session.title_text or ""
             yt_desc = meta.get("description", "")
 

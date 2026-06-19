@@ -123,6 +123,35 @@ class Y2MateSession:
             pass
         await asyncio.sleep(3)
 
+    async def extract_title(self):
+        try:
+            el = await self.page.query_selector("h3.video-title")
+            if el:
+                self.title_text = (await el.inner_text()).strip()
+                return
+        except Exception:
+            pass
+        try:
+            el = await self.page.query_selector(".video-title")
+            if el:
+                self.title_text = (await el.inner_text()).strip()
+                return
+        except Exception:
+            pass
+        try:
+            el = await self.page.query_selector("h3")
+            if el:
+                txt = (await el.inner_text()).strip()
+                if txt and len(txt) > 5:
+                    self.title_text = txt
+                    return
+        except Exception:
+            pass
+        try:
+            self.title_text = (await self.page.title()).strip()
+        except Exception:
+            pass
+
     async def _get_iframe(self):
         try:
             for f in self.page.frames:
@@ -298,6 +327,8 @@ class Y2MateSession:
             await self.navigate_to_y2mate()
             steps.append("Pasting URL...")
             await self.paste_url(video_url)
+            steps.append("Extracting title...")
+            await self.extract_title()
             steps.append("Clicking Video tab...")
             await self.click_video_tab()
             steps.append("Parsing qualities...")
