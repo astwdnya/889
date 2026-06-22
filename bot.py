@@ -2394,7 +2394,60 @@ async def generic_url_handler(event):
             snap_id = f"snap_{event.chat_id}_{int(time.time())}"
             user_state[event.chat_id]["session_id"] = snap_id
             snapwc_sessions[snap_id] = session
-            result = await session.run_full_flow(target_url)
+            try:
+                result = await asyncio.wait_for(
+                    session.run_full_flow(target_url), timeout=90
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[URL] SnapWC timed out for {target_url[:80]}")
+                await session.close_browser()
+                snapwc_sessions.pop(snap_id, None)
+                user_state.pop(event.chat_id, None)
+                # Fall back to Dirpy extraction
+                await safe_edit(
+                    status_msg,
+                    "⏱️ SnapWC timed out — trying direct extraction...",
+                )
+                (
+                    found_urls,
+                    session_headers,
+                    intercept_err,
+                    page_title,
+                ) = await extract_video_url_smart(target_url, status_msg)
+                if not found_urls:
+                    await safe_edit(
+                        status_msg,
+                        f"❌ Could not extract video: {intercept_err or 'No URLs found'}",
+                    )
+                    processing_messages.discard(msg_id)
+                    return
+                await safe_edit(status_msg, "✅ Found video link! Downloading...")
+                best_url = found_urls[0]
+                try:
+                    sizes = await asyncio.gather(
+                        *(get_file_size(u) for u in found_urls[:6]),
+                        return_exceptions=True,
+                    )
+                    best_idx = 0
+                    best_sz = 0
+                    for i, s in enumerate(sizes):
+                        if isinstance(s, int) and s > best_sz:
+                            best_sz = s
+                            best_idx = i
+                    best_url = found_urls[best_idx]
+                except Exception:
+                    pass
+                await do_download_and_send(
+                    event,
+                    status_msg,
+                    best_url,
+                    target_url,
+                    title=page_title,
+                    extra_headers=session_headers or None,
+                )
+                processing_messages.discard(msg_id)
+                return
+
             if not result["success"]:
                 await safe_edit(
                     status_msg, f"❌ SnapWC error: {result.get('error', 'Unknown')}"
@@ -2423,7 +2476,7 @@ async def generic_url_handler(event):
             buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{snap_id}")])
             await safe_edit(status_msg, "📋 **Choose quality:**", buttons=buttons)
         except Exception as e:
-            logger.error(f"[URL] SnapWC auto error: {e}", exc_info=True)
+            logger.error(f"[URL] Adult site error: {e}", exc_info=True)
             try:
                 await safe_edit(status_msg, f"❌ Error: {str(e)[:100]}")
             except Exception:
