@@ -272,51 +272,68 @@ class Y2MateSession:
             return {"success": False, "error": "Quality button not found in iframe"}
         await asyncio.sleep(3)
 
-        iframe = await self._get_iframe()
-        if not iframe:
-            return {"success": False, "error": "Iframe disappeared"}
-
-        dl_link = iframe.locator("a.btn-download-link")
-        try:
-            await dl_link.wait_for(timeout=45000)
-        except Exception:
-            return {"success": False, "error": "Download link in modal did not appear"}
-
-        await asyncio.sleep(2)
-
-        try:
-            dl_span = dl_link.locator("span")
-            await dl_span.click()
-        except Exception:
-            try:
-                await dl_link.click()
-            except Exception:
-                pass
-        await asyncio.sleep(4)
-
-        current_url = self.page.url
-        if "yt-dl.click" in current_url or "yt-dl." in current_url:
-            self._captured_dl_urls.append(current_url)
-            self._captured_dl_url = current_url
-
-        for url in self._captured_dl_urls:
-            if "yt-dl.click" in url or "yt-dl." in url:
-                self.download_url = url
-                return {"success": True, "download_url": url}
-
-        for _ in range(15):
-            current_url = self.page.url
-            if "yt-dl.click" in current_url or "yt-dl." in current_url:
-                if current_url not in self._captured_dl_urls:
-                    self._captured_dl_urls.append(current_url)
+        async def wait_for_dl_url():
+            for _ in range(60):
+                if self._captured_dl_url:
+                    return self._captured_dl_url
+                current_url = self.page.url
+                if "yt-dl.click" in current_url or "yt-dl." in current_url:
                     self._captured_dl_url = current_url
-            for url in self._captured_dl_urls:
-                if "yt-dl.click" in url or "yt-dl." in url:
-                    self.download_url = url
-                    return {"success": True, "download_url": url}
-            await asyncio.sleep(1)
+                    return current_url
+                await asyncio.sleep(0.5)
+            return ""
 
-        return {"success": False, "error": "Could not get download URL"}
+        async def wait_for_modal_link():
+            for attempt in range(60):
+                iframe = await self._get_iframe()
+                if iframe:
+                    for sel in [
+                        "a.btn-download-link",
+                        "a.download-link",
+                        "a[href*='yt-dl']",
+                    ]:
+                        try:
+                            el = await iframe.query_selector(sel)
+                            if el:
+                                href = await el.get_attribute("href")
+                                if href:
+                                    self._captured_dl_url = href
+                                    self._captured_dl_urls.append(href)
+                                    return href
+                        except Exception:
+                            pass
+                    try:
+                        href = await iframe.evaluate("""() => {
+                            const a = document.querySelector('a.btn-download-link');
+                            if (a && a.href) return a.href;
+                            const a2 = document.querySelector('a[href*="yt-dl"]');
+                            if (a2 && a2.href) return a2.href;
+                            return '';
+                        }""")
+                        if href:
+                            self._captured_dl_url = href
+                            self._captured_dl_urls.append(href)
+                            return href
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)
+            return ""
+
+        network_task = asyncio.create_task(wait_for_dl_url())
+        modal_task = asyncio.create_task(wait_for_modal_link())
+        done, pending = await asyncio.wait(
+            [network_task, modal_task],
+            timeout=45,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+
+        if self._captured_dl_url:
+            self.download_url = self._captured_dl_url
+            return {"success": True, "download_url": self._captured_dl_url}
+
+        return {"success": False, "error": "Download link did not appear"}
 
     async def run_full_flow(self, video_url: str) -> dict:
         steps = []
