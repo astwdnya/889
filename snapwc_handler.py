@@ -556,48 +556,128 @@ class SnapWCSession:
         return ""
 
     async def download_via_browser(self, dl_url: str) -> dict:
+        download_page = None
         try:
             download_page = await self.context.new_page()
-            async with download_page.expect_download(timeout=120000) as dl_info:
-                await download_page.goto(
-                    dl_url, wait_until="domcontentloaded", timeout=30000
+
+            try:
+                async with download_page.expect_download(timeout=15000) as dl_info:
+                    await download_page.goto(
+                        dl_url, wait_until="domcontentloaded", timeout=30000
+                    )
+                download = await dl_info.value
+                suggested = download.suggested_filename or f"snapwc_{int(time.time())}"
+                ext = os.path.splitext(suggested)[1] or ".mp4"
+                dest = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "output_files",
+                    f"snapwc_{int(time.time())}{ext}",
                 )
-            download = await dl_info.value
-            path = await download.path()
-            suggested = download.suggested_filename or f"snapwc_{int(time.time())}"
-            ext = os.path.splitext(suggested)[1] or ".mp4"
-            dest = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "output_files",
-                f"snapwc_{int(time.time())}{ext}",
-            )
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            await download.save_as(dest)
-            await download_page.close()
-            size = os.path.getsize(dest)
-            if size < 100:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                await download.save_as(dest)
+                await download_page.close()
+                size = os.path.getsize(dest)
+                if size < 100:
+                    try:
+                        os.remove(dest)
+                    except Exception:
+                        pass
+                    return {
+                        "success": False,
+                        "error": f"Downloaded file too small ({size}B)",
+                    }
+                return {
+                    "success": True,
+                    "filepath": dest,
+                    "size": size,
+                    "filename": suggested,
+                }
+            except Exception:
+                pass
+
+            # No direct download triggered — extract real video URL from page
+            await download_page.wait_for_timeout(3000)
+            actual_url = ""
+            try:
+                actual_url = await download_page.evaluate("""() => {
+                    const els = document.querySelectorAll('a[href], source[src], video[src]');
+                    for (const el of els) {
+                        const href = el.href || el.src || '';
+                        if (href.includes('.mp4') || href.includes('googlevideo.com') || href.includes('videodelivery')) return href;
+                    }
+                    const all = document.querySelectorAll('*');
+                    for (const el of all) {
+                        const t = (el.textContent || '').trim();
+                        if ((t.startsWith('http://') || t.startsWith('https://')) && (t.includes('.mp4') || t.includes('googlevideo.com'))) return t;
+                    }
+                    return '';
+                }""")
+            except Exception:
+                pass
+
+            if not actual_url:
                 try:
-                    os.remove(dest)
+                    body = await download_page.inner_text("body")
+                    for m in re.finditer(
+                        r'https?://[^\s"\']+\.(mp4|m3u8)[^\s"\']*', body
+                    ):
+                        actual_url = m.group(0)
+                        break
                 except Exception:
                     pass
+
+            if actual_url:
+                await download_page.goto("about:blank", wait_until="domcontentloaded")
                 try:
-                    content = open(dest, "rb").read() if os.path.exists(dest) else b""
+                    async with download_page.expect_download(timeout=120000) as dl_info:
+                        await download_page.goto(
+                            actual_url,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                    download = await dl_info.value
+                    suggested = (
+                        download.suggested_filename or f"snapwc_{int(time.time())}"
+                    )
+                    ext = os.path.splitext(suggested)[1] or ".mp4"
+                    dest = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "output_files",
+                        f"snapwc_{int(time.time())}{ext}",
+                    )
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    await download.save_as(dest)
+                    await download_page.close()
+                    size = os.path.getsize(dest)
+                    if size < 100:
+                        try:
+                            os.remove(dest)
+                        except Exception:
+                            pass
+                        return {
+                            "success": False,
+                            "error": f"Downloaded file too small ({size}B)",
+                        }
+                    return {
+                        "success": True,
+                        "filepath": dest,
+                        "size": size,
+                        "filename": suggested,
+                    }
                 except Exception:
-                    content = b""
-                return {
-                    "success": False,
-                    "error": f"Downloaded file too small ({size}B)",
-                    "content": content,
-                }
+                    pass
+
+            # Still no download — return the actual URL for do_download_and_send
+            await download_page.close()
             return {
-                "success": True,
-                "filepath": dest,
-                "size": size,
-                "filename": suggested,
+                "success": False,
+                "error": "No download triggered",
+                "extracted_url": actual_url or dl_url,
             }
         except Exception as e:
             try:
-                await download_page.close()
+                if download_page:
+                    await download_page.close()
             except Exception:
                 pass
             return {"success": False, "error": str(e)}
@@ -711,6 +791,11 @@ class SnapWCSession:
                     "filename": dl_via_browser.get("filename", ""),
                 }
 
+            # If browser download failed but extracted a real video URL, use it
+            if not dl_via_browser["success"] and dl_via_browser.get("extracted_url"):
+                url = dl_via_browser["extracted_url"]
+                steps.append("Using extracted video URL instead of converter")
+
             await self.close_browser()
             return {
                 "success": True,
@@ -787,6 +872,10 @@ class SnapWCSession:
                     "file_size": dl_via_browser["size"],
                     "filename": dl_via_browser.get("filename", ""),
                 }
+
+            if not dl_via_browser["success"] and dl_via_browser.get("extracted_url"):
+                url = dl_via_browser["extracted_url"]
+                steps.append("Using extracted video URL instead of converter")
 
             await self.close_browser()
             return {
