@@ -43,6 +43,7 @@ from github import (
 )
 from savep_handler import process_savep_request
 from snapwc_handler import SnapWCSession
+from y2mate import Y2MateSession
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -2328,74 +2329,168 @@ async def generic_url_handler(event):
         and user_state[event.chat_id].get("action") == "wait_for_compression_size"
     ):
         return
+    msg_id = f"gen_{event.chat_id}_{event.id}"
+    if msg_id in processing_messages:
+        return
+    processing_messages.add(msg_id)
     urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
     if not urls:
+        processing_messages.discard(msg_id)
         return
     target_url = urls[0]
+
+    if (
+        YOUTUBE_RE.match(target_url)
+        or "youtube.com" in target_url
+        or "youtu.be" in target_url
+    ):
+        logger.info(f"[URL] YouTube detected | url={target_url[:120]}")
+        status_msg = await event.reply("⏬ Processing...")
+        try:
+            await process_y2mate_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     logger.info(
         f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}"
     )
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     status_msg = await event.reply("⏬ Downloading...")
+    try:
+        filepath, error, size = await download_with_controls(
+            target_url, status_msg, dl_id, referer=target_url
+        )
 
-    filepath, error, size = await download_with_controls(
-        target_url, status_msg, dl_id, referer=target_url
-    )
+        if error == "HTTP_403":
+            await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
+            await process_dirpy_request(event, target_url)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            return
 
-    # FIX: 403 → auto-dirpy
-    if error == "HTTP_403":
-        await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
-        await process_dirpy_request(event, target_url)
+        if error or not filepath:
+            if error != "Cancelled by user":
+                await safe_edit(status_msg, f"❌ {error or 'Failed'}")
+            return
+        await safe_edit(status_msg, "📤 Uploading...")
         try:
-            await status_msg.delete()
+            vid_duration, vw, vh = await get_video_info(filepath)
+            is_video = (
+                vid_duration is not None and vid_duration > 0 and vw > 0 and vh > 0
+            )
+            if is_video:
+                mins, secs = divmod(int(vid_duration), 60)
+                hours, mins = divmod(mins, 60)
+                if hours > 0:
+                    dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
+                else:
+                    dur_str = f" | ⏱ {mins}:{secs:02d}"
+            else:
+                dur_str = ""
+            gh_line = ""
+            if GITHUB_ENABLED:
+                await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+                gh_url = await maybe_upload_github(
+                    event.client, event.chat_id, filepath, size
+                )
+                if gh_url:
+                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+                await safe_edit(status_msg, "📤 Uploading...")
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
+                status_msg=status_msg,
+            )
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+            return
+        try:
+            os.remove(filepath)
         except Exception:
             pass
-        return
+    finally:
+        processing_messages.discard(msg_id)
 
-    if error or not filepath:
-        if error != "Cancelled by user":
-            await safe_edit(status_msg, f"❌ {error or 'Failed'}")
-        return
-    await safe_edit(status_msg, "📤 Uploading...")
+
+# ====================== Y2MATE INTEGRATION ======================
+
+YOUTUBE_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/")
+
+
+async def process_y2mate_request(event, url: str, status_msg):
+    logger.info(f"[Y2MATE] START | chat={event.chat_id} | url={url[:120]}")
+    await safe_edit(status_msg, "🔄 Processing via Y2Mate...")
+    session = Y2MateSession()
     try:
-        vid_duration, vw, vh = await get_video_info(filepath)
-        is_video = vid_duration is not None and vid_duration > 0 and vw > 0 and vh > 0
-        if is_video:
-            mins, secs = divmod(int(vid_duration), 60)
-            hours, mins = divmod(mins, 60)
-            if hours > 0:
-                dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
-            else:
-                dur_str = f" | ⏱ {mins}:{secs:02d}"
-        else:
-            dur_str = ""
-        gh_line = ""
-        if GITHUB_ENABLED:
-            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-            gh_url = await maybe_upload_github(
-                event.client, event.chat_id, filepath, size
+        result = await asyncio.wait_for(session.run_full_flow(url), timeout=120)
+        if not result["success"]:
+            await safe_edit(
+                status_msg, f"❌ Y2Mate error: {result.get('error', 'Unknown')}"
             )
-            if gh_url:
-                gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-            await safe_edit(status_msg, "📤 Uploading...")
-        await send_file_with_progress(
-            client=event.client,
-            chat_id=event.chat_id,
-            filepath=filepath,
-            caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
-            status_msg=status_msg,
+            ss = result.get("screenshot_b64", "")
+            if ss:
+                try:
+                    await event.client.send_file(
+                        event.chat_id, base64.b64decode(ss), caption="📸 Y2Mate error"
+                    )
+                except Exception:
+                    pass
+            await session.close_browser()
+            return
+
+        qualities = result.get("qualities", [])
+        if not qualities:
+            await safe_edit(status_msg, "❌ No quality options found.")
+            await session.close_browser()
+            return
+
+        best_idx = len(qualities) - 1
+        best = qualities[best_idx]
+        await safe_edit(
+            status_msg, f"📥 Downloading {best['label']} ({best.get('size', '?')})..."
         )
+
+        dl_result = await session.select_quality(best_idx)
+        if not dl_result["success"]:
+            await safe_edit(
+                status_msg,
+                f"❌ Y2Mate download failed: {dl_result.get('error', 'Unknown')}",
+            )
+            await session.close_browser()
+            return
+
+        dl_url = dl_result["download_url"]
+        await session.close_browser()
+
+        await safe_edit(status_msg, "📥 Downloading file...")
+        yt_title = session.title_text or ""
+        await do_download_and_send(
+            event,
+            status_msg,
+            dl_url,
+            url,
+            extra_headers={"Referer": "https://v21.www-y2mate.com/"},
+            title=yt_title,
+        )
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ Y2Mate timed out (120s).")
+        await session.close_browser()
     except Exception as e:
-        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-        return
-    try:
-        os.remove(filepath)
-    except Exception:
-        pass
+        logger.error(f"[Y2MATE] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ Y2Mate error: {str(e)[:120]}")
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
 
 
-# ====================== VIDEO RECEIVE → GITHUB OFFER ======================
+# ====================== VIDEO RECEIVE -> GITHUB OFFER ======================
 
 
 async def video_receive_handler(event):
