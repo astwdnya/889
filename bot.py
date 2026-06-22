@@ -2954,6 +2954,11 @@ async def snapwc_command(event):
     status_msg = await event.reply("🔄 Starting SnapWC session...")
     logger.info(f"[SNAPWC] START | chat={event.chat_id} | url={url[:120]}")
 
+    await _run_snapwc_flow(event, url, status_msg)
+
+
+async def _run_snapwc_flow(event, url, status_msg):
+
     session = SnapWCSession()
     try:
         result = await asyncio.wait_for(session.run_full_flow(url), timeout=180)
