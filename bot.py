@@ -2463,7 +2463,7 @@ async def process_y2mate_request(event, url: str, status_msg):
             return
 
         yt_title = session.title_text or ""
-        pick_id = f"y2m_{event.chat_id}_{int(time.time())}"
+        pick_id = f"{event.chat_id}_{int(time.time())}"
         y2mate_sessions[pick_id] = {
             "session": session,
             "qualities": qualities,
@@ -2476,14 +2476,14 @@ async def process_y2mate_request(event, url: str, status_msg):
         row = []
         for i, q in enumerate(qualities):
             label = f"{q['label']} ({q.get('size', '?')})"
-            btn = Button.inline(label, f"y2m_{pick_id}_{i}")
+            btn = Button.inline(label, f"y2mq_{pick_id}_{i}")
             row.append(btn)
             if len(row) >= 2:
                 buttons.append(row)
                 row = []
         if row:
             buttons.append(row)
-        buttons.append([Button.inline("❌ Cancel", f"y2m_cancel_{pick_id}")])
+        buttons.append([Button.inline("❌ Cancel", f"y2mc_{pick_id}")])
 
         title_line = f"\n🎬 **{yt_title}**" if yt_title else ""
         await safe_edit(
@@ -3099,12 +3099,13 @@ async def snapwc_cancel_callback(event):
 
 async def y2mate_quality_callback(event):
     data = event.data.decode()
-    parts = data.split("_", 2)
-    if len(parts) < 3:
-        return await event.answer("Invalid callback data.", alert=True)
-    pick_id = f"{parts[0]}_{parts[1]}"
+    rest = data[5:]
+    idx_pos = rest.rfind("_")
+    if idx_pos == -1:
+        return await event.answer("Invalid callback.", alert=True)
+    pick_id = rest[:idx_pos]
     try:
-        idx = int(parts[2])
+        idx = int(rest[idx_pos + 1 :])
     except ValueError:
         return await event.answer("Invalid quality index.", alert=True)
 
@@ -3199,8 +3200,7 @@ async def y2mate_quality_callback(event):
 
 
 async def y2mate_cancel_callback(event):
-    data = event.data.decode()
-    pick_id = data.replace("y2m_cancel_", "")
+    pick_id = event.data.decode()[5:]
     if pick_id in y2mate_sessions:
         entry = y2mate_sessions.pop(pick_id)
         try:
@@ -3305,7 +3305,10 @@ async def main():
         events.CallbackQuery(pattern=r"y2m_(?!cancel)(.+)_(\d+)"),
     )
     client.add_event_handler(
-        y2mate_cancel_callback, events.CallbackQuery(pattern=r"y2m_cancel_(.+)")
+        y2mate_quality_callback, events.CallbackQuery(pattern=r"y2mq_.+")
+    )
+    client.add_event_handler(
+        y2mate_cancel_callback, events.CallbackQuery(pattern=r"y2mc_.+")
     )
 
     # ===== Command handlers =====
