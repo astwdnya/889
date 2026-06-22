@@ -2,6 +2,15 @@ import asyncio
 from playwright.async_api import async_playwright
 
 
+def _unescape_json(s: str) -> str:
+    return (
+        s.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\\\", "\\")
+    )
+
+
 async def extract_youtube_info(url: str) -> str:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -34,9 +43,6 @@ async def extract_youtube_info(url: str) -> str:
 
             await page.locator('span:has-text("Submit")').first.click()
             await page.wait_for_timeout(3000)
-
-            title = ""
-            description = ""
 
             result = await page.evaluate("""() => {
                 const snippet = document.querySelector('#video #snippet code');
@@ -75,10 +81,12 @@ async def extract_youtube_info(url: str) -> str:
                 return '';
             }""")
 
+            title = ""
+            description = ""
             if result:
                 parts = result.split("\n", 1)
-                title = parts[0].strip()
-                description = parts[1].strip() if len(parts) > 1 else ""
+                title = _unescape_json(parts[0].strip())
+                description = _unescape_json(parts[1].strip()) if len(parts) > 1 else ""
 
             await browser.close()
             return f"{title}\n{description}" if title else ""
