@@ -2376,6 +2376,62 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if (
+        "pornhub.com" in target_url
+        or "xnxx.com" in target_url
+        or "xvideos.com" in target_url
+        or "xhamster.com" in target_url
+    ):
+        logger.info(
+            f"[URL] Adult site detected, routing via SnapWC | url={target_url[:120]}"
+        )
+        user_state[event.chat_id] = {"action": "snapwc", "video_url": target_url}
+        status_msg = await event.reply("⏬ Processing...")
+        try:
+            from snapwc_handler import SnapWCSession
+
+            session = SnapWCSession()
+            snap_id = f"snap_{event.chat_id}_{int(time.time())}"
+            user_state[event.chat_id]["session_id"] = snap_id
+            snapwc_sessions[snap_id] = session
+            result = await session.run_full_flow(target_url)
+            if not result["success"]:
+                await safe_edit(
+                    status_msg, f"❌ SnapWC error: {result.get('error', 'Unknown')}"
+                )
+                await session.close_browser()
+                snapwc_sessions.pop(snap_id, None)
+                return
+            qualities = result.get("qualities", [])
+            if not qualities:
+                await safe_edit(status_msg, "❌ No qualities found.")
+                await session.close_browser()
+                snapwc_sessions.pop(snap_id, None)
+                return
+            buttons = []
+            row = []
+            for i, q in enumerate(qualities):
+                btn = Button.inline(
+                    f"{q['label']} ({q.get('size', '?')})", f"snapwc_q_{snap_id}_{i}"
+                )
+                row.append(btn)
+                if len(row) >= 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+            buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{snap_id}")])
+            await safe_edit(status_msg, "📋 **Choose quality:**", buttons=buttons)
+        except Exception as e:
+            logger.error(f"[URL] SnapWC auto error: {e}", exc_info=True)
+            try:
+                await safe_edit(status_msg, f"❌ Error: {str(e)[:100]}")
+            except Exception:
+                pass
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     logger.info(
         f"[URL] Direct URL received | chat={event.chat_id} | url={target_url[:120]}"
     )
@@ -2931,6 +2987,7 @@ async def snapwc_select_callback(event):
 
         if result["success"]:
             download_url = result["download_url"]
+            download_headers = result.get("download_headers", {})
             title = result.get("title", "")
 
             steps = result.get("steps", [])
@@ -2942,7 +2999,12 @@ async def snapwc_select_callback(event):
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
             dl_ok = await do_download_and_send(
-                event, status_msg, download_url, video_url, title=title
+                event,
+                status_msg,
+                download_url,
+                video_url,
+                title=title,
+                extra_headers=download_headers if download_headers else None,
             )
 
             # Even if download failed, send the direct link to user
@@ -2976,6 +3038,7 @@ async def snapwc_select_callback(event):
                         new_dl = await new_session.continue_with_quality(index)
                         if new_dl.get("success") and not new_dl.get("captcha"):
                             fresh_url = new_dl["download_url"]
+                            fresh_headers = new_dl.get("download_headers", {})
                             fresh_title = new_dl.get("title", title)
                             await safe_edit(
                                 retry_msg, "🔄 Step 3/3: Retrying download..."
@@ -2985,6 +3048,7 @@ async def snapwc_select_callback(event):
                                 retry_msg,
                                 fresh_url,
                                 video_url,
+                                extra_headers=fresh_headers if fresh_headers else None,
                                 title=fresh_title,
                             )
                             if not retry_ok:
@@ -3070,12 +3134,18 @@ async def snapwc_captcha_handler(event):
 
         if result["success"]:
             download_url = result["download_url"]
+            download_headers = result.get("download_headers", {})
             title = result.get("title", "")
 
             await safe_edit(status_msg, "✅ Captcha solved! Starting download...")
             video_url = state.get("video_url", "")
             await do_download_and_send(
-                event, status_msg, download_url, video_url, title=title
+                event,
+                status_msg,
+                download_url,
+                video_url,
+                extra_headers=download_headers if download_headers else None,
+                title=title,
             )
         else:
             await safe_edit(status_msg, f"❌ {result.get('error', 'Captcha failed')}")
@@ -3204,14 +3274,24 @@ async def y2mate_quality_callback(event):
                         extract_youtube_info(source_url), timeout=60
                     )
                     lines = info.split("\n")
-                    title = lines[0].strip() if lines else ""
-                    desc = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
-                    desc_short = desc
+                    clean_lines = [
+                        l.strip()
+                        for l in lines
+                        if l.strip()
+                        and l.strip()
+                        not in ("Free Download", "TITLE & DESCRIPTION:", "---")
+                    ]
+                    title = clean_lines[0] if clean_lines else yt_title
+                    desc = (
+                        "\n".join(clean_lines[1:]).strip()
+                        if len(clean_lines) > 1
+                        else ""
+                    )
                     extra = ""
                     if title:
                         extra += f"\n🎬 **{title}**"
-                    if desc_short:
-                        extra += f"\n📝 {desc_short}"
+                    if desc:
+                        extra += f"\n📝 {desc}"
                     if extra:
                         new_caption = f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({source_url}){gh_line}{extra}"
                         try:
@@ -3220,6 +3300,14 @@ async def y2mate_quality_callback(event):
                             )
                         except Exception:
                             pass
+                except Exception as e:
+                    logger.error(f"[Y2MATE_EXTRACT] Error: {e}", exc_info=True)
+                    try:
+                        await event.client.send_message(
+                            event.chat_id, f"⚠️ Extractor log: {str(e)[:200]}"
+                        )
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         except Exception as e:

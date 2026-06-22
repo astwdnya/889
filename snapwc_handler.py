@@ -34,6 +34,7 @@ class SnapWCSession:
         self.qualities = []
         self.title_text = ""
         self.download_url = ""
+        self.download_headers = {}
         self.captcha_image_b64 = ""
         self.waiting_for_captcha = False
         self.done = False
@@ -453,10 +454,26 @@ class SnapWCSession:
             await asyncio.sleep(0.5)
         return False
 
-    async def get_download_url(self) -> dict:
+    async def _capture_download_headers(self) -> dict:
+        headers = {
+            "Referer": "https://snapwc.com/sites",
+            "Origin": "https://sf-converter.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        }
+        try:
+            cookies = await self.context.cookies()
+            if cookies:
+                headers["Cookie"] = "; ".join(
+                    f"{c['name']}={c['value']}" for c in cookies
+                )
+        except Exception:
+            pass
+        return headers
+
+    async def get_download_url(self) -> str:
         current = getattr(self, "current_page", self.page)
-        url = ""
         for attempt in range(60):
+            # 1) scan DOM for /get? URLs (converter URL — preferred)
             try:
                 url = await current.evaluate("""() => {
                     const a = document.querySelector('a[href*="/get?"]');
@@ -466,75 +483,77 @@ class SnapWCSession:
                     return null;
                 }""")
                 if url:
-                    break
+                    self.download_url = url
+                    self.download_headers = await self._capture_download_headers()
+                    return url
             except Exception:
                 pass
 
-            if not url:
-                try:
-                    url = await current.evaluate("""() => {
-                        const els = document.querySelectorAll('*');
-                        for (const el of els) {
-                            const t = el.textContent.trim();
-                            if (t.startsWith('http://') || t.startsWith('https://')) {
-                                if (t.includes('/get?') || t.includes('sf-converter.com/get')) return t;
-                            }
+            # 2) scan ALL elements for /get? or sf-converter.com URLs
+            try:
+                url = await current.evaluate("""() => {
+                    const els = document.querySelectorAll('*');
+                    for (const el of els) {
+                        const t = el.textContent.trim();
+                        if (t.startsWith('http://') || t.startsWith('https://')) {
+                            if (t.includes('/get?') || t.includes('sf-converter.com/get')) return t;
                         }
-                        return null;
-                    }""")
-                    if url:
-                        break
-                except Exception:
-                    pass
+                    }
+                    return null;
+                }""")
+                if url:
+                    self.download_url = url
+                    self.download_headers = await self._capture_download_headers()
+                    return url
+            except Exception:
+                pass
 
-            if not url:
-                try:
-                    body = await current.inner_text("body")
-                    for match in re.finditer(
-                        r'https?://[^\s"\']+/get\?[^\s"\']+', body
-                    ):
-                        url = match.group(0)
-                        break
-                    if url:
-                        break
-                except Exception:
-                    pass
+            # 3) regex on body inner_text for /get? URLs
+            try:
+                body = await current.inner_text("body")
+                for match in re.finditer(r'https?://[^\s"\']+/get\?[^\s"\']+', body):
+                    self.download_url = match.group(0)
+                    self.download_headers = await self._capture_download_headers()
+                    return match.group(0)
+            except Exception:
+                pass
 
-            if not url:
-                try:
-                    text = await current.evaluate("""async () => {
-                        try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
-                        return '';
-                    }""")
-                    if text:
-                        url = text
-                        break
-                except Exception:
-                    pass
+            # 4) clipboard (last resort — often contains CDN URL, only accept converter URLs)
+            try:
+                text = await current.evaluate("""async () => {
+                    try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
+                    return '';
+                }""")
+                if text:
+                    self.download_url = text
+                    self.download_headers = await self._capture_download_headers()
+                    return text
+            except Exception:
+                pass
+
+            # 5) clipboard via hidden input (also filtered)
+            try:
+                url = await current.evaluate("""async () => {
+                    try {
+                        const inp = document.createElement('input');
+                        inp.style.position = 'fixed'; inp.style.left = '-9999px';
+                        document.body.appendChild(inp);
+                        inp.focus();
+                        const t = await navigator.clipboard.readText();
+                        inp.value = t;
+                        inp.remove();
+                        if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t;
+                    } catch(e) {}
+                    return '';
+                }""")
+                if url:
+                    self.download_url = url
+                    return url
+            except Exception:
+                pass
 
             await asyncio.sleep(0.5)
-
-        if not url:
-            return {"url": "", "headers": {}}
-
-        self.download_url = url
-
-        cookies_raw = []
-        try:
-            cookies_raw = await self.context.cookies()
-        except Exception:
-            pass
-
-        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies_raw)
-        headers = {
-            "Referer": "https://snapwc.com/sites",
-            "Origin": "https://sf-converter.com",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        }
-        if cookie_str:
-            headers["Cookie"] = cookie_str
-
-        return {"url": url, "headers": headers}
+        return ""
 
     async def run_full_flow(self, video_url: str) -> dict:
         steps = []
@@ -622,10 +641,8 @@ class SnapWCSession:
                 }
 
             steps.append("Retrieving download URL...")
-            dl_info = await self.get_download_url()
-            dl_url = dl_info.get("url", "")
-            dl_headers = dl_info.get("headers", {})
-            if not dl_url:
+            url = await self.get_download_url()
+            if not url:
                 await self.take_screenshot()
                 return {
                     "success": False,
@@ -640,8 +657,8 @@ class SnapWCSession:
             return {
                 "success": True,
                 "captcha": False,
-                "download_url": dl_url,
-                "download_headers": dl_headers,
+                "download_url": url,
+                "download_headers": self.download_headers,
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
@@ -689,10 +706,8 @@ class SnapWCSession:
                 }
 
             steps.append("Retrieving download URL...")
-            dl_info = await self.get_download_url()
-            dl_url = dl_info.get("url", "")
-            dl_headers = dl_info.get("headers", {})
-            if not dl_url:
+            url = await self.get_download_url()
+            if not url:
                 await self.take_screenshot()
                 return {
                     "success": False,
@@ -707,8 +722,8 @@ class SnapWCSession:
             return {
                 "success": True,
                 "captcha": False,
-                "download_url": dl_url,
-                "download_headers": dl_headers,
+                "download_url": url,
+                "download_headers": self.download_headers,
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
@@ -751,8 +766,10 @@ async def main():
 
     if result2["success"] and result2.get("download_url"):
         print(f"\nDownload URL: {result2['download_url']}")
-        print(f"Download headers: {result2.get('download_headers', {})}")
         print(f"Title: {result2.get('title', '')}")
+        headers = result2.get("download_headers", {})
+        if headers:
+            print(f"Cookie: {headers.get('Cookie', '(none)')[:80]}...")
     else:
         print(f"Error: {result2.get('error', 'Unknown')}")
 
