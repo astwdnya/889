@@ -3303,9 +3303,18 @@ async def y2mate_quality_callback(event):
                 except Exception as e:
                     logger.error(f"[Y2MATE_EXTRACT] Error: {e}", exc_info=True)
                     try:
-                        await event.client.send_message(
-                            event.chat_id, f"⚠️ Extractor log: {str(e)[:200]}"
-                        )
+                        err_msg = str(e)[:200]
+                        ss_b64 = getattr(e, "screenshot_b64", "")
+                        if ss_b64:
+                            await event.client.send_file(
+                                event.chat_id,
+                                base64.b64decode(ss_b64),
+                                caption=f"⚠️ Extractor failed:\n{err_msg}",
+                            )
+                        else:
+                            await event.client.send_message(
+                                event.chat_id, f"⚠️ Extractor log: {err_msg}"
+                            )
                     except Exception:
                         pass
                 except Exception:
