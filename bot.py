@@ -44,6 +44,7 @@ from github import (
 from savep_handler import process_savep_request
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
+from youtube_extractor import extract_youtube_info
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -591,6 +592,7 @@ async def send_file_with_progress(
         except Exception:
             pass
 
+    sent = None
     try:
         with open(filepath, "rb") as f:
             uploaded = await fast_upload_file(
@@ -641,7 +643,7 @@ async def send_file_with_progress(
                 force_file=True,
             )
 
-        await client.send_file(
+        sent = await client.send_file(
             chat_id,
             media,
             caption=caption,
@@ -659,6 +661,8 @@ async def send_file_with_progress(
         await status_msg.delete()
     except Exception:
         pass
+
+    return sent
 
 
 # ====================== DOWNLOAD AND SEND ======================
@@ -3173,7 +3177,7 @@ async def y2mate_quality_callback(event):
                 )
                 if gh_url:
                     gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-            await send_file_with_progress(
+            sent_msg = await send_file_with_progress(
                 client=event.client,
                 chat_id=event.chat_id,
                 filepath=filepath,
@@ -3184,6 +3188,32 @@ async def y2mate_quality_callback(event):
                 os.remove(filepath)
             except Exception:
                 pass
+
+            if sent_msg and "youtube" in source_url.lower():
+                try:
+                    await safe_edit(status_msg, "📝 Getting video info...")
+                    info = await asyncio.wait_for(
+                        extract_youtube_info(source_url), timeout=60
+                    )
+                    lines = info.split("\n")
+                    title = lines[0].strip() if lines else ""
+                    desc = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+                    desc_short = desc
+                    extra = ""
+                    if title:
+                        extra += f"\n🎬 **{title}**"
+                    if desc_short:
+                        extra += f"\n📝 {desc_short}"
+                    if extra:
+                        new_caption = f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({source_url}){gh_line}{extra}"
+                        try:
+                            await event.client.edit_message(
+                                event.chat_id, sent_msg.id, text=new_caption
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
         except Exception as e:
             await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
     except Exception as e:
