@@ -33,22 +33,52 @@ async def extract_youtube_info(url: str) -> str:
             await asyncio.sleep(0.3)
 
             await page.locator('span:has-text("Submit")').first.click()
-
             await page.wait_for_timeout(3000)
 
             title = ""
             description = ""
 
-            spans = await page.locator("span.hljs-string").all()
-            for sp in spans:
-                text = (await sp.inner_text()).strip().strip('"')
-                if not text:
-                    continue
-                if not title:
-                    title = text
-                elif not description:
-                    description = text
-                    break
+            result = await page.evaluate("""() => {
+                const snippet = document.querySelector('#video #snippet code');
+                if (!snippet) return '';
+
+                const attrs = snippet.querySelectorAll('span.hljs-attr');
+                let t = '', d = '';
+
+                for (const attr of attrs) {
+                    const key = attr.textContent.trim().replace(/^"(.*)"$/, '$1');
+                    if (key === 'title' && !t) {
+                        let el = attr.nextElementSibling;
+                        while (el) {
+                            if (el.classList.contains('hljs-string')) {
+                                t = el.textContent.trim();
+                                t = t.replace(/^"(.*)"$/, '$1');
+                                break;
+                            }
+                            el = el.nextElementSibling;
+                        }
+                    } else if (key === 'description' && !d) {
+                        let el = attr.nextElementSibling;
+                        while (el) {
+                            if (el.classList.contains('hljs-string')) {
+                                d = el.textContent.trim();
+                                d = d.replace(/^"(.*)"$/, '$1');
+                                break;
+                            }
+                            el = el.nextElementSibling;
+                        }
+                    }
+                    if (t && d) break;
+                }
+
+                if (t || d) return (t || '') + '\\n' + (d || '');
+                return '';
+            }""")
+
+            if result:
+                parts = result.split("\n", 1)
+                title = parts[0].strip()
+                description = parts[1].strip() if len(parts) > 1 else ""
 
             await browser.close()
             return f"{title}\n{description}" if title else ""

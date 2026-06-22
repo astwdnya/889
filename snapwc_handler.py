@@ -518,10 +518,10 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # 4) clipboard (last resort — often contains CDN URL, only accept converter URLs)
+            # 4) clipboard — accept any valid URL
             try:
                 text = await current.evaluate("""async () => {
-                    try { const t = await navigator.clipboard.readText(); if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t; } catch(e) {}
+                    try { const t = await navigator.clipboard.readText(); if (t && (t.startsWith('http://') || t.startsWith('https://'))) return t; } catch(e) {}
                     return '';
                 }""")
                 if text:
@@ -531,7 +531,7 @@ class SnapWCSession:
             except Exception:
                 pass
 
-            # 5) clipboard via hidden input (also filtered)
+            # 5) clipboard via hidden input (same, any URL)
             try:
                 url = await current.evaluate("""async () => {
                     try {
@@ -542,7 +542,7 @@ class SnapWCSession:
                         const t = await navigator.clipboard.readText();
                         inp.value = t;
                         inp.remove();
-                        if (t && (t.includes('/get?') || t.includes('sf-converter.com/get'))) return t;
+                        if (t && (t.startsWith('http://') || t.startsWith('https://'))) return t;
                     } catch(e) {}
                     return '';
                 }""")
