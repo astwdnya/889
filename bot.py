@@ -299,14 +299,23 @@ async def download_with_controls(
                                 0,
                             )
 
-                        # Detect file extension
-                        ext = ".bin"
+                        # Detect original filename
+                        orig_name = ""
                         cd = response.headers.get("Content-Disposition", "")
                         if "filename=" in cd:
                             fm = re.search(r'filename="?([^";]+)', cd)
                             if fm:
-                                ext = os.path.splitext(fm.group(1).strip())[1] or ext
-                        if ext == ".bin":
+                                orig_name = fm.group(1).strip()
+                        if not orig_name:
+                            url_path = url.split("?")[0].rstrip("/")
+                            orig_name = os.path.basename(url_path)
+                        if not orig_name:
+                            orig_name = f"file_{int(time.time())}"
+                        orig_name = re.sub(r"[^\w\.\-_\(\) ]", "_", orig_name)
+
+                        # Detect extension
+                        ext = os.path.splitext(orig_name)[1].lower()
+                        if not ext:
                             ct = (
                                 response.headers.get("Content-Type", "") or ""
                             ).lower()
@@ -338,17 +347,19 @@ async def download_with_controls(
                                 if mtype in ct:
                                     ext = mext
                                     break
-                        if ext == ".bin":
-                            url_path = url.split("?")[0].rstrip("/")
-                            uext = os.path.splitext(url_path)[1]
-                            if uext and len(uext) <= 6:
-                                ext = uext
-                        if ext == ".bin":
+                        if not ext:
                             ext = ".mp4"
+                        orig_name = os.path.splitext(orig_name)[0] + ext
 
-                        filepath = os.path.join(
-                            OUTPUT_FOLDER, f"file_{int(time.time())}{ext}"
-                        )
+                        filepath = os.path.join(OUTPUT_FOLDER, orig_name)
+                        # Avoid overwrite: add suffix if exists
+                        counter = 1
+                        while os.path.exists(filepath):
+                            base = os.path.splitext(orig_name)[0]
+                            filepath = os.path.join(
+                                OUTPUT_FOLDER, f"{base}_{counter}{ext}"
+                            )
+                            counter += 1
 
                     write_mode = "ab" if downloaded > 0 else "wb"
                     async with aiofiles.open(filepath, write_mode) as f:
@@ -2450,13 +2461,32 @@ async def process_y2mate_request(event, url: str, status_msg):
             await session.close_browser()
             return
 
-        best_idx = len(qualities) - 1
-        best = qualities[best_idx]
-        await safe_edit(
-            status_msg, f"📥 Downloading {best['label']} ({best.get('size', '?')})..."
-        )
+        # Only keep video (mp4) qualities
+        video_qs = [
+            (i, q)
+            for i, q in enumerate(qualities)
+            if q.get("format", "mp4") == "mp4" and "p" in q.get("label", "").lower()
+        ]
+        audio_qs = [
+            (i, q)
+            for i, q in enumerate(qualities)
+            if q.get("format") == "mp3" or "kbps" in q.get("label", "").lower()
+        ]
 
-        dl_result = await session.select_quality(best_idx)
+        is_audio = False
+        if video_qs:
+            sel_idx, selected = video_qs[-1]
+        elif audio_qs:
+            sel_idx, selected = audio_qs[-1]
+            is_audio = True
+        else:
+            sel_idx, selected = len(qualities) - 1, qualities[-1]
+
+        await safe_edit(
+            status_msg,
+            f"📥 Downloading {selected['label']} ({selected.get('size', '?')})...",
+        )
+        dl_result = await session.select_quality(sel_idx)
         if not dl_result["success"]:
             await safe_edit(
                 status_msg,
@@ -2470,14 +2500,72 @@ async def process_y2mate_request(event, url: str, status_msg):
 
         await safe_edit(status_msg, "📥 Downloading file...")
         yt_title = session.title_text or ""
-        await do_download_and_send(
-            event,
-            status_msg,
+
+        extra_ext = ".mp3" if is_audio else ".mp4"
+        dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
+        active_downloads[dl_id] = {"paused": False, "cancelled": False}
+        filepath, dl_error, final_size = await download_with_controls(
             dl_url,
-            url,
+            status_msg,
+            dl_id,
+            referer="https://v21.www-y2mate.com/",
             extra_headers={"Referer": "https://v21.www-y2mate.com/"},
-            title=yt_title,
         )
+
+        if dl_error or not filepath:
+            await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
+            return
+
+        await safe_edit(status_msg, "📤 Uploading...")
+        try:
+            # Ensure correct extension for audio
+            if is_audio:
+                base = os.path.splitext(filepath)[0]
+                new_path = base + ".mp3"
+                if filepath != new_path:
+                    try:
+                        os.rename(filepath, new_path)
+                        filepath = new_path
+                    except Exception:
+                        pass
+
+            fname = os.path.basename(filepath)
+            caption_start = (
+                f"🎬 {yt_title}"
+                if yt_title
+                else ("🎵 Audio" if is_audio else f"📄 {fname}")
+            )
+            gh_line = ""
+            if GITHUB_ENABLED:
+                gh_url = await maybe_upload_github(
+                    event.client, event.chat_id, filepath, final_size
+                )
+                if gh_url:
+                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({url}){gh_line}",
+                status_msg=status_msg,
+            )
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+            return
+        try:
+            os.remove(filepath)
+        except Exception:
+            pass
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ Y2Mate timed out (120s).")
+        await session.close_browser()
+    except Exception as e:
+        logger.error(f"[Y2MATE] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ Y2Mate error: {str(e)[:120]}")
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
     except asyncio.TimeoutError:
         await safe_edit(status_msg, "❌ Y2Mate timed out (120s).")
         await session.close_browser()
