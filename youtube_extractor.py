@@ -17,13 +17,6 @@ def _extract_video_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def _clean_title(title: str) -> str:
-    title = title.strip()
-    if title.endswith("(2)"):
-        title = title[:-3].strip()
-    return title
-
-
 async def extract_youtube_info(url: str) -> dict:
     video_id = _extract_video_id(url)
     title = ""
@@ -117,7 +110,7 @@ async def extract_youtube_info(url: str) -> dict:
             await browser.close()
             raise
 
-    title = _clean_title(title)
+    title = title.strip()
     if not thumb_url and video_id:
         thumb_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
 

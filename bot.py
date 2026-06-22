@@ -605,27 +605,98 @@ async def send_file_with_progress(
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
     is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
 
-    thumb_path = thumb_filepath or (
-        await get_video_thumbnail(filepath) if is_video else None
-    )
+    # ---- Preprocessing ----
+    orig_filepath = filepath
+    tmp_files = []
+    thumb_path = None
 
-    async def progress_cb(current: int, total: int):
-        now = time.time()
-        if now - last_update[0] < 3.0 and current != total:
-            return
-        last_update[0] = now
-        dt = now - last_time[0]
-        speed = (current - last_bytes[0]) / dt if dt > 0 else 0
-        last_bytes[0] = current
-        last_time[0] = now
-        text = build_progress_text("📤 Uploading", current, total, speed, start_time)
-        try:
-            asyncio.ensure_future(status_msg.edit(text, parse_mode="markdown"))
-        except Exception:
-            pass
-
-    sent = None
     try:
+        # ویدیو: moov atom رو ببر اول فایل (Fast Start) برای استریمینگ
+        if is_video:
+            fast_path = filepath + "_faststart.mp4"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-i",
+                filepath,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-y",
+                fast_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0:
+                filepath = fast_path
+                tmp_files.append(fast_path)
+
+        # صدا: استخراج کاور از تگ‌های ID3
+        audio_title = ""
+        audio_performer = ""
+        if is_audio and not thumb_filepath:
+            cover_path = filepath + "_cover.jpg"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-i",
+                filepath,
+                "-an",
+                "-vcodec",
+                "copy",
+                "-y",
+                cover_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+                thumb_filepath = cover_path
+                tmp_files.append(cover_path)
+
+        # متادیتای صدا (عنوان و هنرمند)
+        if is_audio:
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                orig_filepath,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await probe.communicate()
+            try:
+                tags = json.loads(out.decode()).get("format", {}).get("tags", {})
+                audio_title = tags.get("title", "")
+                audio_performer = tags.get("artist", "") or tags.get("TPE1", "")
+            except Exception:
+                pass
+
+        thumb_path = thumb_filepath or (
+            await get_video_thumbnail(filepath) if is_video else None
+        )
+
+        async def progress_cb(current: int, total: int):
+            now = time.time()
+            if now - last_update[0] < 3.0 and current != total:
+                return
+            last_update[0] = now
+            dt = now - last_time[0]
+            speed = (current - last_bytes[0]) / dt if dt > 0 else 0
+            last_bytes[0] = current
+            last_time[0] = now
+            text = build_progress_text(
+                "📤 Uploading", current, total, speed, start_time
+            )
+            try:
+                asyncio.ensure_future(status_msg.edit(text, parse_mode="markdown"))
+            except Exception:
+                pass
+
+        sent = None
         with open(filepath, "rb") as f:
             uploaded = await fast_upload_file(
                 client, f, progress_callback=progress_cb, connection_count=15
@@ -656,14 +727,27 @@ async def send_file_with_progress(
                 force_file=False,
             )
         elif is_audio:
+            audio_dur = int(duration) if duration and duration > 0 else 0
             attributes, mime_type = utils.get_attributes(
                 filepath,
-                attributes=[DocumentAttributeAudio(duration=0, voice=False)],
+                attributes=[
+                    DocumentAttributeAudio(
+                        duration=audio_dur,
+                        voice=False,
+                        title=audio_title or None,
+                        performer=audio_performer or None,
+                    )
+                ],
             )
+            thumb_input = None
+            if thumb_path and os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as tf:
+                    thumb_input = await fast_upload_file(client, tf)
             media = InputMediaUploadedDocument(
                 file=uploaded,
                 mime_type=mime_type,
                 attributes=attributes,
+                thumb=thumb_input,
                 force_file=False,
             )
         else:
@@ -683,9 +767,15 @@ async def send_file_with_progress(
             parse_mode="markdown",
         )
     finally:
-        if thumb_path and os.path.exists(thumb_path):
+        if thumb_path and os.path.exists(thumb_path) and thumb_path != thumb_filepath:
             try:
                 os.remove(thumb_path)
+            except Exception:
+                pass
+        for fp in tmp_files:
+            try:
+                if os.path.exists(fp):
+                    os.remove(fp)
             except Exception:
                 pass
 
@@ -2634,10 +2724,7 @@ async def process_y2mate_request(event, url: str, status_msg):
                         pass
 
             fname = os.path.basename(filepath)
-            # حذف (2) از آخر تایتل
             yt_clean = yt_title
-            if yt_clean.endswith("(2)"):
-                yt_clean = yt_clean[:-3].strip()
             caption_start = (
                 f"🎬 {yt_clean}"
                 if yt_clean
@@ -3356,9 +3443,6 @@ async def y2mate_quality_callback(event):
             clean_title = (
                 yt_title if yt_title and "free download" not in yt_title.lower() else ""
             )
-            # حذف (2) از آخر تایتل
-            if clean_title.endswith("(2)"):
-                clean_title = clean_title[:-3].strip()
             caption_start = (
                 f"🎬 {clean_title}"
                 if clean_title
