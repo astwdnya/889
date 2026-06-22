@@ -1,113 +1,72 @@
 import asyncio
 import re
-import json
-import aiohttp
+from playwright.async_api import async_playwright
 
 
 async def extract_youtube_info(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    html = ""
-    timeout = aiohttp.ClientTimeout(total=15)
+    playwright = await async_playwright().__aenter__()
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+        ],
+    )
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    )
+    page = await context.new_page()
 
-    # Fetch YouTube page HTML
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-    except Exception:
-        pass
+        await page.goto(
+            "https://mattw.io/youtube-metadata/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
 
-    title = ""
-    description = ""
+        await page.locator("#value").wait_for(timeout=10000)
+        await page.locator("#value").click()
+        await page.locator("#value").fill("")
+        await asyncio.sleep(0.3)
+        await page.locator("#value").fill(url)
+        await asyncio.sleep(0.3)
 
-    if html:
-        # Try JSON-LD first (most reliable)
-        try:
-            for m in re.finditer(
-                r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
-                html,
-                re.DOTALL,
-            ):
-                data = json.loads(m.group(1))
-                if isinstance(data, list):
-                    data = data[0]
-                if data.get("@type") == "VideoObject" or data.get("name"):
-                    if not title:
-                        title = (data.get("name", "") or "").strip()
-                    if not description:
-                        description = (data.get("description", "") or "").strip()
-                    break
-        except Exception:
-            pass
+        await page.locator('span:has-text("Submit")').first.click()
 
-        # Fallback: meta tags
-        if not title:
-            m = re.search(
-                r'<meta\s+name="title"\s+content="([^"]*)"', html, re.IGNORECASE
-            )
-            if m:
-                title = m.group(1).strip()
-        if not description:
-            m = re.search(
-                r'<meta\s+name="description"\s+content="([^"]*)"',
-                html,
-                re.IGNORECASE,
-            )
-            if m:
-                description = m.group(1).strip()
+        await page.wait_for_timeout(3000)
 
-        # Last resort: <title> tag
-        if not title:
-            m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
-            if m:
-                title = m.group(1).replace(" - YouTube", "").strip()
+        title = ""
+        description = ""
 
-    # If page scraping failed entirely, use oEmbed for title only
-    if not title:
-        try:
-            oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(oembed_url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        title = (data.get("title", "") or "").strip()
-        except Exception:
-            pass
+        spans = await page.locator("span.hljs-string").all()
+        for i, sp in enumerate(spans):
+            text = (await sp.inner_text()).strip().strip('"')
+            if not text:
+                continue
+            if not title:
+                title = text
+            elif not description:
+                description = text
+                break
 
-    # Clean up title
-    title = re.sub(r"\s+", " ", title).strip() if title else ""
-    description = re.sub(r"\s+", " ", description).strip() if description else ""
-    # Truncate very long descriptions
-    if len(description) > 500:
-        description = description[:497] + "..."
-
-    if title and description:
-        return f"{title}\n{description}"
-    if title:
-        return title
-    return ""
-
-
-async def main():
-    import sys
-
-    url = sys.argv[1] if len(sys.argv) > 1 else input("Enter YouTube URL: ").strip()
-    if not url:
-        print("No URL provided.")
-        return
-    result = await extract_youtube_info(url)
-    if result:
-        lines = result.split("\n")
-        print(f"Title: {lines[0]}")
-        if len(lines) > 1:
-            print(f"Description: {lines[1]}")
-    else:
-        print("No info extracted.")
+        return f"{title}\n{description}" if title else ""
+    finally:
+        await browser.close()
+        await playwright.__aexit__(None, None, None)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+
+    url = sys.argv[1] if len(sys.argv) > 1 else input("Enter YouTube URL: ").strip()
+    if url:
+        result = asyncio.run(extract_youtube_info(url))
+        if result:
+            lines = result.split("\n")
+            print(f"Title: {lines[0]}")
+            if len(lines) > 1:
+                print(f"Description: {lines[1]}")
+        else:
+            print("No info extracted.")
