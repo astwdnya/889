@@ -555,6 +555,53 @@ class SnapWCSession:
             await asyncio.sleep(0.5)
         return ""
 
+    async def download_via_browser(self, dl_url: str) -> dict:
+        try:
+            download_page = await self.context.new_page()
+            async with download_page.expect_download(timeout=120000) as dl_info:
+                await download_page.goto(
+                    dl_url, wait_until="domcontentloaded", timeout=30000
+                )
+            download = await dl_info.value
+            path = await download.path()
+            suggested = download.suggested_filename or f"snapwc_{int(time.time())}"
+            ext = os.path.splitext(suggested)[1] or ".mp4"
+            dest = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "output_files",
+                f"snapwc_{int(time.time())}{ext}",
+            )
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            await download.save_as(dest)
+            await download_page.close()
+            size = os.path.getsize(dest)
+            if size < 100:
+                try:
+                    os.remove(dest)
+                except Exception:
+                    pass
+                try:
+                    content = open(dest, "rb").read() if os.path.exists(dest) else b""
+                except Exception:
+                    content = b""
+                return {
+                    "success": False,
+                    "error": f"Downloaded file too small ({size}B)",
+                    "content": content,
+                }
+            return {
+                "success": True,
+                "filepath": dest,
+                "size": size,
+                "filename": suggested,
+            }
+        except Exception as e:
+            try:
+                await download_page.close()
+            except Exception:
+                pass
+            return {"success": False, "error": str(e)}
+
     async def run_full_flow(self, video_url: str) -> dict:
         steps = []
         try:
@@ -653,6 +700,17 @@ class SnapWCSession:
                 }
 
             steps.append("Got download link! Cleaning up...")
+
+            dl_via_browser = await self.download_via_browser(url)
+            dl_data = {}
+            if dl_via_browser["success"]:
+                dl_data = {
+                    "browser_download": True,
+                    "filepath": dl_via_browser["filepath"],
+                    "file_size": dl_via_browser["size"],
+                    "filename": dl_via_browser.get("filename", ""),
+                }
+
             await self.close_browser()
             return {
                 "success": True,
@@ -662,6 +720,7 @@ class SnapWCSession:
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
+                "download_data": dl_data,
             }
         except Exception as e:
             await self.take_screenshot()
@@ -718,6 +777,17 @@ class SnapWCSession:
                 }
 
             steps.append("Got download link! Cleaning up...")
+
+            dl_via_browser = await self.download_via_browser(url)
+            dl_data = {}
+            if dl_via_browser["success"]:
+                dl_data = {
+                    "browser_download": True,
+                    "filepath": dl_via_browser["filepath"],
+                    "file_size": dl_via_browser["size"],
+                    "filename": dl_via_browser.get("filename", ""),
+                }
+
             await self.close_browser()
             return {
                 "success": True,
@@ -727,6 +797,7 @@ class SnapWCSession:
                 "title": self.title_text,
                 "steps": steps,
                 "session": self,
+                "download_data": dl_data,
             }
         except Exception as e:
             await self.take_screenshot()

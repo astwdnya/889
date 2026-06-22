@@ -2989,9 +2989,34 @@ async def snapwc_select_callback(event):
             download_url = result["download_url"]
             download_headers = result.get("download_headers", {})
             title = result.get("title", "")
+            download_data = result.get("download_data", {})
 
             steps = result.get("steps", [])
             logger.info(f"[SNAPWC] Quality selected OK | steps: {' → '.join(steps)}")
+
+            # If browser already downloaded the file, send directly
+            if download_data.get("browser_download") and download_data.get("filepath"):
+                filepath = download_data["filepath"]
+                file_size = download_data.get("file_size", 0)
+                status_msg = await event.client.send_message(
+                    event.chat_id, "✅ File downloaded via browser! Uploading..."
+                )
+                caption_start = f"🎬 {title}" if title else "📄 **SnapWC Download**"
+                await send_file_with_progress(
+                    client=event.client,
+                    chat_id=event.chat_id,
+                    filepath=filepath,
+                    caption=(
+                        f"{caption_start}\n📦 Size: {human_readable_size(file_size)}"
+                    ),
+                    status_msg=status_msg,
+                )
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+                user_state.pop(event.chat_id, None)
+                return
 
             status_msg = await event.client.send_message(
                 event.chat_id, "✅ Got download link! Downloading..."
@@ -3040,22 +3065,56 @@ async def snapwc_select_callback(event):
                             fresh_url = new_dl["download_url"]
                             fresh_headers = new_dl.get("download_headers", {})
                             fresh_title = new_dl.get("title", title)
-                            await safe_edit(
-                                retry_msg, "🔄 Step 3/3: Retrying download..."
-                            )
-                            retry_ok = await do_download_and_send(
-                                event,
-                                retry_msg,
-                                fresh_url,
-                                video_url,
-                                extra_headers=fresh_headers if fresh_headers else None,
-                                title=fresh_title,
-                            )
-                            if not retry_ok:
+                            fresh_download_data = new_dl.get("download_data", {})
+
+                            # If browser already downloaded the file, send directly
+                            if fresh_download_data.get(
+                                "browser_download"
+                            ) and fresh_download_data.get("filepath"):
+                                filepath = fresh_download_data["filepath"]
+                                file_size = fresh_download_data.get("file_size", 0)
                                 await safe_edit(
                                     retry_msg,
-                                    "❌ Retry also failed. SnapWC may be having issues.",
+                                    "✅ File downloaded via browser! Uploading...",
                                 )
+                                caption_start = (
+                                    f"🎬 {fresh_title}"
+                                    if fresh_title
+                                    else "📄 **SnapWC Download**"
+                                )
+                                await send_file_with_progress(
+                                    client=event.client,
+                                    chat_id=event.chat_id,
+                                    filepath=filepath,
+                                    caption=(
+                                        f"{caption_start}\n"
+                                        f"📦 Size: {human_readable_size(file_size)}"
+                                    ),
+                                    status_msg=retry_msg,
+                                )
+                                try:
+                                    os.remove(filepath)
+                                except Exception:
+                                    pass
+                            else:
+                                await safe_edit(
+                                    retry_msg, "🔄 Step 3/3: Retrying download..."
+                                )
+                                retry_ok = await do_download_and_send(
+                                    event,
+                                    retry_msg,
+                                    fresh_url,
+                                    video_url,
+                                    extra_headers=fresh_headers
+                                    if fresh_headers
+                                    else None,
+                                    title=fresh_title,
+                                )
+                                if not retry_ok:
+                                    await safe_edit(
+                                        retry_msg,
+                                        "❌ Retry also failed. SnapWC may be having issues.",
+                                    )
                         elif new_dl.get("captcha"):
                             await safe_edit(
                                 retry_msg, "🔐 Captcha on retry — run /snapwc again."
@@ -3136,6 +3195,30 @@ async def snapwc_captcha_handler(event):
             download_url = result["download_url"]
             download_headers = result.get("download_headers", {})
             title = result.get("title", "")
+            download_data = result.get("download_data", {})
+
+            # If browser already downloaded the file, send directly
+            if download_data.get("browser_download") and download_data.get("filepath"):
+                filepath = download_data["filepath"]
+                file_size = download_data.get("file_size", 0)
+                await safe_edit(
+                    status_msg, "✅ File downloaded via browser! Uploading..."
+                )
+                caption_start = f"🎬 {title}" if title else "📄 **SnapWC Download**"
+                await send_file_with_progress(
+                    client=event.client,
+                    chat_id=event.chat_id,
+                    filepath=filepath,
+                    caption=(
+                        f"{caption_start}\n📦 Size: {human_readable_size(file_size)}"
+                    ),
+                    status_msg=status_msg,
+                )
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+                return
 
             await safe_edit(status_msg, "✅ Captcha solved! Starting download...")
             video_url = state.get("video_url", "")
