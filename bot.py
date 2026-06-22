@@ -29,6 +29,7 @@ from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Message,
     DocumentAttributeVideo,
+    DocumentAttributeAudio,
     InputMediaUploadedDocument,
 )
 from FastTelethon import upload_file as fast_upload_file
@@ -227,7 +228,7 @@ async def download_with_controls(
         headers.update(extra_headers)
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
-    filepath = os.path.join(OUTPUT_FOLDER, f"video_{int(time.time())}.mp4")
+    filepath = ""
     downloaded = 0
     total = 0
     last_update = 0.0
@@ -275,7 +276,6 @@ async def download_with_controls(
                 async with session.get(
                     url, headers=attempt_headers, allow_redirects=True
                 ) as response:
-                    # FIX: 403 رو به عنوان کد خاص برمیگردونه تا caller تصمیم بگیره
                     if response.status == 403:
                         return None, "HTTP_403", 0
                     if response.status not in (200, 206):
@@ -297,14 +297,57 @@ async def download_with_controls(
                                 f"File too large ({human_readable_size(total)})",
                                 0,
                             )
+
+                        # Detect file extension
+                        ext = ".bin"
                         cd = response.headers.get("Content-Disposition", "")
                         if "filename=" in cd:
                             fm = re.search(r'filename="?([^";]+)', cd)
                             if fm:
-                                ext = os.path.splitext(fm.group(1).strip())[1] or ".mp4"
-                                filepath = os.path.join(
-                                    OUTPUT_FOLDER, f"video_{int(time.time())}{ext}"
-                                )
+                                ext = os.path.splitext(fm.group(1).strip())[1] or ext
+                        if ext == ".bin":
+                            ct = (
+                                response.headers.get("Content-Type", "") or ""
+                            ).lower()
+                            ct_map = {
+                                "video/mp4": ".mp4",
+                                "video/x-matroska": ".mkv",
+                                "video/webm": ".webm",
+                                "video/avi": ".avi",
+                                "video/quicktime": ".mov",
+                                "video/x-msvideo": ".avi",
+                                "audio/mpeg": ".mp3",
+                                "audio/mp4": ".m4a",
+                                "audio/ogg": ".ogg",
+                                "audio/wav": ".wav",
+                                "audio/x-wav": ".wav",
+                                "audio/flac": ".flac",
+                                "image/jpeg": ".jpg",
+                                "image/png": ".png",
+                                "image/gif": ".gif",
+                                "image/webp": ".webp",
+                                "application/pdf": ".pdf",
+                                "application/zip": ".zip",
+                                "application/x-rar-compressed": ".rar",
+                                "application/x-7z-compressed": ".7z",
+                                "application/x-tar": ".tar",
+                                "application/gzip": ".gz",
+                            }
+                            for mtype, mext in ct_map.items():
+                                if mtype in ct:
+                                    ext = mext
+                                    break
+                        if ext == ".bin":
+                            url_path = url.split("?")[0].rstrip("/")
+                            uext = os.path.splitext(url_path)[1]
+                            if uext and len(uext) <= 6:
+                                ext = uext
+                        if ext == ".bin":
+                            ext = ".mp4"
+
+                        filepath = os.path.join(
+                            OUTPUT_FOLDER, f"file_{int(time.time())}{ext}"
+                        )
 
                     write_mode = "ab" if downloaded > 0 else "wb"
                     async with aiofiles.open(filepath, write_mode) as f:
@@ -512,14 +555,16 @@ async def send_file_with_progress(
     last_update = [0.0]
     last_bytes = [0]
     last_time = [start_time]
+    ext = os.path.splitext(filepath)[1].lower()
 
-    # اطلاعات ویدیو برای نمایش درست در تلگرام
     duration, width, height = await get_video_info(filepath)
-    thumb_path = await get_video_thumbnail(filepath)
+    is_video = duration is not None and duration > 0 and width > 0 and height > 0
+    is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
+
+    thumb_path = await get_video_thumbnail(filepath) if is_video else None
 
     async def progress_cb(current: int, total: int):
         now = time.time()
-        # هر 3 ثانیه یه بار آپدیت — کمتر فشار روی event loop
         if now - last_update[0] < 3.0 and current != total:
             return
         last_update[0] = now
@@ -534,38 +579,55 @@ async def send_file_with_progress(
             pass
 
     try:
-        duration_int = int(duration) if duration else 0
-        # FastTelethon: parallel upload — چند connection همزمان به تلگرام
         with open(filepath, "rb") as f:
             uploaded = await fast_upload_file(
                 client, f, progress_callback=progress_cb, connection_count=15
             )
 
-        # ساخت media با متادیتای ویدیو
-        attributes, mime_type = utils.get_attributes(
-            filepath,
-            attributes=[
-                DocumentAttributeVideo(
-                    duration=duration_int,
-                    w=width if width else 0,
-                    h=height if height else 0,
-                    supports_streaming=True,
-                )
-            ],
-        )
-        # آپلود thumbnail به تلگرام
-        thumb_input = None
-        if thumb_path and os.path.exists(thumb_path):
-            with open(thumb_path, "rb") as tf:
-                thumb_input = await fast_upload_file(client, tf)
+        if is_video:
+            duration_int = int(duration) if duration else 0
+            attributes, mime_type = utils.get_attributes(
+                filepath,
+                attributes=[
+                    DocumentAttributeVideo(
+                        duration=duration_int,
+                        w=width if width else 0,
+                        h=height if height else 0,
+                        supports_streaming=True,
+                    )
+                ],
+            )
+            thumb_input = None
+            if thumb_path and os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as tf:
+                    thumb_input = await fast_upload_file(client, tf)
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type=mime_type,
+                attributes=attributes,
+                thumb=thumb_input,
+                force_file=False,
+            )
+        elif is_audio:
+            attributes, mime_type = utils.get_attributes(
+                filepath,
+                attributes=[DocumentAttributeAudio(duration=0, voice=False)],
+            )
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type=mime_type,
+                attributes=attributes,
+                force_file=False,
+            )
+        else:
+            attributes, mime_type = utils.get_attributes(filepath)
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type=mime_type,
+                attributes=attributes,
+                force_file=True,
+            )
 
-        media = InputMediaUploadedDocument(
-            file=uploaded,
-            mime_type=mime_type,
-            attributes=attributes,
-            thumb=thumb_input,
-            force_file=False,
-        )
         await client.send_file(
             chat_id,
             media,
@@ -574,7 +636,6 @@ async def send_file_with_progress(
             parse_mode="markdown",
         )
     finally:
-        # پاک کردن thumbnail موقت
         if thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
@@ -636,28 +697,24 @@ async def do_download_and_send(
             await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
         return False
 
-    # بررسی کن فایل دانلود شده واقعاً ویدیو هست یا نه
-    vid_duration, vw, vh = await get_video_info(filepath)
-    if vid_duration is None or vid_duration <= 0:
-        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-        return False
-
     await safe_edit(status_msg, "📤 Uploading...")
     try:
-        dur_str = ""
-        if vid_duration and vid_duration > 0:
+        ext = os.path.splitext(filepath)[1].lower()
+        vid_duration, vw, vh = await get_video_info(filepath)
+        is_video = vid_duration is not None and vid_duration > 0 and vw > 0 and vh > 0
+
+        if is_video:
             mins, secs = divmod(int(vid_duration), 60)
             hours, mins = divmod(mins, 60)
             if hours > 0:
                 dur_str = f"\n⏱ Duration: {hours}:{mins:02d}:{secs:02d}"
             else:
                 dur_str = f"\n⏱ Duration: {mins}:{secs:02d}"
-
-        caption_start = f"🎬 {title}" if title else "🎬 **Video Downloaded**"
+            caption_start = f"🎬 {title}" if title else "🎬 **Video Downloaded**"
+        else:
+            dur_str = ""
+            fname = os.path.basename(filepath)
+            caption_start = f"📄 **{fname}**" if not title else f"📄 **{title}**"
 
         gh_line = ""
         if GITHUB_ENABLED:
@@ -667,6 +724,7 @@ async def do_download_and_send(
             )
             if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+
         await send_file_with_progress(
             client=event.client,
             chat_id=event.chat_id,
@@ -682,7 +740,6 @@ async def do_download_and_send(
             status_msg=status_msg,
             supports_streaming=True,
         )
-        # پاک کردن خودکار فایل از سرور بعد از آپلود موفق
         try:
             os.remove(filepath)
         except Exception:
@@ -2300,24 +2357,19 @@ async def generic_url_handler(event):
         if error != "Cancelled by user":
             await safe_edit(status_msg, f"❌ {error or 'Failed'}")
         return
-    vid_duration, vw, vh = await get_video_info(filepath)
-    if vid_duration is None or vid_duration <= 0:
-        await safe_edit(status_msg, "❌ Downloaded file is not a valid video")
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
-        return
     await safe_edit(status_msg, "📤 Uploading...")
     try:
-        dur_str = ""
-        if vid_duration and vid_duration > 0:
+        vid_duration, vw, vh = await get_video_info(filepath)
+        is_video = vid_duration is not None and vid_duration > 0 and vw > 0 and vh > 0
+        if is_video:
             mins, secs = divmod(int(vid_duration), 60)
             hours, mins = divmod(mins, 60)
             if hours > 0:
                 dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
             else:
                 dur_str = f" | ⏱ {mins}:{secs:02d}"
+        else:
+            dur_str = ""
         gh_line = ""
         if GITHUB_ENABLED:
             await safe_edit(status_msg, "☁️ Uploading to GitHub...")
@@ -2635,7 +2687,6 @@ async def snapwc_select_callback(event):
 
         if result["success"]:
             download_url = result["download_url"]
-            download_headers = result.get("download_headers", {})
             title = result.get("title", "")
 
             steps = result.get("steps", [])
@@ -2647,12 +2698,7 @@ async def snapwc_select_callback(event):
 
             video_url = user_state.get(event.chat_id, {}).get("video_url", "")
             dl_ok = await do_download_and_send(
-                event,
-                status_msg,
-                download_url,
-                video_url,
-                extra_headers=download_headers,
-                title=title,
+                event, status_msg, download_url, video_url, title=title
             )
 
             # Even if download failed, send the direct link to user
@@ -2686,7 +2732,6 @@ async def snapwc_select_callback(event):
                         new_dl = await new_session.continue_with_quality(index)
                         if new_dl.get("success") and not new_dl.get("captcha"):
                             fresh_url = new_dl["download_url"]
-                            fresh_headers = new_dl.get("download_headers", {})
                             fresh_title = new_dl.get("title", title)
                             await safe_edit(
                                 retry_msg, "🔄 Step 3/3: Retrying download..."
@@ -2696,7 +2741,6 @@ async def snapwc_select_callback(event):
                                 retry_msg,
                                 fresh_url,
                                 video_url,
-                                extra_headers=fresh_headers,
                                 title=fresh_title,
                             )
                             if not retry_ok:
@@ -2782,18 +2826,12 @@ async def snapwc_captcha_handler(event):
 
         if result["success"]:
             download_url = result["download_url"]
-            download_headers = result.get("download_headers", {})
             title = result.get("title", "")
 
             await safe_edit(status_msg, "✅ Captcha solved! Starting download...")
             video_url = state.get("video_url", "")
             await do_download_and_send(
-                event,
-                status_msg,
-                download_url,
-                video_url,
-                extra_headers=download_headers,
-                title=title,
+                event, status_msg, download_url, video_url, title=title
             )
         else:
             await safe_edit(status_msg, f"❌ {result.get('error', 'Captcha failed')}")
