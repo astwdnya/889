@@ -322,6 +322,8 @@ async def download_with_controls(
                         if not orig_name:
                             orig_name = f"file_{int(time.time())}"
                         orig_name = re.sub(r"[^\w\.\-_\(\) ]", "_", orig_name)
+                        if len(orig_name) > 80:
+                            orig_name = orig_name[:80]
 
                         # Detect extension
                         ext = os.path.splitext(orig_name)[1].lower()
@@ -2396,10 +2398,20 @@ async def generic_url_handler(event):
             snapwc_sessions[snap_id] = session
             try:
                 result = await asyncio.wait_for(
-                    session.run_full_flow(target_url), timeout=90
+                    session.run_full_flow(target_url), timeout=20
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[URL] SnapWC timed out for {target_url[:80]}")
+                ss_b64 = await session.take_screenshot()
+                if ss_b64:
+                    try:
+                        await event.client.send_file(
+                            event.chat_id,
+                            base64.b64decode(ss_b64),
+                            caption=f"⏱️ SnapWC timeout — couldn't load qualities in 20s",
+                        )
+                    except Exception:
+                        pass
                 await session.close_browser()
                 snapwc_sessions.pop(snap_id, None)
                 user_state.pop(event.chat_id, None)
