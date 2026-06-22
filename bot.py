@@ -284,6 +284,14 @@ async def download_with_controls(
                     if response.status not in (200, 206):
                         return None, f"HTTP {response.status}", 0
 
+                    ct = (response.headers.get("Content-Type", "") or "").lower()
+                    if "text/html" in ct:
+                        return (
+                            None,
+                            "Got HTML page instead of file (redirected to ad)",
+                            0,
+                        )
+
                     if total == 0:
                         content_length = int(response.headers.get("content-length", 0))
                         if response.status == 206:

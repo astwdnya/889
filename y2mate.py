@@ -51,9 +51,15 @@ class Y2MateSession:
 
     async def _handle_popup(self, popup):
         try:
-            await popup.wait_for_load_state("domcontentloaded", timeout=15000)
+            await popup.wait_for_load_state("load", timeout=20000)
+            await asyncio.sleep(1)
             pu = popup.url
-            if pu and pu.startswith("http"):
+            if pu and (
+                "googlevideo.com" in pu
+                or "yt-dl.click" in pu
+                or "yt-dl.com" in pu
+                or "yt-dl." in pu
+            ):
                 self._captured_dl_urls.append(pu)
                 self._captured_dl_url = pu
             await popup.close()
@@ -65,13 +71,24 @@ class Y2MateSession:
 
     async def _on_request(self, request):
         url = request.url
-        if "yt-dl.click" in url or "yt-dl.com" in url or ".yt-dl." in url:
-            self._captured_dl_urls.append(url)
-            self._captured_dl_url = url
+        if (
+            "yt-dl.click" in url
+            or "yt-dl.com" in url
+            or ".yt-dl." in url
+            or "googlevideo.com" in url
+        ):
+            if url not in self._captured_dl_urls:
+                self._captured_dl_urls.append(url)
+                self._captured_dl_url = url
 
     async def _on_response(self, response):
         url = str(response.url)
-        if "yt-dl.click" in url or "yt-dl.com" in url or ".yt-dl." in url:
+        if (
+            "yt-dl.click" in url
+            or "yt-dl.com" in url
+            or ".yt-dl." in url
+            or "googlevideo.com" in url
+        ):
             if url not in self._captured_dl_urls:
                 self._captured_dl_urls.append(url)
                 self._captured_dl_url = url
@@ -328,7 +345,7 @@ class Y2MateSession:
                 if self._captured_dl_url:
                     return self._captured_dl_url
                 cu = self.page.url
-                if "yt-dl.click" in cu:
+                if "yt-dl.click" in cu or "googlevideo.com" in cu:
                     self._captured_dl_url = cu
                     return cu
                 await asyncio.sleep(0.5)
@@ -339,7 +356,7 @@ class Y2MateSession:
                 if self._captured_dl_url:
                     return self._captured_dl_url
                 cu = self.page.url
-                if "yt-dl.click" in cu or "yt-dl." in cu:
+                if "yt-dl.click" in cu or "yt-dl." in cu or "googlevideo.com" in cu:
                     self._captured_dl_url = cu
                     return cu
                 await asyncio.sleep(0.5)
