@@ -272,21 +272,35 @@ class Y2MateSession:
             return {"success": False, "error": "Quality button not found in iframe"}
         await asyncio.sleep(3)
 
-        async def wait_for_dl_url():
-            for _ in range(60):
-                if self._captured_dl_url:
-                    return self._captured_dl_url
-                current_url = self.page.url
-                if "yt-dl.click" in current_url or "yt-dl." in current_url:
-                    self._captured_dl_url = current_url
-                    return current_url
-                await asyncio.sleep(0.5)
+        async def click_and_get_url(iframe_obj):
+            for sel in ["a.btn-download-link", "a.download-link", "a[href*='yt-dl']"]:
+                try:
+                    el = await iframe_obj.query_selector(sel)
+                    if el:
+                        href = await el.get_attribute("href") or ""
+                        if href and "javascript:" not in href:
+                            return href
+                except Exception:
+                    pass
+            try:
+                href = await iframe_obj.evaluate("""() => {
+                    const a = document.querySelector('a.btn-download-link, a.download-link, a[href*="yt-dl"]');
+                    if (a && a.href && !a.href.startsWith('javascript:')) return a.href;
+                    return '';
+                }""")
+                if href:
+                    return href
+            except Exception:
+                pass
             return ""
 
-        async def wait_for_modal_link():
-            for attempt in range(60):
+        async def click_and_wait():
+            for _ in range(60):
                 iframe = await self._get_iframe()
-                if iframe:
+                if not iframe:
+                    await asyncio.sleep(0.5)
+                    continue
+                try:
                     for sel in [
                         "a.btn-download-link",
                         "a.download-link",
@@ -295,36 +309,48 @@ class Y2MateSession:
                         try:
                             el = await iframe.query_selector(sel)
                             if el:
-                                href = await el.get_attribute("href")
-                                if href:
-                                    self._captured_dl_url = href
-                                    self._captured_dl_urls.append(href)
+                                href = await el.get_attribute("href") or ""
+                                if href and "javascript:" not in href:
                                     return href
                         except Exception:
                             pass
-                    try:
-                        href = await iframe.evaluate("""() => {
-                            const a = document.querySelector('a.btn-download-link');
-                            if (a && a.href) return a.href;
-                            const a2 = document.querySelector('a[href*="yt-dl"]');
-                            if (a2 && a2.href) return a2.href;
-                            return '';
-                        }""")
-                        if href:
-                            self._captured_dl_url = href
-                            self._captured_dl_urls.append(href)
-                            return href
-                    except Exception:
-                        pass
+                    for click_sel in ["a.btn-download-link", "a.download-link"]:
+                        try:
+                            el = await iframe.query_selector(click_sel)
+                            if el:
+                                await el.click()
+                                await asyncio.sleep(1)
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                if self._captured_dl_url:
+                    return self._captured_dl_url
+                cu = self.page.url
+                if "yt-dl.click" in cu:
+                    self._captured_dl_url = cu
+                    return cu
                 await asyncio.sleep(0.5)
             return ""
 
-        network_task = asyncio.create_task(wait_for_dl_url())
-        modal_task = asyncio.create_task(wait_for_modal_link())
+        async def wait_network():
+            for _ in range(60):
+                if self._captured_dl_url:
+                    return self._captured_dl_url
+                cu = self.page.url
+                if "yt-dl.click" in cu or "yt-dl." in cu:
+                    self._captured_dl_url = cu
+                    return cu
+                await asyncio.sleep(0.5)
+            return ""
+
+        tasks = [
+            asyncio.create_task(click_and_wait()),
+            asyncio.create_task(wait_network()),
+        ]
         done, pending = await asyncio.wait(
-            [network_task, modal_task],
-            timeout=45,
-            return_when=asyncio.FIRST_COMPLETED,
+            tasks, timeout=50, return_when=asyncio.FIRST_COMPLETED
         )
         for t in pending:
             t.cancel()
