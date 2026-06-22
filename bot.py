@@ -2396,69 +2396,29 @@ async def generic_url_handler(event):
             snap_id = f"snap_{event.chat_id}_{int(time.time())}"
             user_state[event.chat_id]["session_id"] = snap_id
             snapwc_sessions[snap_id] = session
-            try:
-                result = await asyncio.wait_for(
-                    session.run_full_flow(target_url), timeout=20
+            flow_task = asyncio.create_task(session.run_full_flow(target_url))
+            done, pending = await asyncio.wait([flow_task], timeout=20)
+            if not done:
+                logger.warning(
+                    f"[URL] SnapWC still processing after 20s — sending screenshot"
                 )
-            except asyncio.TimeoutError:
-                logger.warning(f"[URL] SnapWC timed out for {target_url[:80]}")
                 ss_b64 = await session.take_screenshot()
                 if ss_b64:
                     try:
                         await event.client.send_file(
                             event.chat_id,
                             base64.b64decode(ss_b64),
-                            caption=f"⏱️ SnapWC timeout — couldn't load qualities in 20s",
+                            caption=f"⏱️ SnapWC still processing after 20s",
                         )
                     except Exception:
                         pass
-                await session.close_browser()
-                snapwc_sessions.pop(snap_id, None)
-                user_state.pop(event.chat_id, None)
-                # Fall back to Dirpy extraction
+                # Keep waiting for SnapWC to finish
                 await safe_edit(
-                    status_msg,
-                    "⏱️ SnapWC timed out — trying direct extraction...",
+                    status_msg, "⏬ Still processing — waiting for SnapWC..."
                 )
-                (
-                    found_urls,
-                    session_headers,
-                    intercept_err,
-                    page_title,
-                ) = await extract_video_url_smart(target_url, status_msg)
-                if not found_urls:
-                    await safe_edit(
-                        status_msg,
-                        f"❌ Could not extract video: {intercept_err or 'No URLs found'}",
-                    )
-                    processing_messages.discard(msg_id)
-                    return
-                await safe_edit(status_msg, "✅ Found video link! Downloading...")
-                best_url = found_urls[0]
-                try:
-                    sizes = await asyncio.gather(
-                        *(get_file_size(u) for u in found_urls[:6]),
-                        return_exceptions=True,
-                    )
-                    best_idx = 0
-                    best_sz = 0
-                    for i, s in enumerate(sizes):
-                        if isinstance(s, int) and s > best_sz:
-                            best_sz = s
-                            best_idx = i
-                    best_url = found_urls[best_idx]
-                except Exception:
-                    pass
-                await do_download_and_send(
-                    event,
-                    status_msg,
-                    best_url,
-                    target_url,
-                    title=page_title,
-                    extra_headers=session_headers or None,
-                )
-                processing_messages.discard(msg_id)
-                return
+                result = await flow_task
+            else:
+                result = done.pop().result()
 
             if not result["success"]:
                 await safe_edit(
