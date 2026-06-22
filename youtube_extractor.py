@@ -1,4 +1,5 @@
 import asyncio
+import re
 from playwright.async_api import async_playwright
 
 
@@ -11,7 +12,24 @@ def _unescape_json(s: str) -> str:
     )
 
 
-async def extract_youtube_info(url: str) -> str:
+def _extract_video_id(url: str) -> str:
+    m = re.search(r"(?:v=|youtu\.be/|/v/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})", url)
+    return m.group(1) if m else ""
+
+
+def _clean_title(title: str) -> str:
+    title = title.strip()
+    if title.endswith("(2)"):
+        title = title[:-3].strip()
+    return title
+
+
+async def extract_youtube_info(url: str) -> dict:
+    video_id = _extract_video_id(url)
+    title = ""
+    description = ""
+    thumb_url = ""
+
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
@@ -81,18 +99,34 @@ async def extract_youtube_info(url: str) -> str:
                 return '';
             }""")
 
-            title = ""
-            description = ""
             if result:
                 parts = result.split("\n", 1)
                 title = _unescape_json(parts[0].strip())
                 description = _unescape_json(parts[1].strip()) if len(parts) > 1 else ""
 
+            # Extract thumbnail from page
+            thumb_url = await page.evaluate(
+                """() => {
+                    const img = document.querySelector('#video-thumb');
+                    return img ? img.src : '';
+                }"""
+            )
+
             await browser.close()
-            return f"{title}\n{description}" if title else ""
         except Exception:
             await browser.close()
             raise
+
+    title = _clean_title(title)
+    if not thumb_url and video_id:
+        thumb_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+
+    return {
+        "title": title,
+        "description": description,
+        "video_id": video_id,
+        "thumb_url": thumb_url,
+    }
 
 
 if __name__ == "__main__":
@@ -101,10 +135,7 @@ if __name__ == "__main__":
     url = sys.argv[1] if len(sys.argv) > 1 else input("Enter YouTube URL: ").strip()
     if url:
         result = asyncio.run(extract_youtube_info(url))
-        if result:
-            lines = result.split("\n")
-            print(f"Title: {lines[0]}")
-            if len(lines) > 1:
-                print(f"Description: {lines[1]}")
-        else:
-            print("No info extracted.")
+        print(f"Title: {result.get('title', '')}")
+        print(f"Description: {result.get('description', '')}")
+        print(f"Video ID: {result.get('video_id', '')}")
+        print(f"Thumb URL: {result.get('thumb_url', '')}")

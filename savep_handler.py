@@ -1,10 +1,7 @@
 import asyncio
-import glob
 import logging
 import os
-import re
 import time
-from urllib.parse import quote, urlparse, parse_qs
 
 import aiofiles
 import aiohttp
@@ -12,29 +9,12 @@ from aiohttp import ClientTimeout
 
 logger = logging.getLogger(__name__)
 
-_BROWSER_ARGS = [
-    "--no-sandbox",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    "--disable-software-rasterizer",
-    "--disable-extensions",
-]
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-
-async def _find_chrome():
-    for pattern in [
-        r"C:\Users\Administrator\AppData\Local\ms-playwright\chromium-*\chrome-win\chrome.exe",
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]:
-        m = glob.glob(pattern)
-        if m:
-            return m[0]
-    return ""
+API_BASE = "https://api.v02.savethevideo.com"
 
 
 async def _download_file(url, filepath, progress_cb):
@@ -83,298 +63,184 @@ async def _download_file(url, filepath, progress_cb):
         return False, str(e)[:150], 0
 
 
-async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
+async def _call_api(method, path, data=None, headers=None):
+    url = API_BASE + path
+    req_headers = {
+        "Accept": "application/json",
+        "Origin": "https://www.savethevideo.com",
+        "Referer": "https://www.savethevideo.com/",
+        "User-Agent": _USER_AGENT,
+    }
+    if headers:
+        req_headers.update(headers)
+
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        return ["ERROR: playwright not installed"]
-
-    async with async_playwright() as p:
-        browser = None
-        try:
-            exe = await _find_chrome()
-            kw = dict(headless=True, args=_BROWSER_ARGS)
-            if exe:
-                kw["executable_path"] = exe
-            browser = await p.chromium.launch(**kw)
-            ctx = await browser.new_context(
-                user_agent=_USER_AGENT,
-                viewport={"width": 1280, "height": 800},
-                locale="en-US",
-            )
-
-            page = await ctx.new_page()
-
-            stv_url = f"https://www.savethevideo.com/home?url={quote(video_url)}"
-            progress_cb("🌐 Opening savethevideo.com...")
-            await page.goto(stv_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
-            progress_cb("✅ Page loaded")
-
-            # Close any initial popup tabs
-            for pg in list(ctx.pages):
-                if pg is not page:
-                    try:
-                        await pg.close()
-                    except Exception:
-                        pass
-
-            # Click Start button
-            progress_cb("🖱 Clicking Start...")
-            try:
-                start_btn = page.locator("button").filter(has_text="Start").first
-                if await start_btn.is_visible(timeout=5000):
-                    await start_btn.click()
-                    progress_cb("✅ Start clicked")
-            except Exception:
-                try:
-                    await page.evaluate(
-                        """() => {
-                        for (const b of document.querySelectorAll("button")) {
-                            if (b.textContent.trim() === "Start") {
-                                b.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }"""
-                    )
-                    progress_cb("✅ Start clicked (JS)")
-                except Exception:
-                    progress_cb("⚠️ Start button not found")
-
-            await page.wait_for_timeout(3000)
-
-            # Close any popup tabs
-            for pg in list(ctx.pages):
-                if pg is not page:
-                    try:
-                        await pg.close()
-                        progress_cb("🚫 Closed popup tab")
-                    except Exception:
-                        pass
-
-            # Click Convert tab
-            progress_cb("🖱 Clicking Convert tab...")
-            convert_clicked = False
-            try:
-                convert_tab = (
-                    page.locator('li[role="tab"]').filter(has_text="Convert").first
-                )
-                if await convert_tab.is_visible(timeout=5000):
-                    await convert_tab.click()
-                    convert_clicked = True
-                    progress_cb("✅ Convert tab clicked")
-            except Exception:
-                pass
-
-            if not convert_clicked:
-                try:
-                    result = await page.evaluate(
-                        """() => {
-                        for (const el of document.querySelectorAll('li[role="tab"], [role="tab"]')) {
-                            if (/convert/i.test(el.textContent)) {
-                                el.click();
-                                return true;
-                            }
-                        }
-                        return false;
-                    }"""
-                    )
-                    if result:
-                        convert_clicked = True
-                        progress_cb("✅ Convert tab clicked (JS)")
-                except Exception:
-                    pass
-
-            await page.wait_for_timeout(2000)
-
-            # Wait for the convert panel (select element)
-            try:
-                await page.wait_for_selector("#convert-format", timeout=10000)
-                progress_cb("✅ Convert panel loaded")
-            except Exception:
-                progress_cb("⚠️ Convert panel not found, trying alternative...")
-                await page.wait_for_timeout(2000)
-
-            # Select MP4 format
-            progress_cb("🎬 Selecting MP4 format...")
-            try:
-                await page.select_option("#convert-format", value="mp4")
-                progress_cb("✅ MP4 selected")
-            except Exception:
-                try:
-                    await page.evaluate(
-                        """() => {
-                        const s = document.getElementById("convert-format") || document.querySelector("select");
-                        if (!s) return false;
-                        s.value = "mp4";
-                        s.dispatchEvent(new Event("change", {bubbles: true}));
-                        s.dispatchEvent(new Event("input", {bubbles: true}));
-                        return true;
-                    }"""
-                    )
-                    progress_cb("✅ MP4 selected (JS)")
-                except Exception:
-                    progress_cb("⚠️ Could not select MP4")
-
-            await page.wait_for_timeout(1000)
-
-            # Click Convert to MP4 button
-            progress_cb("🖱 Clicking Convert to MP4...")
-            conv_clicked = False
-            try:
-                convert_btn = page.locator("a").filter(has_text="Convert to MP4").first
-                if await convert_btn.is_visible(timeout=5000):
-                    await convert_btn.click()
-                    conv_clicked = True
-                    progress_cb("✅ Convert to MP4 clicked")
-            except Exception:
-                pass
-
-            if not conv_clicked:
-                try:
-                    result = await page.evaluate(
-                        """() => {
-                        for (const el of document.querySelectorAll("a, button")) {
-                            if (/convert to mp4/i.test(el.textContent.trim())) {
-                                el.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
-                                return true;
-                            }
-                        }
-                        return false;
-                    }"""
-                    )
-                    if result:
-                        conv_clicked = True
-                        progress_cb("✅ Convert to MP4 clicked (JS)")
-                except Exception:
-                    pass
-
-            if not conv_clicked:
-                return ["❌ Could not click Convert to MP4 button"]
-
-            await page.wait_for_timeout(3000)
-
-            # Close any popup tabs (from ad redirects)
-            for pg in list(ctx.pages):
-                if pg is not page:
-                    try:
-                        await pg.close()
-                        progress_cb("🚫 Closed ad popup")
-                    except Exception:
-                        pass
-
-            # Monitor conversion progress until finished
-            progress_cb("⏳ Conversion started, monitoring progress...")
-            found_link = None
-            last_status = ""
-            rd = 0
-
-            while True:
-                if stop_event is not None and stop_event.is_set():
-                    return ["❌ Stopped by user"]
-
-                await page.wait_for_timeout(3000)
-
-                # Check for popup tabs and close them
-                for pg in list(ctx.pages):
-                    if pg is not page:
-                        try:
-                            await pg.close()
-                        except Exception:
-                            pass
-
-                try:
-                    # Read progress status
-                    status = await page.evaluate(
-                        """() => {
-                        for (const el of document.querySelectorAll("p")) {
-                            const t = el.textContent.trim();
-                            if (t && t.length < 200 && /Step\\s+\\d+\\s+of\\s+\\d+/i.test(t)) return t;
-                            if (/finished.*click.*download/i.test(t)) return t;
-                            if (/Downloading.*\\d+\\.?\\d*%/.test(t)) return t;
-                            if (/Downloaded.*\\d+\\.?\\d*%/.test(t)) return t;
-                            if (/Processing.*\\d+\\.?\\d*%/.test(t)) return t;
-                        }
-                        return "";
-                    }"""
-                    )
-                    if status and status != last_status:
-                        last_status = status
-                        progress_cb(f"⚙️ {status}")
-
-                    # Check for download link
-                    dl_link = await page.evaluate(
-                        """() => {
-                        for (const a of document.querySelectorAll("a[href]")) {
-                            const h = a.href || "";
-                            if (h.length < 30) continue;
-                            if (h.includes("javascript")) continue;
-                            if (h.includes("utm_")) continue;
-                            if (h.includes("aliexpress")) continue;
-                            if (h.includes("videoproc")) continue;
-                            const cls = a.className || "";
-                            if (cls.includes("bg-blue") && (h.includes(".mp4") || h.includes("savethevideo") || h.includes(".v02."))) return h;
-                        }
-                        for (const a of document.querySelectorAll("a[href]")) {
-                            const h = a.href || "";
-                            if (h.includes(".mp4") && !h.includes("utm_") && !h.includes("aliexpress") && h.length > 30) return h;
-                        }
-                        return null;
-                    }"""
-                    )
-                    if dl_link:
-                        found_link = dl_link
-                        progress_cb("✅ Download link found!")
-                        break
-
-                    # If "Finished" text appears, do final scan
-                    txt = (status or last_status).lower()
-                    if "finished" in txt or "click to download" in txt:
-                        progress_cb("🔍 Finished detected, final scan for link...")
-                        await page.wait_for_timeout(3000)
-                        fallback = await page.evaluate(
-                            """() => {
-                            for (const a of document.querySelectorAll("a[href]")) {
-                                const h = a.href || "";
-                                const cls = a.className || "";
-                                if (h.length < 30 || h.includes("javascript") || h.includes("utm_")) continue;
-                                if (h.includes(".mp4")) return h;
-                                if (cls.includes("bg-blue")) return h;
-                            }
-                            return null;
-                        }"""
+        timeout = ClientTimeout(connect=15, sock_read=30, total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if method == "POST":
+                req_headers["Content-Type"] = "application/json"
+                async with session.post(url, json=data, headers=req_headers) as resp:
+                    body = await resp.json()
+                    if resp.status >= 400:
+                        raise Exception(
+                            f"API error {resp.status}: {body.get('message', body)}"
                         )
-                        if fallback:
-                            found_link = fallback
-                            progress_cb("✅ Download link found (fallback)!")
-                            break
-                        else:
-                            progress_cb("⚠️ Finished but no link yet, continuing...")
+                    return body
+            else:
+                async with session.get(url, headers=req_headers) as resp:
+                    body = await resp.json()
+                    if resp.status >= 400:
+                        raise Exception(
+                            f"API error {resp.status}: {body.get('message', body)}"
+                        )
+                    return body
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"[SAVEP] API call error: {e}")
+        raise
 
-                except Exception as e:
-                    progress_cb(f"⚠️ Round {rd + 1}: {str(e)[:80]}")
 
-                rd += 1
-                elapsed = rd * 3
-                if rd % 20 == 0:
-                    mins, secs = divmod(elapsed, 60)
-                    progress_cb(f"⏳ Still converting... ({mins}m {secs}s)")
+def _extract_url_from_result(task):
+    """Extract the best download URL from the API response.
+    Response structure can be:
+    - result is an array of video items, each with url and formats
+    - Or result is an object with formats/files/entries
+    """
+    result = task.get("result", task)
+    if isinstance(result, list):
+        for item in result:
+            # Prefer mp4 URL
+            url = item.get("url", "") or ""
+            if url and (".mp4" in url or "googlevideo" in url):
+                return url
+            # Check sub-formats
+            formats = item.get("formats", [])
+            for fmt in formats:
+                fu = fmt.get("url", "") or ""
+                if fu and (".mp4" in fu or "googlevideo" in fu):
+                    return fu
+            # Return first URL found
+            if url:
+                return url
+            for fmt in formats:
+                fu = fmt.get("url", "") or ""
+                if fu:
+                    return fu
+        return None
 
-            if found_link:
-                return [found_link]
-            return ["❌ Download link not found"]
+    if isinstance(result, dict):
+        formats = result.get("formats", [])
+        if formats:
+            for fmt in formats:
+                url = fmt.get("url", "") or ""
+                if url and (".mp4" in url or "googlevideo" in url):
+                    return url
+            return formats[0].get("url", "")
+        url = result.get("url", "") or ""
+        if url:
+            return url
+        files = result.get("files", [])
+        if files:
+            return files[0] if isinstance(files[0], str) else files[0].get("url", "")
+        entries = result.get("entries", [])
+        if entries:
+            for entry in entries:
+                eu = entry.get("url", "") or ""
+                if eu:
+                    return eu
 
-        except Exception as e:
-            progress_cb(f"❌ Error: {str(e)[:200]}")
-            return [f"ERROR: {str(e)[:250]}"]
-        finally:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+    return None
+
+
+async def _create_task(video_url):
+    body = await _call_api("POST", "/tasks", data={"type": "info", "url": video_url})
+    return body
+
+
+async def _poll_task(task_href, progress_cb, stop_event=None):
+    interval = 1.5
+    timeout = 900
+    start = time.time()
+    last_status = ""
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return None
+
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            raise Exception("Task polling timed out")
+
+        body = await _call_api("GET", task_href)
+
+        state = body.get("state", "")
+        if state == "completed":
+            return _extract_url_from_result(body)
+
+        elif state == "failed":
+            error = body.get("error", {})
+            code = error.get("code", "unknown")
+            msg = error.get("message", "Unknown error")
+            raise Exception(f"Task failed: code={code}, msg={msg}")
+
+        elif state == "progress" or state == "pending":
+            status_text = body.get("statusText", "") or body.get("message", "") or ""
+            if status_text and status_text != last_status:
+                last_status = status_text
+                progress_cb(f"⚙️ {status_text}")
+
+        await asyncio.sleep(interval)
+
+
+async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
+    """Extract video download URL from savethevideo.com using direct API calls."""
+    try:
+        progress_cb("🌐 Creating task on savethevideo.com...")
+        task = await _create_task(video_url)
+        logger.info(f"[SAVEP] Task response: {task}")
+
+        task_href = task.get("href", "")
+        task_state = task.get("state", "")
+
+        progress_cb(f"✅ Task created (state: {task_state})")
+
+        # Extract download URL from response
+        dl_url = _extract_url_from_result(task)
+        if dl_url:
+            return [dl_url]
+
+        if task_state == "completed":
+            return ["❌ No download URL found in completed task"]
+
+        if not task_href:
+            return [f"ERROR: No task href in response"]
+
+        progress_cb("⏳ Polling for results...")
+        dl_url = await _poll_task(task_href, progress_cb, stop_event)
+
+        if dl_url:
+            progress_cb("✅ Download URL obtained!")
+            return [dl_url]
+        else:
+            # Fallback: try creating a download task with format=mp4
+            progress_cb("🔄 Trying download task with mp4 format...")
+            dl_task = await _call_api(
+                "POST",
+                "/tasks",
+                data={"type": "download", "url": video_url, "format": "mp4"},
+            )
+            dl_href = dl_task.get("href", "")
+            if dl_href:
+                dl_url2 = await _poll_task(dl_href, progress_cb, stop_event)
+                if dl_url2:
+                    return [dl_url2]
+            return ["❌ Could not obtain download URL from API"]
+
+    except Exception as e:
+        progress_cb(f"❌ API error: {str(e)[:200]}")
+        logger.error(f"[SAVEP] API extraction error: {e}", exc_info=True)
+        return [f"ERROR: {str(e)[:250]}"]
 
 
 async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download_dir):
@@ -411,7 +277,7 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
     try:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        await update_status("🌐 **Opening browser...**")
+        await update_status("🌐 **Connecting to savethevideo.com...**")
         links = await _async_extract_savep_v2(url, sync_progress_cb)
     finally:
         progress_task.cancel()

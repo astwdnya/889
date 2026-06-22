@@ -592,6 +592,7 @@ async def send_file_with_progress(
     status_msg: Message,
     buttons=None,
     supports_streaming: bool = True,
+    thumb_filepath: str = None,
 ):
     file_size = os.path.getsize(filepath)
     start_time = time.time()
@@ -604,7 +605,9 @@ async def send_file_with_progress(
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
     is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
 
-    thumb_path = await get_video_thumbnail(filepath) if is_video else None
+    thumb_path = thumb_filepath or (
+        await get_video_thumbnail(filepath) if is_video else None
+    )
 
     async def progress_cb(current: int, total: int):
         now = time.time()
@@ -2631,9 +2634,13 @@ async def process_y2mate_request(event, url: str, status_msg):
                         pass
 
             fname = os.path.basename(filepath)
+            # حذف (2) از آخر تایتل
+            yt_clean = yt_title
+            if yt_clean.endswith("(2)"):
+                yt_clean = yt_clean[:-3].strip()
             caption_start = (
-                f"🎬 {yt_title}"
-                if yt_title
+                f"🎬 {yt_clean}"
+                if yt_clean
                 else ("🎵 Audio" if is_audio else f"📄 {fname}")
             )
             gh_line = ""
@@ -2643,13 +2650,49 @@ async def process_y2mate_request(event, url: str, status_msg):
                 )
                 if gh_url:
                     gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+
+            # دانلود تامبنیل یوتیوب
+            thumb_fp = None
+            if not is_audio and "youtube" in url.lower():
+                try:
+                    import re as _re
+
+                    ym = _re.search(
+                        r"(?:v=|youtu\.be/|/v/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})",
+                        url,
+                    )
+                    if ym:
+                        vid = ym.group(1)
+                        turl = f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg"
+                        async with aiohttp.ClientSession() as sess:
+                            async with sess.get(
+                                turl, timeout=aiohttp.ClientTimeout(total=10)
+                            ) as resp:
+                                if resp.status == 200:
+                                    tfp = filepath + "_ytthumb.jpg"
+                                    async with aiofiles.open(tfp, "wb") as f:
+                                        async for chunk in resp.content.iter_chunked(
+                                            65536
+                                        ):
+                                            await f.write(chunk)
+                                    if os.path.getsize(tfp) > 0:
+                                        thumb_fp = tfp
+                except Exception:
+                    pass
+
             await send_file_with_progress(
                 client=event.client,
                 chat_id=event.chat_id,
                 filepath=filepath,
                 caption=f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({url}){gh_line}",
                 status_msg=status_msg,
+                thumb_filepath=thumb_fp,
             )
+            if thumb_fp and os.path.exists(thumb_fp):
+                try:
+                    os.remove(thumb_fp)
+                except Exception:
+                    pass
         except Exception as e:
             await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
             return
@@ -3313,6 +3356,9 @@ async def y2mate_quality_callback(event):
             clean_title = (
                 yt_title if yt_title and "free download" not in yt_title.lower() else ""
             )
+            # حذف (2) از آخر تایتل
+            if clean_title.endswith("(2)"):
+                clean_title = clean_title[:-3].strip()
             caption_start = (
                 f"🎬 {clean_title}"
                 if clean_title
@@ -3325,13 +3371,50 @@ async def y2mate_quality_callback(event):
                 )
                 if gh_url:
                     gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+
+            # دانلود تامبنیل یوتیوب
+            thumb_fp = None
+            if not is_audio and "youtube" in source_url.lower():
+                try:
+                    import re as _re
+
+                    ym = _re.search(
+                        r"(?:v=|youtu\.be/|/v/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})",
+                        source_url,
+                    )
+                    if ym:
+                        vid = ym.group(1)
+                        turl = f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg"
+                        async with aiohttp.ClientSession() as sess:
+                            async with sess.get(
+                                turl, timeout=aiohttp.ClientTimeout(total=10)
+                            ) as resp:
+                                if resp.status == 200:
+                                    tfp = filepath + "_ytthumb.jpg"
+                                    async with aiofiles.open(tfp, "wb") as f:
+                                        async for chunk in resp.content.iter_chunked(
+                                            65536
+                                        ):
+                                            await f.write(chunk)
+                                    if os.path.getsize(tfp) > 0:
+                                        thumb_fp = tfp
+                except Exception:
+                    pass
+
             sent_msg = await send_file_with_progress(
                 client=event.client,
                 chat_id=event.chat_id,
                 filepath=filepath,
                 caption=f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({source_url}){gh_line}",
                 status_msg=status_msg,
+                thumb_filepath=thumb_fp,
             )
+            # پاک کردن تامبنیل موقت
+            if thumb_fp and os.path.exists(thumb_fp):
+                try:
+                    os.remove(thumb_fp)
+                except Exception:
+                    pass
             try:
                 os.remove(filepath)
             except Exception:
@@ -3343,20 +3426,24 @@ async def y2mate_quality_callback(event):
                     info = await asyncio.wait_for(
                         extract_youtube_info(source_url), timeout=60
                     )
-                    lines = info.split("\n")
-                    clean_lines = [
-                        l.strip()
-                        for l in lines
-                        if l.strip()
-                        and l.strip()
-                        not in ("Free Download", "TITLE & DESCRIPTION:", "---")
-                    ]
-                    title = clean_lines[0] if clean_lines else yt_title
-                    desc = (
-                        "\n".join(clean_lines[1:]).strip()
-                        if len(clean_lines) > 1
-                        else ""
-                    )
+                    if isinstance(info, dict):
+                        title = info.get("title", "")
+                        desc = info.get("description", "")
+                    else:
+                        lines = info.split("\n")
+                        clean_lines = [
+                            l.strip()
+                            for l in lines
+                            if l.strip()
+                            and l.strip()
+                            not in ("Free Download", "TITLE & DESCRIPTION:", "---")
+                        ]
+                        title = clean_lines[0] if clean_lines else yt_title
+                        desc = (
+                            "\n".join(clean_lines[1:]).strip()
+                            if len(clean_lines) > 1
+                            else ""
+                        )
                     extra = ""
                     if title:
                         extra += f"\n🎬 **{title}**"
