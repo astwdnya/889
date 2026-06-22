@@ -65,6 +65,7 @@ admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
+y2mate_sessions: Dict[str, dict] = {}  # Y2Mate session cache
 
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
@@ -2461,6 +2462,54 @@ async def process_y2mate_request(event, url: str, status_msg):
             await session.close_browser()
             return
 
+        yt_title = session.title_text or ""
+        pick_id = f"y2m_{event.chat_id}_{int(time.time())}"
+        y2mate_sessions[pick_id] = {
+            "session": session,
+            "qualities": qualities,
+            "source_url": url,
+            "title": yt_title,
+            "chat_id": event.chat_id,
+        }
+
+        buttons = []
+        row = []
+        for i, q in enumerate(qualities):
+            label = f"{q['label']} ({q.get('size', '?')})"
+            btn = Button.inline(label, f"y2m_{pick_id}_{i}")
+            row.append(btn)
+            if len(row) >= 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([Button.inline("❌ Cancel", f"y2m_cancel_{pick_id}")])
+
+        title_line = f"\n🎬 **{yt_title}**" if yt_title else ""
+        await safe_edit(
+            status_msg,
+            f"📋 **Choose quality:**{title_line}",
+            buttons=buttons,
+        )
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ Y2Mate timed out (120s).")
+        await session.close_browser()
+    except Exception as e:
+        logger.error(f"[Y2MATE] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ Y2Mate error: {str(e)[:120]}")
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+            await session.close_browser()
+            return
+
+        qualities = result.get("qualities", [])
+        if not qualities:
+            await safe_edit(status_msg, "❌ No quality options found.")
+            await session.close_browser()
+            return
+
         # Only keep video (mp4) qualities
         video_qs = [
             (i, q)
@@ -3045,6 +3094,126 @@ async def snapwc_cancel_callback(event):
         pass
 
 
+# ====================== Y2MATE CALLBACK HANDLERS ======================
+
+
+async def y2mate_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return await event.answer("Invalid callback data.", alert=True)
+    pick_id = f"{parts[0]}_{parts[1]}"
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        return await event.answer("Invalid quality index.", alert=True)
+
+    if pick_id not in y2mate_sessions:
+        return await event.answer("Session expired. Send link again.", alert=True)
+
+    entry = y2mate_sessions.pop(pick_id)
+    session = entry["session"]
+    qualities = entry["qualities"]
+    source_url = entry["source_url"]
+    yt_title = entry["title"]
+
+    try:
+        await event.answer("⏬ Downloading...", alert=False)
+        await event.edit("📥 Processing your selection...", buttons=None)
+
+        q = qualities[idx]
+        dl_result = await session.select_quality(idx)
+        if not dl_result["success"]:
+            await event.edit(f"❌ Failed: {dl_result.get('error', 'Unknown')}")
+            await session.close_browser()
+            return
+
+        dl_url = dl_result["download_url"]
+        await session.close_browser()
+
+        status_msg = await event.get_message()
+        await safe_edit(status_msg, "📥 Downloading file...")
+        is_audio = q.get("format") == "mp3" or "kbps" in q.get("label", "").lower()
+        dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
+        active_downloads[dl_id] = {"paused": False, "cancelled": False}
+        filepath, dl_error, final_size = await download_with_controls(
+            dl_url,
+            status_msg,
+            dl_id,
+            referer="https://v21.www-y2mate.com/",
+            extra_headers={"Referer": "https://v21.www-y2mate.com/"},
+        )
+
+        if dl_error or not filepath:
+            await safe_edit(status_msg, f"❌ Download failed: {dl_error}")
+            return
+
+        await safe_edit(status_msg, "📤 Uploading...")
+        try:
+            if is_audio:
+                base = os.path.splitext(filepath)[0]
+                new_path = base + ".mp3"
+                if filepath != new_path:
+                    try:
+                        os.rename(filepath, new_path)
+                        filepath = new_path
+                    except Exception:
+                        pass
+
+            caption_start = (
+                f"🎬 {yt_title}"
+                if yt_title
+                else ("🎵 Audio" if is_audio else f"📄 {os.path.basename(filepath)}")
+            )
+            gh_line = ""
+            if GITHUB_ENABLED:
+                gh_url = await maybe_upload_github(
+                    event.client, event.chat_id, filepath, final_size
+                )
+                if gh_url:
+                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({source_url}){gh_line}",
+                status_msg=status_msg,
+            )
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+    except Exception as e:
+        logger.error(f"[Y2MATE_CB] Error: {e}", exc_info=True)
+        try:
+            await event.edit(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            pass
+        try:
+            await session.close_browser()
+        except Exception:
+            pass
+    raise events.StopPropagation
+
+
+async def y2mate_cancel_callback(event):
+    data = event.data.decode()
+    pick_id = data.replace("y2m_cancel_", "")
+    if pick_id in y2mate_sessions:
+        entry = y2mate_sessions.pop(pick_id)
+        try:
+            await entry["session"].close_browser()
+        except Exception:
+            pass
+    await event.answer("❌ Cancelled", alert=False)
+    try:
+        await event.edit("❌ Y2Mate cancelled.", buttons=None)
+    except Exception:
+        pass
+
+
 # ====================== MAIN ======================
 async def main():
     print("\n" + "=" * 60)
@@ -3130,6 +3299,13 @@ async def main():
     )
     client.add_event_handler(
         snapwc_cancel_callback, events.CallbackQuery(pattern=r"snapwc_cancel_(.+)")
+    )
+    client.add_event_handler(
+        y2mate_quality_callback,
+        events.CallbackQuery(pattern=r"y2m_(?!cancel)(.+)_(\d+)"),
+    )
+    client.add_event_handler(
+        y2mate_cancel_callback, events.CallbackQuery(pattern=r"y2m_cancel_(.+)")
     )
 
     # ===== Command handlers =====
