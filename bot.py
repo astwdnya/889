@@ -443,6 +443,25 @@ async def download_with_controls(
             logger.info(
                 f"[DL] DONE | size={human_readable_size(downloaded)} | file={filepath}"
             )
+            # Reject tiny files — likely error/placeholder, not real video
+            if downloaded < 1024:
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+                return None, f"File too small ({downloaded} B) — not a real video", 0
+            # Check first bytes for HTML content (ad/error page disguised as video)
+            try:
+                with open(filepath, "rb") as _f:
+                    head = _f.read(512)
+                if head.lstrip(b"\xef\xbb\xbf")[:1] == b"<":
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+                    return None, "Downloaded HTML page instead of video", 0
+            except Exception:
+                pass
             try:
                 await status_msg.edit(
                     "✅ Download complete!", parse_mode="markdown", buttons=None
@@ -2151,7 +2170,7 @@ async def savep_command(event):
         url=parts[1].strip(),
         safe_edit_fn=safe_edit,
         send_file_fn=send_file_with_progress,
-        download_dir="/tmp",
+        download_dir=OUTPUT_FOLDER,
     )
 
 
@@ -2385,76 +2404,16 @@ async def generic_url_handler(event):
         or "xhamster.com" in target_url
     ):
         logger.info(
-            f"[URL] Adult site detected, routing via SnapWC | url={target_url[:120]}"
+            f"[URL] Adult site detected, routing via SaveTheVideo | url={target_url[:120]}"
         )
-        user_state[event.chat_id] = {"action": "snapwc", "video_url": target_url}
-        status_msg = await event.reply("⏬ Processing...")
-        try:
-            from snapwc_handler import SnapWCSession
-
-            session = SnapWCSession()
-            snap_id = f"snap_{event.chat_id}_{int(time.time())}"
-            user_state[event.chat_id]["session_id"] = snap_id
-            snapwc_sessions[snap_id] = session
-            flow_task = asyncio.create_task(session.run_full_flow(target_url))
-            done, pending = await asyncio.wait([flow_task], timeout=20)
-            if not done:
-                logger.warning(
-                    f"[URL] SnapWC still processing after 20s — sending screenshot"
-                )
-                ss_b64 = await session.take_screenshot()
-                if ss_b64:
-                    try:
-                        await event.client.send_file(
-                            event.chat_id,
-                            base64.b64decode(ss_b64),
-                            caption=f"⏱️ SnapWC still processing after 20s",
-                        )
-                    except Exception:
-                        pass
-                # Keep waiting for SnapWC to finish
-                await safe_edit(
-                    status_msg, "⏬ Still processing — waiting for SnapWC..."
-                )
-                result = await flow_task
-            else:
-                result = done.pop().result()
-
-            if not result["success"]:
-                await safe_edit(
-                    status_msg, f"❌ SnapWC error: {result.get('error', 'Unknown')}"
-                )
-                await session.close_browser()
-                snapwc_sessions.pop(snap_id, None)
-                return
-            qualities = result.get("qualities", [])
-            if not qualities:
-                await safe_edit(status_msg, "❌ No qualities found.")
-                await session.close_browser()
-                snapwc_sessions.pop(snap_id, None)
-                return
-            buttons = []
-            row = []
-            for i, q in enumerate(qualities):
-                btn = Button.inline(
-                    f"{q['label']} ({q.get('size', '?')})", f"snapwc_q_{snap_id}_{i}"
-                )
-                row.append(btn)
-                if len(row) >= 2:
-                    buttons.append(row)
-                    row = []
-            if row:
-                buttons.append(row)
-            buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{snap_id}")])
-            await safe_edit(status_msg, "📋 **Choose quality:**", buttons=buttons)
-        except Exception as e:
-            logger.error(f"[URL] Adult site error: {e}", exc_info=True)
-            try:
-                await safe_edit(status_msg, f"❌ Error: {str(e)[:100]}")
-            except Exception:
-                pass
-        finally:
-            processing_messages.discard(msg_id)
+        await process_savep_request(
+            event=event,
+            url=target_url,
+            safe_edit_fn=safe_edit,
+            send_file_fn=send_file_with_progress,
+            download_dir=OUTPUT_FOLDER,
+        )
+        processing_messages.discard(msg_id)
         return
 
     logger.info(
@@ -3351,9 +3310,12 @@ async def y2mate_quality_callback(event):
                     except Exception:
                         pass
 
+            clean_title = (
+                yt_title if yt_title and "free download" not in yt_title.lower() else ""
+            )
             caption_start = (
-                f"🎬 {yt_title}"
-                if yt_title
+                f"🎬 {clean_title}"
+                if clean_title
                 else ("🎵 Audio" if is_audio else f"📄 {os.path.basename(filepath)}")
             )
             gh_line = ""
