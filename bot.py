@@ -244,6 +244,110 @@ def is_direct_file_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in direct_extensions)
 
 
+# ====================== DOWNLOAD VIA PLAYWRIGHT (REAL BROWSER) ======================
+async def download_with_playwright(
+    url: str,
+    status_msg: Message,
+    dl_id: str,
+) -> Tuple[Optional[str], Optional[str], int]:
+    """
+    Download a file using a real Chromium browser (bypasses TLS fingerprint / Cloudflare blocking).
+    Only suitable for direct file URLs (no video page extraction).
+    """
+    if dl_id not in active_downloads:
+        active_downloads[dl_id] = {"paused": False, "cancelled": False}
+
+    await safe_edit(status_msg, "🌐 Downloading via browser...")
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=_browser_args())
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await context.new_page()
+
+            download_promise: asyncio.Future = asyncio.Future()
+
+            async def on_download(download):
+                download_promise.set_result(download)
+
+            page.on("download", on_download)
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+
+            # Wait a bit for download to start
+            for _ in range(30):
+                if download_promise.done() or active_downloads.get(dl_id, {}).get(
+                    "cancelled"
+                ):
+                    break
+                await asyncio.sleep(1)
+
+            if active_downloads.get(dl_id, {}).get("cancelled"):
+                await browser.close()
+                return None, "Cancelled by user", 0
+
+            if not download_promise.done():
+                # Download didn't start automatically — save page content as fallback
+                try:
+                    content = await page.content()
+                    if content and len(content) > 512:
+                        # Check if it's a binary download by looking at response
+                        await browser.close()
+                        return None, "Browser could not trigger download", 0
+                except Exception:
+                    pass
+                await browser.close()
+                return None, "Download did not start in browser", 0
+
+            download = await download_promise
+
+            # Get suggested filename
+            suggested = download.suggested_filename or f"file_{int(time.time())}"
+            suggested = re.sub(r"[^\w\.\-_\(\) ]", "_", suggested)
+            if len(suggested) > 100:
+                base, ext = os.path.splitext(suggested)
+                suggested = base[:95] + ext
+
+            filepath = os.path.join(OUTPUT_FOLDER, suggested)
+            counter = 1
+            while os.path.exists(filepath):
+                base, ext = os.path.splitext(suggested)
+                filepath = os.path.join(OUTPUT_FOLDER, f"{base}_{counter}{ext}")
+                counter += 1
+
+            # Wait for download to complete
+            dl_path = await download.path()
+            if not dl_path or not os.path.exists(dl_path):
+                await browser.close()
+                return None, "Download path not found", 0
+
+            file_size = os.path.getsize(dl_path)
+            if file_size < 1024:
+                await browser.close()
+                return None, f"File too small ({file_size} B)", 0
+
+            # Move to our output folder
+            import shutil
+
+            shutil.move(dl_path, filepath)
+
+            await browser.close()
+            logger.info(
+                f"[DL-PW] DONE | size={human_readable_size(file_size)} | file={filepath}"
+            )
+            return filepath, None, file_size
+
+    except Exception as e:
+        logger.error(f"[DL-PW] Error: {e}", exc_info=True)
+        return None, str(e)[:100], 0
+
+
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
 async def download_with_controls(
     url: str,
@@ -860,12 +964,21 @@ async def do_download_and_send(
     # FIX: 403 → auto-retry via dirpy
     if dl_error == "HTTP_403":
         if is_direct_file_url(direct_url):
-            await safe_edit(
-                status_msg,
-                "❌ 403 Forbidden — سرور دانلود مستقیم توسط ربات را مسدود کرده است.",
+            await safe_edit(status_msg, "🔄 403 — retrying via real browser...")
+            dl_id3 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_pw2"
+            active_downloads[dl_id3] = {"paused": False, "cancelled": False}
+            filepath, dl_error, final_size = await download_with_playwright(
+                direct_url, status_msg, dl_id3
             )
-            return False
-        await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
+            if dl_error or not filepath:
+                await safe_edit(
+                    status_msg,
+                    "❌ 403 Forbidden — سرور دانلود توسط ربات را مسدود کرده است.\n"
+                    "لینک در مرورگر کار می‌کند اما CDN درخواست‌های خودکار را رد می‌کند.",
+                )
+                return False
+        else:
+            await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
         (
             found_urls,
             session_headers,
@@ -2582,19 +2695,27 @@ async def generic_url_handler(event):
 
         if error == "HTTP_403":
             if is_direct_file_url(target_url):
-                await safe_edit(
-                    status_msg,
-                    "❌ 403 Forbidden — server blocked the download.\n"
-                    "لینک در مرورگر کار می‌کند اما سرور دانلود مستقیم توسط ربات را مسدود کرده است.",
+                await safe_edit(status_msg, "🔄 403 — retrying via real browser...")
+                dl_id2 = f"dl_{event.chat_id}_{event.id}_{int(time.time())}_pw"
+                active_downloads[dl_id2] = {"paused": False, "cancelled": False}
+                filepath, error, size = await download_with_playwright(
+                    target_url, status_msg, dl_id2
                 )
+                if error or not filepath:
+                    await safe_edit(
+                        status_msg,
+                        "❌ 403 Forbidden — سرور دانلود توسط ربات را مسدود کرده است.\n"
+                        "لینک در مرورگر کار می‌کند اما CDN درخواست‌های خودکار را رد می‌کند.",
+                    )
+                    return
+            else:
+                await safe_edit(status_msg, "🔄 403 — trying via Dirpy...")
+                await process_dirpy_request(event, target_url)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
                 return
-            await safe_edit(status_msg, "🔄 403 — trying via Dirpy...")
-            await process_dirpy_request(event, target_url)
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            return
 
         if error or not filepath:
             if error != "Cancelled by user":
