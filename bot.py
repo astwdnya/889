@@ -2517,11 +2517,11 @@ async def generic_url_handler(event):
     status_msg = await event.reply("⏬ Downloading...")
     try:
         filepath, error, size = await download_with_controls(
-            target_url, status_msg, dl_id, referer=target_url
+            target_url, status_msg, dl_id, referer=None
         )
 
         if error == "HTTP_403":
-            await safe_edit(status_msg, "🔄 403 — extracting via Dirpy...")
+            await safe_edit(status_msg, "🔄 403 — trying via Dirpy...")
             await process_dirpy_request(event, target_url)
             try:
                 await status_msg.delete()
@@ -3604,6 +3604,8 @@ async def savep_cancel_callback(event):
             await event.edit("🚫 **Cancelled.**", buttons=None)
         except Exception:
             pass
+
+
 async def main():
     print("\n" + "=" * 60)
     print("🚀 ULTIMATE BOT v5")
