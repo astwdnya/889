@@ -97,9 +97,10 @@ async def split_file_into_parts(
     total_parts = (file_size + max_part_size - 1) // max_part_size
 
     part_num = 1
+    last_update = 0.0
     with open(filepath, "rb") as f:
         while True:
-            part_filename = f"{base_name}.part{part_num:03d}{ext}"
+            part_filename = f"{base_name}{ext}.part{part_num:03d}"
             part_path = os.path.join(OUTPUT_FOLDER, part_filename)
             remaining = file_size - f.tell()
             if remaining <= 0:
@@ -114,11 +115,14 @@ async def split_file_into_parts(
                     pf.write(chunk)
                     written += len(chunk)
                     if status_msg:
-                        pct = (f.tell() / file_size) * 100
-                        await safe_edit(
-                            status_msg,
-                            f"✂️ Splitting part {part_num}/{total_parts}: {pct:.1f}%",
-                        )
+                        now = time.time()
+                        if now - last_update >= 2.0:
+                            last_update = now
+                            pct = (f.tell() / file_size) * 100
+                            await safe_edit(
+                                status_msg,
+                                f"✂️ Splitting part {part_num}/{total_parts}: {pct:.1f}%",
+                            )
             parts.append(part_path)
             if status_msg:
                 await safe_edit(
@@ -3218,10 +3222,19 @@ async def generic_url_handler(event):
                 except:
                     pass
 
+                # Re-add ul_id for cancellation detection between parts
+                if ul_id_all not in active_uploads:
+                    active_uploads[ul_id_all] = {"paused": False, "cancelled": False}
+
+            active_uploads.pop(ul_id_all, None)
+
+            part_names = [os.path.basename(p) for p in parts]
+            orig_fname = os.path.basename(filepath)
+            win_cmd = "copy /b " + "+".join(part_names) + " " + orig_fname
             join_help = (
                 "To join parts:\n"
-                "Windows: `copy /b file.part001.*+file.part002.*+... output.ext`\n"
-                "Linux/Mac: `cat file.part001.* file.part002.* > output.ext`"
+                f"Windows: `{win_cmd}`\n"
+                f"Linux/Mac: `cat {orig_fname}.part* > {orig_fname}`"
             )
             await event.client.send_message(
                 event.chat_id,
