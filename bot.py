@@ -204,6 +204,46 @@ def build_progress_text(
     )
 
 
+# ====================== DIRECT FILE URL DETECTION ======================
+def is_direct_file_url(url: str) -> bool:
+    path = url.split("?")[0].split("#")[0].lower()
+    direct_extensions = (
+        ".mp4",
+        ".mkv",
+        ".avi",
+        ".mov",
+        ".wmv",
+        ".flv",
+        ".webm",
+        ".m4v",
+        ".mp3",
+        ".m4a",
+        ".flac",
+        ".wav",
+        ".ogg",
+        ".aac",
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".apk",
+        ".ipa",
+        ".xapk",
+        ".exe",
+        ".dmg",
+        ".iso",
+        ".pdf",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".webp",
+        ".bmp",
+    )
+    return any(path.endswith(ext) for ext in direct_extensions)
+
+
 # ====================== DOWNLOAD WITH PAUSE/CANCEL ======================
 async def download_with_controls(
     url: str,
@@ -216,10 +256,17 @@ async def download_with_controls(
     CHUNK_SIZE = 2 * 1024 * 1024  # 2MB chunks
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
         "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
     }
     if referer:
         headers["Referer"] = referer
@@ -354,6 +401,13 @@ async def download_with_controls(
                                 "application/x-7z-compressed": ".7z",
                                 "application/x-tar": ".tar",
                                 "application/gzip": ".gz",
+                                "application/octet-stream": ".bin",
+                                "application/vnd.android.package-archive": ".apk",
+                                "application/x-ipa": ".ipa",
+                                "application/x-apple-diskimage": ".dmg",
+                                "application/x-iso9660-image": ".iso",
+                                "application/vnd.apple.installer+xml": ".ipa",
+                                "application/x-msdownload": ".exe",
                             }
                             for mtype, mext in ct_map.items():
                                 if mtype in ct:
@@ -805,6 +859,12 @@ async def do_download_and_send(
 
     # FIX: 403 → auto-retry via dirpy
     if dl_error == "HTTP_403":
+        if is_direct_file_url(direct_url):
+            await safe_edit(
+                status_msg,
+                "❌ 403 Forbidden — سرور دانلود مستقیم توسط ربات را مسدود کرده است.",
+            )
+            return False
         await safe_edit(status_msg, "🔄 403 received — extracting via Dirpy...")
         (
             found_urls,
@@ -2521,6 +2581,13 @@ async def generic_url_handler(event):
         )
 
         if error == "HTTP_403":
+            if is_direct_file_url(target_url):
+                await safe_edit(
+                    status_msg,
+                    "❌ 403 Forbidden — server blocked the download.\n"
+                    "لینک در مرورگر کار می‌کند اما سرور دانلود مستقیم توسط ربات را مسدود کرده است.",
+                )
+                return
             await safe_edit(status_msg, "🔄 403 — trying via Dirpy...")
             await process_dirpy_request(event, target_url)
             try:
