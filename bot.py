@@ -41,7 +41,7 @@ from github import (
     GITHUB_BRANCH,
     GITHUB_BASE_DIR,
 )
-from savep_handler import process_savep_request
+from savep_handler import process_savep_request, trigger_savep_cancel
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
@@ -3595,7 +3595,15 @@ async def y2mate_cancel_callback(event):
         pass
 
 
-# ====================== MAIN ======================
+async def savep_cancel_callback(event):
+    session_id = event.data.decode().replace("savep_cancel_", "")
+    cancelled = trigger_savep_cancel(session_id)
+    await event.answer("🚫 Cancelling..." if cancelled else "Already done", alert=False)
+    if cancelled:
+        try:
+            await event.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
 async def main():
     print("\n" + "=" * 60)
     print("🚀 ULTIMATE BOT v5")
@@ -3690,6 +3698,9 @@ async def main():
     )
     client.add_event_handler(
         y2mate_cancel_callback, events.CallbackQuery(pattern=r"y2mc_.+")
+    )
+    client.add_event_handler(
+        savep_cancel_callback, events.CallbackQuery(pattern=r"savep_cancel_.+")
     )
 
     # ===== Command handlers =====
