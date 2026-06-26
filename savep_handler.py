@@ -151,7 +151,8 @@ async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
             if not start_clicked:
                 return ["❌ Start button not found"]
 
-            await page.wait_for_timeout(5000)
+            # صبر بیشتر تا صفحه کاملاً re-render بشه
+            await page.wait_for_timeout(8000)
 
             for pg in list(ctx.pages):
                 if pg is not page:
@@ -160,45 +161,94 @@ async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
                     except Exception:
                         pass
 
+            # صبر اضافه بعد از بستن پاپ‌آپ‌ها
+            await page.wait_for_timeout(2000)
+
             # Click Convert tab
             progress_cb("🖱 Clicking Convert tab...")
             convert_clicked = False
 
-            try:
-                convert_tab = (
-                    page.locator('li[role="tab"]').filter(has_text="Convert").first
-                )
-                if await convert_tab.is_visible(timeout=10000):
-                    await convert_tab.click()
-                    convert_clicked = True
-                    progress_cb("✅ Convert tab clicked")
-            except Exception:
-                pass
+            # سلکتورهای مختلف برای تب Convert
+            convert_selectors = [
+                'li[role="tab"]',
+                'a[role="tab"]',
+                '.nav-tabs li',
+                '.tabs li',
+                '[data-tab]',
+                '.tab',
+                'button.tab',
+                '.nav-link',
+            ]
 
+            for selector in convert_selectors:
+                if convert_clicked:
+                    break
+                try:
+                    els = page.locator(selector)
+                    count = await els.count()
+                    for i in range(count):
+                        el = els.nth(i)
+                        txt = (await el.text_content() or "").strip()
+                        if "convert" in txt.lower():
+                            await el.scroll_into_view_if_needed()
+                            await el.click()
+                            convert_clicked = True
+                            progress_cb(f"✅ Convert tab clicked ({selector})")
+                            break
+                except Exception:
+                    pass
+
+            # JS fallback — همه المنت‌ها رو چک کن
             if not convert_clicked:
                 try:
                     result = await page.evaluate(
                         """() => {
-                        for (const el of document.querySelectorAll('li[role="tab"]')) {
-                            if (el.textContent.trim() === "Convert") {
+                        const candidates = document.querySelectorAll(
+                            'li, a, button, div, span'
+                        );
+                        for (const el of candidates) {
+                            const t = (el.textContent || '').trim().toLowerCase();
+                            if (t === 'convert' || t === 'convert tab') {
                                 el.click();
-                                return true;
+                                return el.tagName + ':' + el.className;
                             }
                         }
-                        return false;
+                        return null;
                     }"""
                     )
                     if result:
                         convert_clicked = True
-                        progress_cb("✅ Convert tab clicked (JS)")
+                        progress_cb(f"✅ Convert tab clicked (JS fallback: {result})")
                 except Exception:
                     pass
 
+            # اگه هیچ‌کدوم کار نکرد، لیست همه تب‌ها رو لاگ کن
             if not convert_clicked:
+                try:
+                    tabs_info = await page.evaluate(
+                        """() => {
+                        const results = [];
+                        const candidates = document.querySelectorAll(
+                            'li, a[role="tab"], button[role="tab"], .nav-link, .tab-item'
+                        );
+                        for (const el of candidates) {
+                            const t = (el.textContent || '').trim();
+                            if (t && t.length < 50) {
+                                results.push(el.tagName + '[' + (el.role || el.className || '') + ']: ' + t);
+                            }
+                        }
+                        return results.slice(0, 15).join(' | ');
+                    }"""
+                    )
+                    progress_cb(f"🔍 Available elements: {tabs_info[:200]}")
+                except Exception:
+                    pass
+
+                # آخرین تلاش: select_option
                 try:
                     await page.select_option("#tabs", value="1")
                     convert_clicked = True
-                    progress_cb("✅ Convert tab via select")
+                    progress_cb("✅ Convert tab via select#tabs")
                 except Exception:
                     pass
 
