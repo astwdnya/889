@@ -442,12 +442,46 @@ async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
                     pass
 
 
-async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download_dir):
-    status_msg = await event.reply("🔄 Starting extraction...", parse_mode="markdown")
 
-    async def update_status(text):
+# نگهداری stop_event ها برای cancel کردن از callback
+_savep_stop_events: dict = {}
+
+
+def register_savep_cancel(session_id: str, stop_event: asyncio.Event):
+    _savep_stop_events[session_id] = stop_event
+
+
+def trigger_savep_cancel(session_id: str) -> bool:
+    ev = _savep_stop_events.pop(session_id, None)
+    if ev:
+        ev.set()
+        return True
+    return False
+
+
+async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download_dir):
+    from telethon.tl.types import KeyboardButtonCallback
+    from telethon import Button
+
+    session_id = f"savep_{event.chat_id}_{event.id}_{int(time.time())}"
+    stop_event = asyncio.Event()
+    register_savep_cancel(session_id, stop_event)
+
+    cancel_btn = [[Button.inline("🪟 Cancel", f"savep_cancel_{session_id}")]]
+
+    status_msg = await event.reply(
+        "🔄 Starting extraction...",
+        parse_mode="markdown",
+        buttons=cancel_btn,
+    )
+
+    async def update_status(text, keep_btn=True):
         try:
-            await safe_edit_fn(status_msg, text)
+            await safe_edit_fn(
+                status_msg,
+                text,
+                buttons=cancel_btn if keep_btn else None,
+            )
         except Exception:
             pass
 
@@ -467,7 +501,7 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
                     + "\n```"
                 )
                 try:
-                    await safe_edit_fn(status_msg, text)
+                    await safe_edit_fn(status_msg, text, buttons=cancel_btn)
                 except Exception:
                     pass
 
@@ -477,19 +511,27 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         await update_status("🌐 **Opening browser...**")
-        links = await _async_extract_savep_v2(url, sync_progress_cb)
+        links = await _async_extract_savep_v2(url, sync_progress_cb, stop_event=stop_event)
     finally:
         progress_task.cancel()
         try:
             await progress_task
         except asyncio.CancelledError:
             pass
+        _savep_stop_events.pop(session_id, None)
+
+    # چک کنسل شدن
+    if stop_event.is_set():
+        await safe_edit_fn(status_msg, "🚫 **Cancelled.**", buttons=None)
+        return
 
     if not links or links[0].startswith("❌") or links[0].startswith("ERROR"):
         err_detail = links[0] if links else "No links found"
         log_text = "\n".join(progress_log[-6:]) if progress_log else "No log"
-        await update_status(
-            f"❌ **Extraction failed**\n`{err_detail}`\n\n**Last log:**\n```\n{log_text}\n```"
+        await safe_edit_fn(
+            status_msg,
+            f"❌ **Extraction failed**\n`{err_detail}`\n\n**Last log:**\n```\n{log_text}\n```",
+            buttons=None,
         )
         return
 
@@ -502,7 +544,7 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
 
     async def progress_text_cb(text):
         try:
-            await safe_edit_fn(status_msg, text)
+            await safe_edit_fn(status_msg, text, buttons=cancel_btn)
         except Exception:
             pass
 
@@ -511,17 +553,17 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
     )
 
     if not success or not os.path.exists(filepath):
-        await update_status(f"❌ **Download failed:** `{dl_error}`")
+        await safe_edit_fn(status_msg, f"❌ **Download failed:** `{dl_error}`", buttons=None)
         return
     if final_size < 1024:
-        await update_status(f"❌ **Download failed:** File too small ({final_size}B)")
+        await safe_edit_fn(status_msg, f"❌ **Download failed:** File too small ({final_size}B)", buttons=None)
         try:
             os.remove(filepath)
         except Exception:
             pass
         return
 
-    await update_status("📤 **Uploading video...**")
+    await safe_edit_fn(status_msg, "📤 **Uploading video...**", buttons=None)
     try:
         caption = (
             f"🎬 **Video Downloaded**\n"
