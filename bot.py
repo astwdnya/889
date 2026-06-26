@@ -66,6 +66,7 @@ video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
 admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
+active_uploads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
 y2mate_sessions: Dict[str, dict] = {}  # Y2Mate session cache
@@ -87,11 +88,13 @@ def get_free_space(path: str = OUTPUT_FOLDER) -> int:
 async def split_file_into_parts(
     filepath: str,
     max_part_size: int = MAX_PART_SIZE,
+    status_msg: Message = None,
 ) -> list:
     parts = []
     file_size = os.path.getsize(filepath)
     base, ext = os.path.splitext(filepath)
     base_name = os.path.basename(base)
+    total_parts = (file_size + max_part_size - 1) // max_part_size
 
     part_num = 1
     with open(filepath, "rb") as f:
@@ -110,8 +113,22 @@ async def split_file_into_parts(
                         break
                     pf.write(chunk)
                     written += len(chunk)
+                    if status_msg:
+                        pct = (f.tell() / file_size) * 100
+                        await safe_edit(
+                            status_msg,
+                            f"✂️ Splitting part {part_num}/{total_parts}: {pct:.1f}%",
+                        )
             parts.append(part_path)
+            if status_msg:
+                await safe_edit(
+                    status_msg,
+                    f"✂️ Part {part_num}/{total_parts} done ({human_readable_size(read_size)}) — {part_num}/{total_parts} complete.",
+                )
             part_num += 1
+
+    if status_msg:
+        await safe_edit(status_msg, f"✂️ Split complete: {total_parts} parts.")
 
     return parts
 
@@ -1032,6 +1049,18 @@ async def dl_cancel_callback(event):
         pass
 
 
+async def ul_cancel_callback(event):
+    ul_id = event.data.decode().replace("ulcancel_", "")
+    if ul_id not in active_uploads:
+        return await event.answer("No active upload found.", alert=True)
+    active_uploads[ul_id]["cancelled"] = True
+    await event.answer("❌ Cancelling upload...", alert=False)
+    try:
+        await event.edit(buttons=None)
+    except Exception:
+        pass
+
+
 # ====================== UPLOAD WITH PROGRESS ======================
 async def get_video_thumbnail(filepath: str) -> Optional[str]:
     """یه فریم از وسط ویدیو به عنوان thumbnail می‌گیره"""
@@ -1093,6 +1122,7 @@ async def send_file_with_progress(
     buttons=None,
     supports_streaming: bool = True,
     thumb_filepath: str = None,
+    ul_id: str = None,
 ):
     file_size = os.path.getsize(filepath)
     start_time = time.time()
@@ -1100,6 +1130,9 @@ async def send_file_with_progress(
     last_bytes = [0]
     last_time = [start_time]
     ext = os.path.splitext(filepath)[1].lower()
+
+    if ul_id:
+        active_uploads[ul_id] = {"paused": False, "cancelled": False}
 
     duration, width, height = await get_video_info(filepath)
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
@@ -1179,7 +1212,13 @@ async def send_file_with_progress(
             await get_video_thumbnail(filepath) if is_video else None
         )
 
+        ul_buttons = None
+        if ul_id:
+            ul_buttons = [Button.inline("❌ Cancel", f"ulcancel_{ul_id}")]
+
         async def progress_cb(current: int, total: int):
+            if ul_id and active_uploads.get(ul_id, {}).get("cancelled"):
+                raise asyncio.CancelledError("Upload cancelled by user")
             now = time.time()
             if now - last_update[0] < 3.0 and current != total:
                 return
@@ -1191,16 +1230,23 @@ async def send_file_with_progress(
             text = build_progress_text(
                 "📤 Uploading", current, total, speed, start_time
             )
-            try:
-                asyncio.ensure_future(status_msg.edit(text, parse_mode="markdown"))
-            except Exception:
-                pass
+            asyncio.ensure_future(_safe_edit_text(status_msg, text, ul_buttons))
 
         sent = None
-        with open(filepath, "rb") as f:
-            uploaded = await fast_upload_file(
-                client, f, progress_callback=progress_cb, connection_count=15
-            )
+        try:
+            with open(filepath, "rb") as f:
+                uploaded = await fast_upload_file(
+                    client, f, progress_callback=progress_cb, connection_count=15
+                )
+        except asyncio.CancelledError:
+            try:
+                await status_msg.edit("🚫 Upload cancelled.", buttons=None)
+            except Exception:
+                pass
+            raise
+
+        if ul_id:
+            active_uploads.pop(ul_id, None)
 
         if is_video:
             duration_int = int(duration) if duration else 0
@@ -1279,12 +1325,20 @@ async def send_file_with_progress(
             except Exception:
                 pass
 
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
+    if not ul_id:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     return sent
+
+
+async def _safe_edit_text(msg: Message, text: str, buttons=None):
+    try:
+        await msg.edit(text, parse_mode="markdown", buttons=buttons)
+    except Exception:
+        pass
 
 
 # ====================== DOWNLOAD AND SEND ======================
@@ -3088,7 +3142,7 @@ async def generic_url_handler(event):
                 status_msg,
                 f"✂️ Splitting large file ({human_readable_size(file_size)}) into parts...",
             )
-            parts = await split_file_into_parts(filepath)
+            parts = await split_file_into_parts(filepath, status_msg=status_msg)
             if not parts:
                 await safe_edit(status_msg, "❌ Failed to split file.")
                 return
@@ -3100,11 +3154,24 @@ async def generic_url_handler(event):
 
             total_parts = len(parts)
             base_name = os.path.basename(filepath)
+            ul_id_all = f"ul_{event.chat_id}_{event.id}_{int(time.time())}"
+            active_uploads[ul_id_all] = {"paused": False, "cancelled": False}
+            upload_failed = False
             for i, part_path in enumerate(parts):
+                if active_uploads.get(ul_id_all, {}).get("cancelled"):
+                    await safe_edit(status_msg, "🚫 Multi-part upload cancelled.")
+                    for remaining in parts[i:]:
+                        try:
+                            os.remove(remaining)
+                        except:
+                            pass
+                    break
                 part_size = os.path.getsize(part_path)
                 part_label = os.path.basename(part_path)
+                pct_done = (i / total_parts) * 100
                 await safe_edit(
-                    status_msg, f"📤 Uploading part {i + 1}/{total_parts}: {part_label}"
+                    status_msg,
+                    f"📤 Uploading part {i + 1}/{total_parts} ({pct_done:.0f}% complete):\n{part_label}\n📏 {human_readable_size(part_size)}",
                 )
                 gh_line = ""
                 if GITHUB_ENABLED:
@@ -3113,17 +3180,39 @@ async def generic_url_handler(event):
                     )
                     if gh_url:
                         gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-                await send_file_with_progress(
-                    client=event.client,
-                    chat_id=event.chat_id,
-                    filepath=part_path,
-                    caption=(
-                        f"📦 {base_name}\n"
-                        f"🧩 Part {i + 1}/{total_parts}\n"
-                        f"📏 {human_readable_size(part_size)}{gh_line}"
-                    ),
-                    status_msg=status_msg,
-                )
+                try:
+                    await send_file_with_progress(
+                        client=event.client,
+                        chat_id=event.chat_id,
+                        filepath=part_path,
+                        caption=(
+                            f"📦 {base_name}\n"
+                            f"🧩 Part {i + 1}/{total_parts}\n"
+                            f"📏 {human_readable_size(part_size)}{gh_line}"
+                        ),
+                        status_msg=status_msg,
+                        ul_id=ul_id_all,
+                    )
+                except asyncio.CancelledError:
+                    upload_failed = True
+                    for remaining in parts[i:]:
+                        try:
+                            os.remove(remaining)
+                        except:
+                            pass
+                    break
+                except Exception as e:
+                    await safe_edit(
+                        status_msg, f"❌ Part {i + 1} upload failed: {str(e)[:80]}"
+                    )
+                    upload_failed = True
+                    for remaining in parts[i:]:
+                        try:
+                            os.remove(remaining)
+                        except:
+                            pass
+                    break
+
                 try:
                     os.remove(part_path)
                 except:
@@ -3171,6 +3260,7 @@ async def generic_url_handler(event):
                     filepath=filepath,
                     caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
                     status_msg=status_msg,
+                    ul_id=f"ul_{event.chat_id}_{event.id}",
                 )
             except Exception as e:
                 await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
@@ -4256,6 +4346,9 @@ async def main():
     )
     client.add_event_handler(
         dl_cancel_callback, events.CallbackQuery(pattern=r"dlcancel_(.+)")
+    )
+    client.add_event_handler(
+        ul_cancel_callback, events.CallbackQuery(pattern=r"ulcancel_(.+)")
     )
     client.add_event_handler(
         compress_callback, events.CallbackQuery(pattern=r"compress_(.+)")
