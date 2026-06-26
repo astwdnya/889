@@ -9,6 +9,7 @@ import sys
 import logging
 import time
 import json
+import shutil
 from urllib.parse import quote
 from typing import Optional, Tuple, Dict
 
@@ -54,7 +55,8 @@ API_HASH = "b18441a1ff607e10a989891a5462e627"
 AUTHORIZED_USERS = {818185073, 6936101187, 7972834913, 8228738080}
 ADMIN_ID = 818185073
 
-MAX_FILE_SIZE_MB = 2000
+MAX_FILE_SIZE_MB = 50000  # allow up to ~50GB (bot will split into 2GB parts)
+MAX_PART_SIZE = 1900 * 1024 * 1024  # 1.9GB per part for Telegram upload
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -73,6 +75,46 @@ GITHUB_ENABLED: bool = False
 
 # نگه‌داری فایل‌های ویدیویی که کاربر فرستاده و منتظر تأیید گیتهاب هستن
 video_github_pending: Dict[str, Dict] = {}
+
+
+# ====================== DISK UTILITIES ======================
+def get_free_space(path: str = OUTPUT_FOLDER) -> int:
+    os.makedirs(path, exist_ok=True)
+    usage = shutil.disk_usage(path)
+    return usage.free
+
+
+async def split_file_into_parts(
+    filepath: str,
+    max_part_size: int = MAX_PART_SIZE,
+) -> list:
+    parts = []
+    file_size = os.path.getsize(filepath)
+    base, ext = os.path.splitext(filepath)
+    base_name = os.path.basename(base)
+
+    part_num = 1
+    with open(filepath, "rb") as f:
+        while True:
+            part_filename = f"{base_name}.part{part_num:03d}{ext}"
+            part_path = os.path.join(OUTPUT_FOLDER, part_filename)
+            remaining = file_size - f.tell()
+            if remaining <= 0:
+                break
+            read_size = min(max_part_size, remaining)
+            with open(part_path, "wb") as pf:
+                written = 0
+                while written < read_size:
+                    chunk = f.read(min(4 * 1024 * 1024, read_size - written))
+                    if not chunk:
+                        break
+                    pf.write(chunk)
+                    written += len(chunk)
+            parts.append(part_path)
+            part_num += 1
+
+    return parts
+
 
 # ====================== LOGGING ======================
 import sys as _sys
@@ -208,6 +250,7 @@ def build_progress_text(
 def is_direct_file_url(url: str) -> bool:
     path = url.split("?")[0].split("#")[0].lower()
     direct_extensions = (
+        # Video
         ".mp4",
         ".mkv",
         ".avi",
@@ -216,30 +259,237 @@ def is_direct_file_url(url: str) -> bool:
         ".flv",
         ".webm",
         ".m4v",
+        ".mpg",
+        ".mpeg",
+        ".mpe",
+        ".3gp",
+        ".3g2",
+        ".ogv",
+        ".ogx",
+        ".ts",
+        ".mts",
+        ".m2ts",
+        ".vob",
+        ".divx",
+        ".xvid",
+        ".f4v",
+        ".rm",
+        ".rmvb",
+        ".asf",
+        ".amv",
+        ".yuv",
+        ".qt",
+        # Audio
         ".mp3",
         ".m4a",
         ".flac",
         ".wav",
         ".ogg",
         ".aac",
-        ".zip",
-        ".rar",
-        ".7z",
-        ".tar",
-        ".gz",
-        ".apk",
-        ".ipa",
-        ".xapk",
-        ".exe",
-        ".dmg",
-        ".iso",
-        ".pdf",
+        ".wma",
+        ".opus",
+        ".ape",
+        ".ac3",
+        ".dts",
+        ".ra",
+        ".mid",
+        ".midi",
+        ".aiff",
+        ".aif",
+        ".au",
+        ".amr",
+        ".awb",
+        ".voc",
+        ".cda",
+        ".pcm",
+        ".tta",
+        ".wv",
+        ".mpc",
+        ".mka",
+        ".oga",
+        ".spx",
+        # Image
         ".jpg",
         ".jpeg",
         ".png",
         ".gif",
         ".webp",
         ".bmp",
+        ".tiff",
+        ".tif",
+        ".svg",
+        ".svgz",
+        ".ico",
+        ".cur",
+        ".psd",
+        ".ai",
+        ".eps",
+        ".raw",
+        ".cr2",
+        ".nef",
+        ".arw",
+        ".dng",
+        ".jxr",
+        ".heic",
+        ".heif",
+        ".avif",
+        ".jfif",
+        ".pjpeg",
+        ".pjp",
+        # Document
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".rtf",
+        ".txt",
+        ".csv",
+        ".tsv",
+        ".epub",
+        ".mobi",
+        ".azw3",
+        ".fb2",
+        ".djvu",
+        ".pages",
+        ".numbers",
+        ".key",
+        ".md",
+        ".tex",
+        # Archive
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".zst",
+        ".lz",
+        ".lzma",
+        ".lzo",
+        ".arj",
+        ".cab",
+        ".iso",
+        ".vhd",
+        ".vmdk",
+        ".dmg",
+        ".tgz",
+        ".tbz2",
+        ".tlz",
+        ".txz",
+        ".z",
+        ".sz",
+        ".wim",
+        ".chm",
+        ".hfs",
+        # Executable
+        ".exe",
+        ".msi",
+        ".appimage",
+        ".deb",
+        ".rpm",
+        ".apk",
+        ".ipa",
+        ".xapk",
+        ".apks",
+        ".aab",
+        ".dmg",
+        ".pkg",
+        ".sh",
+        ".bat",
+        ".cmd",
+        ".com",
+        ".bin",
+        ".elf",
+        ".run",
+        ".o",
+        ".ko",
+        ".so",
+        ".dll",
+        ".sys",
+        # Font
+        ".ttf",
+        ".otf",
+        ".woff",
+        ".woff2",
+        ".eot",
+        # 3D / CAD
+        ".stl",
+        ".obj",
+        ".fbx",
+        ".blend",
+        ".3ds",
+        ".dae",
+        ".step",
+        ".stp",
+        ".iges",
+        ".igs",
+        # Subtitles
+        ".srt",
+        ".ass",
+        ".ssa",
+        ".vtt",
+        ".sub",
+        ".idx",
+        # Torrent
+        ".torrent",
+        # Disk images
+        ".img",
+        ".nrg",
+        ".cue",
+        ".bin",
+        ".mdf",
+        ".mds",
+        # Game
+        ".rom",
+        ".gba",
+        ".nds",
+        ".n64",
+        ".z64",
+        ".v64",
+        ".smc",
+        ".sfc",
+        ".gb",
+        ".gbc",
+        ".nes",
+        # Programming
+        ".py",
+        ".js",
+        ".ts",
+        ".jsx",
+        ".tsx",
+        ".java",
+        ".cpp",
+        ".c",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".rb",
+        ".go",
+        ".rs",
+        ".swift",
+        ".kt",
+        ".scala",
+        ".php",
+        ".pl",
+        ".lua",
+        ".sql",
+        ".r",
+        ".m",
+        ".mm",
+        ".dart",
+        # Database
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".mdb",
+        ".accdb",
     )
     return any(path.endswith(ext) for ext in direct_extensions)
 
@@ -483,35 +733,127 @@ async def download_with_controls(
                                 response.headers.get("Content-Type", "") or ""
                             ).lower()
                             ct_map = {
+                                # Video
                                 "video/mp4": ".mp4",
                                 "video/x-matroska": ".mkv",
                                 "video/webm": ".webm",
                                 "video/avi": ".avi",
-                                "video/quicktime": ".mov",
                                 "video/x-msvideo": ".avi",
+                                "video/quicktime": ".mov",
+                                "video/x-ms-wmv": ".wmv",
+                                "video/x-flv": ".flv",
+                                "video/mpeg": ".mpg",
+                                "video/3gpp": ".3gp",
+                                "video/3gpp2": ".3g2",
+                                "video/ogg": ".ogv",
+                                "video/mp2t": ".ts",
+                                "video/vnd.dlna.mpeg-tts": ".ts",
+                                "video/x-m4v": ".m4v",
+                                "video/x-ms-asf": ".asf",
+                                # Audio
                                 "audio/mpeg": ".mp3",
                                 "audio/mp4": ".m4a",
                                 "audio/ogg": ".ogg",
                                 "audio/wav": ".wav",
                                 "audio/x-wav": ".wav",
                                 "audio/flac": ".flac",
+                                "audio/aac": ".aac",
+                                "audio/x-aac": ".aac",
+                                "audio/x-ms-wma": ".wma",
+                                "audio/opus": ".opus",
+                                "audio/ape": ".ape",
+                                "audio/ac3": ".ac3",
+                                "audio/x-ac3": ".ac3",
+                                "audio/amr": ".amr",
+                                "audio/midi": ".mid",
+                                "audio/x-midi": ".mid",
+                                "audio/aiff": ".aiff",
+                                "audio/x-aiff": ".aiff",
+                                "audio/basic": ".au",
+                                "audio/webm": ".weba",
+                                # Image
                                 "image/jpeg": ".jpg",
                                 "image/png": ".png",
                                 "image/gif": ".gif",
                                 "image/webp": ".webp",
+                                "image/bmp": ".bmp",
+                                "image/tiff": ".tiff",
+                                "image/svg+xml": ".svg",
+                                "image/x-icon": ".ico",
+                                "image/vnd.microsoft.icon": ".ico",
+                                "image/vnd.adobe.photoshop": ".psd",
+                                "image/x-canon-cr2": ".cr2",
+                                "image/x-nikon-nef": ".nef",
+                                "image/heic": ".heic",
+                                "image/heif": ".heif",
+                                "image/avif": ".avif",
+                                "image/jxr": ".jxr",
+                                # Document
                                 "application/pdf": ".pdf",
+                                "application/msword": ".doc",
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+                                "application/vnd.ms-excel": ".xls",
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+                                "application/vnd.ms-powerpoint": ".ppt",
+                                "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+                                "application/vnd.oasis.opendocument.text": ".odt",
+                                "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+                                "application/vnd.oasis.opendocument.presentation": ".odp",
+                                "application/rtf": ".rtf",
+                                "text/plain": ".txt",
+                                "text/csv": ".csv",
+                                "text/tab-separated-values": ".tsv",
+                                "application/epub+zip": ".epub",
+                                "application/x-mobipocket-ebook": ".mobi",
+                                "application/x-fictionbook+xml": ".fb2",
+                                "image/vnd.djvu": ".djvu",
+                                # Archive / compressed
                                 "application/zip": ".zip",
                                 "application/x-rar-compressed": ".rar",
                                 "application/x-7z-compressed": ".7z",
                                 "application/x-tar": ".tar",
                                 "application/gzip": ".gz",
-                                "application/octet-stream": ".bin",
+                                "application/x-bzip2": ".bz2",
+                                "application/x-xz": ".xz",
+                                "application/x-lzma": ".lzma",
+                                "application/x-lzip": ".lz",
+                                "application/x-iso9660-image": ".iso",
+                                "application/x-apple-diskimage": ".dmg",
+                                "application/x-cd-image": ".iso",
+                                "application/java-archive": ".jar",
+                                # Executable / installer
                                 "application/vnd.android.package-archive": ".apk",
                                 "application/x-ipa": ".ipa",
-                                "application/x-apple-diskimage": ".dmg",
-                                "application/x-iso9660-image": ".iso",
                                 "application/vnd.apple.installer+xml": ".ipa",
                                 "application/x-msdownload": ".exe",
+                                "application/x-msi": ".msi",
+                                "application/x-msdos-program": ".exe",
+                                "application/x-elf": ".elf",
+                                "application/x-sharedlib": ".so",
+                                "application/x-executable": ".bin",
+                                "application/x-debian-package": ".deb",
+                                "application/x-rpm": ".rpm",
+                                "application/x-appimage": ".appimage",
+                                # Font
+                                "font/ttf": ".ttf",
+                                "font/otf": ".otf",
+                                "font/woff": ".woff",
+                                "font/woff2": ".woff2",
+                                "application/x-font-ttf": ".ttf",
+                                "application/x-font-otf": ".otf",
+                                # Torrent
+                                "application/x-bittorrent": ".torrent",
+                                # Subtitles
+                                "text/vtt": ".vtt",
+                                "text/x-srt": ".srt",
+                                "application/x-subrip": ".srt",
+                                "text/x-ass": ".ass",
+                                # 3D
+                                "model/stl": ".stl",
+                                "model/obj": ".obj",
+                                "application/sla": ".stl",
+                                # Fallback binary
+                                "application/octet-stream": ".bin",
                             }
                             for mtype, mext in ct_map.items():
                                 if mtype in ct:
@@ -2721,44 +3063,122 @@ async def generic_url_handler(event):
             if error != "Cancelled by user":
                 await safe_edit(status_msg, f"❌ {error or 'Failed'}")
             return
-        await safe_edit(status_msg, "📤 Uploading...")
-        try:
-            vid_duration, vw, vh = await get_video_info(filepath)
-            is_video = (
-                vid_duration is not None and vid_duration > 0 and vw > 0 and vh > 0
-            )
-            if is_video:
-                mins, secs = divmod(int(vid_duration), 60)
-                hours, mins = divmod(mins, 60)
-                if hours > 0:
-                    dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
-                else:
-                    dur_str = f" | ⏱ {mins}:{secs:02d}"
-            else:
-                dur_str = ""
-            gh_line = ""
-            if GITHUB_ENABLED:
-                await safe_edit(status_msg, "☁️ Uploading to GitHub...")
-                gh_url = await maybe_upload_github(
-                    event.client, event.chat_id, filepath, size
+
+        # Check free space before proceeding
+        fname = os.path.basename(filepath)
+        free_space = get_free_space()
+        file_size = os.path.getsize(filepath)
+
+        if file_size > MAX_PART_SIZE:
+            # Large file — split into parts and upload each separately
+            need_space = file_size + 512 * 1024 * 1024  # extra 512MB margin
+            if free_space < need_space:
+                await safe_edit(
+                    status_msg,
+                    f"❌ Not enough disk space for split & upload.\n"
+                    f"Need: {human_readable_size(need_space)}, Free: {human_readable_size(free_space)}",
                 )
-                if gh_url:
-                    gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-                await safe_edit(status_msg, "📤 Uploading...")
-            await send_file_with_progress(
-                client=event.client,
-                chat_id=event.chat_id,
-                filepath=filepath,
-                caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
-                status_msg=status_msg,
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
+                return
+
+            await safe_edit(
+                status_msg,
+                f"✂️ Splitting large file ({human_readable_size(file_size)}) into parts...",
             )
-        except Exception as e:
-            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
-            return
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
+            parts = await split_file_into_parts(filepath)
+            if not parts:
+                await safe_edit(status_msg, "❌ Failed to split file.")
+                return
+
+            try:
+                os.remove(filepath)
+            except:
+                pass
+
+            total_parts = len(parts)
+            base_name = os.path.basename(filepath)
+            for i, part_path in enumerate(parts):
+                part_size = os.path.getsize(part_path)
+                part_label = os.path.basename(part_path)
+                await safe_edit(
+                    status_msg, f"📤 Uploading part {i + 1}/{total_parts}: {part_label}"
+                )
+                gh_line = ""
+                if GITHUB_ENABLED:
+                    gh_url = await maybe_upload_github(
+                        event.client, event.chat_id, part_path, part_size
+                    )
+                    if gh_url:
+                        gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+                await send_file_with_progress(
+                    client=event.client,
+                    chat_id=event.chat_id,
+                    filepath=part_path,
+                    caption=(
+                        f"📦 {base_name}\n"
+                        f"🧩 Part {i + 1}/{total_parts}\n"
+                        f"📏 {human_readable_size(part_size)}{gh_line}"
+                    ),
+                    status_msg=status_msg,
+                )
+                try:
+                    os.remove(part_path)
+                except:
+                    pass
+
+            join_help = (
+                "To join parts:\n"
+                "Windows: `copy /b file.part001.*+file.part002.*+... output.ext`\n"
+                "Linux/Mac: `cat file.part001.* file.part002.* > output.ext`"
+            )
+            await event.client.send_message(
+                event.chat_id,
+                f"✅ **All {total_parts} parts uploaded!**\n{join_help}",
+                parse_mode="markdown",
+            )
+        else:
+            # Normal file — upload directly
+            await safe_edit(status_msg, "📤 Uploading...")
+            try:
+                vid_duration, vw, vh = await get_video_info(filepath)
+                is_video = (
+                    vid_duration is not None and vid_duration > 0 and vw > 0 and vh > 0
+                )
+                if is_video:
+                    mins, secs = divmod(int(vid_duration), 60)
+                    hours, mins = divmod(mins, 60)
+                    if hours > 0:
+                        dur_str = f" | ⏱ {hours}:{mins:02d}:{secs:02d}"
+                    else:
+                        dur_str = f" | ⏱ {mins}:{secs:02d}"
+                else:
+                    dur_str = ""
+                gh_line = ""
+                if GITHUB_ENABLED:
+                    await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+                    gh_url = await maybe_upload_github(
+                        event.client, event.chat_id, filepath, size
+                    )
+                    if gh_url:
+                        gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+                    await safe_edit(status_msg, "📤 Uploading...")
+                await send_file_with_progress(
+                    client=event.client,
+                    chat_id=event.chat_id,
+                    filepath=filepath,
+                    caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
+                    status_msg=status_msg,
+                )
+            except Exception as e:
+                await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
+                return
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
     finally:
         processing_messages.discard(msg_id)
 
