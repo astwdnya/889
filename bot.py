@@ -1141,7 +1141,8 @@ async def send_file_with_progress(
     ext = os.path.splitext(filepath)[1].lower()
 
     if ul_id:
-        active_uploads[ul_id] = {"paused": False, "cancelled": False}
+        if ul_id not in active_uploads:
+            active_uploads[ul_id] = {"paused": False, "cancelled": False}
 
     duration, width, height = await get_video_info(filepath)
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
@@ -1340,7 +1341,7 @@ async def send_file_with_progress(
             except Exception:
                 pass
 
-    if not ul_id:
+    if not ul_id and status_msg:
         try:
             await status_msg.delete()
         except Exception:
@@ -3180,6 +3181,7 @@ async def generic_url_handler(event):
                             os.remove(remaining)
                         except:
                             pass
+                    upload_failed = True
                     break
                 part_size = os.path.getsize(part_path)
                 part_label = os.path.basename(part_path)
@@ -3233,25 +3235,22 @@ async def generic_url_handler(event):
                 except:
                     pass
 
-                # Re-add ul_id for cancellation detection between parts
-                if ul_id_all not in active_uploads:
-                    active_uploads[ul_id_all] = {"paused": False, "cancelled": False}
-
             active_uploads.pop(ul_id_all, None)
 
-            orig_fname = os.path.basename(filepath)
-            join_help = (
-                "📎 **Join parts into one file:**\n\n"
-                f"**Linux/Mac:**\n"
-                f'`cat "{orig_fname}.part*" > "{orig_fname}"`\n\n'
-                f"**Windows (CMD):**\n"
-                f'`copy /b "{orig_fname}.part*" "{orig_fname}"`'
-            )
-            await event.client.send_message(
-                event.chat_id,
-                f"✅ **All {total_parts} parts uploaded!**\n{join_help}",
-                parse_mode="markdown",
-            )
+            if not upload_failed:
+                orig_fname = os.path.basename(filepath)
+                join_help = (
+                    "📎 **Join parts into one file:**\n\n"
+                    f"**Linux/Mac:**\n"
+                    f'`cat "{orig_fname}.part*" > "{orig_fname}"`\n\n'
+                    f"**Windows (CMD):**\n"
+                    f'`copy /b "{orig_fname}.part*" "{orig_fname}"`'
+                )
+                await event.client.send_message(
+                    event.chat_id,
+                    f"✅ **All {total_parts} parts uploaded!**\n{join_help}",
+                    parse_mode="markdown",
+                )
         else:
             # Normal file — upload directly
             await safe_edit(status_msg, "📤 Uploading...")
@@ -3540,8 +3539,8 @@ async def process_y2mate_request(event, url: str, status_msg):
 async def _flush_video_send_batch(batch_key: str, client, chat_id: int, reply_to_id: int):
     """بعد از ۳ ثانیه، پیام batch ویدیو رو ارسال میکنه."""
     await asyncio.sleep(3)
-    batch = video_send_pending.pop(batch_key, None)
     video_send_timers.pop(batch_key, None)
+    batch = video_send_pending.get(batch_key)
     if not batch or not batch.get("files"):
         return
 
