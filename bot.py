@@ -77,6 +77,11 @@ GITHUB_ENABLED: bool = False
 # نگه‌داری فایل‌های ویدیویی که کاربر فرستاده و منتظر تأیید گیتهاب هستن
 video_github_pending: Dict[str, Dict] = {}
 
+# نگه‌داری فایل‌های ویدیویی که باید به صورت video ارسال بشن (batch)
+video_send_pending: Dict[str, Dict] = {}
+# تسک‌های تایمر batch ویدیو
+video_send_timers: Dict[str, asyncio.Task] = {}
+
 
 # ====================== DISK UTILITIES ======================
 def get_free_space(path: str = OUTPUT_FOLDER) -> int:
@@ -3234,13 +3239,13 @@ async def generic_url_handler(event):
 
             active_uploads.pop(ul_id_all, None)
 
-            part_names = [os.path.basename(p) for p in parts]
             orig_fname = os.path.basename(filepath)
-            win_cmd = "copy /b " + "+".join(part_names) + " " + orig_fname
             join_help = (
-                "To join parts:\n"
-                f"Windows: `{win_cmd}`\n"
-                f"Linux/Mac: `cat {orig_fname}.part* > {orig_fname}`"
+                "📎 **Join parts into one file:**\n\n"
+                f"**Linux/Mac:**\n"
+                f'`cat "{orig_fname}.part*" > "{orig_fname}"`\n\n'
+                f"**Windows (CMD):**\n"
+                f'`copy /b "{orig_fname}.part*" "{orig_fname}"`'
             )
             await event.client.send_message(
                 event.chat_id,
@@ -3532,44 +3537,119 @@ async def process_y2mate_request(event, url: str, status_msg):
 # ====================== VIDEO RECEIVE -> GITHUB OFFER ======================
 
 
+async def _flush_video_send_batch(batch_key: str, client, chat_id: int, reply_to_id: int):
+    """بعد از ۳ ثانیه، پیام batch ویدیو رو ارسال میکنه."""
+    await asyncio.sleep(3)
+    batch = video_send_pending.pop(batch_key, None)
+    video_send_timers.pop(batch_key, None)
+    if not batch or not batch.get("files"):
+        return
+
+    files = batch["files"]
+    count = len(files)
+    total_size = sum(f["file_size"] for f in files)
+    size_str = human_readable_size(total_size)
+
+    lines = [f"🎬 **{count} video file{'s' if count > 1 else ''} received** — {size_str}\n"]
+    for i, f in enumerate(files, 1):
+        lines.append(f"  {i}. `{f['filename']}` ({human_readable_size(f['file_size'])})")
+
+    buttons = [
+        [Button.inline(f"▶️ Send as Video ({count} file{'s' if count > 1 else ''})", f"vsend_{batch_key}")]
+    ]
+
+    if GITHUB_ENABLED:
+        buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])
+
+    try:
+        await client.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="markdown",
+            buttons=buttons,
+            reply_to=reply_to_id,
+        )
+    except Exception as e:
+        logger.warning(f"[VBATCH] Failed to send batch message: {e}")
+
+
 async def video_receive_handler(event):
-    """وقتی کاربر ویدیو میفرسته و GITHUB_ENABLED فعاله، یه دکمه پیشنهاد آپلود به گیتهاب میده."""
+    """وقتی کاربر ویدیو/document ویدیویی میفرسته:
+    - ۳ ثانیه صبر میکنه تا فایل‌های بیشتری جمع بشه (batch)
+    - یه دکمه 'ارسال به عنوان ویدیو' نشون میده
+    - اگه GITHUB_ENABLED باشه، دکمه گیتهاب هم نشون میده
+    """
     if event.sender_id not in AUTHORIZED_USERS:
         return
-    if not GITHUB_ENABLED:
-        return
-    # فقط ویدیو — document های غیر ویدیو رو رد کن
+
+    # تشخیص ویدیو: video یا document با mime_type ویدیو
     media = event.video or event.document
     if not media:
         return
-    # بررسی mime type
     mime = getattr(media, "mime_type", "") or ""
-    if not mime.startswith("video/") and not (event.video):
+    is_video_mime = mime.startswith("video/")
+    is_video_attr = bool(event.video)
+    # بررسی پسوند فایل برای document هایی که mime ویدیو ندارن
+    fname_attr = ""
+    for attr in getattr(media, "attributes", []):
+        fn = getattr(attr, "file_name", None)
+        if fn:
+            fname_attr = fn
+            break
+    video_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+                  ".m4v", ".mpg", ".mpeg", ".3gp", ".ts", ".mts", ".ogv", ".rmvb", ".f4v"}
+    ext = os.path.splitext(fname_attr)[1].lower() if fname_attr else ""
+    is_video_ext = ext in video_exts
+
+    if not (is_video_mime or is_video_attr or is_video_ext):
         return
+
     file_size = getattr(media, "size", 0) or 0
-    if file_size == 0 or file_size > GITHUB_MAX_MB * 1024 * 1024:
-        return  # بزرگتر از حد مجاز — نادیده بگیر
+    if file_size == 0:
+        return
 
-    pending_id = f"vgh_{event.chat_id}_{event.id}_{int(time.time())}"
-    video_github_pending[pending_id] = {
-        "chat_id": event.chat_id,
-        "message_id": event.id,
-        "file_size": file_size,
-    }
+    filename = fname_attr or f"video_{event.id}{ext or '.mp4'}"
 
-    size_str = human_readable_size(file_size)
-    await event.reply(
-        f"☁️ **GitHub Upload**\n"
-        f"📦 Size: {size_str}\n\n"
-        f"Do you want to upload this video to GitHub and get a direct download link?",
-        parse_mode="markdown",
-        buttons=[
-            [
-                Button.inline("✅ Yes, upload to GitHub", f"vgh_yes_{pending_id}"),
-                Button.inline("❌ No", f"vgh_no_{pending_id}"),
-            ]
-        ],
+    # batch key برای این چت
+    batch_key = f"vbatch_{event.chat_id}"
+
+    if batch_key in video_send_pending:
+        # اضافه کردن به batch موجود
+        video_send_pending[batch_key]["files"].append({
+            "message_id": event.id,
+            "file_size": file_size,
+            "filename": filename,
+        })
+        # ریست تایمر
+        old_task = video_send_timers.pop(batch_key, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+    else:
+        # batch جدید
+        video_send_pending[batch_key] = {
+            "chat_id": event.chat_id,
+            "reply_to_id": event.id,
+            "files": [{
+                "message_id": event.id,
+                "file_size": file_size,
+                "filename": filename,
+            }],
+        }
+
+    # شروع (یا ریست) تایمر ۳ ثانیه‌ای
+    task = asyncio.get_event_loop().create_task(
+        _flush_video_send_batch(batch_key, event.client, event.chat_id, event.id)
     )
+    video_send_timers[batch_key] = task
+
+    # اگه فقط github offer قبلی هم لازم بود (وقتی GITHUB_ENABLED بود):
+    if GITHUB_ENABLED and file_size <= GITHUB_MAX_MB * 1024 * 1024:
+        pending_id = f"vgh_{event.chat_id}_{event.id}_{int(time.time())}"
+        video_github_pending[pending_id] = {
+            "chat_id": event.chat_id,
+            "message_id": event.id,
+            "file_size": file_size,
+        }
 
 
 async def vgh_yes_callback(event):
@@ -3653,6 +3733,86 @@ async def vgh_no_callback(event):
     await event.answer("OK", alert=False)
     try:
         await event.delete()
+    except Exception:
+        pass
+
+
+async def vsend_callback(event):
+    """دانلود فایل‌های ویدیویی از تلگرام و ارسال مجدد به عنوان video با تایتل فایل."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    batch_key = event.data.decode().replace("vsend_", "")
+    batch = video_send_pending.pop(batch_key, None)
+    if not batch:
+        return await event.answer("❌ Session expired or already processed.", alert=True)
+
+    await event.answer("⏳ Sending as video...", alert=False)
+    chat_id = batch["chat_id"]
+    files = batch["files"]
+    total = len(files)
+
+    try:
+        await event.edit(f"⏳ Downloading and sending {total} video{'s' if total > 1 else ''}...", buttons=None)
+    except Exception:
+        pass
+
+    sent = 0
+    for i, file_info in enumerate(files):
+        msg_id = file_info["message_id"]
+        filename = file_info["filename"]
+        title = os.path.splitext(filename)[0]
+
+        tmp_path = os.path.join(OUTPUT_FOLDER, f"vsend_{int(time.time())}_{i}_{filename}")
+        try:
+            msg = await event.client.get_messages(chat_id, ids=msg_id)
+            if not msg:
+                logger.warning(f"[VSEND] Message {msg_id} not found")
+                continue
+
+            try:
+                await event.edit(f"⬇️ Downloading {i+1}/{total}: `{filename}`...", parse_mode="markdown", buttons=None)
+            except Exception:
+                pass
+
+            await event.client.download_media(msg, file=tmp_path)
+
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                logger.warning(f"[VSEND] Download failed for {filename}")
+                continue
+
+            try:
+                await event.edit(f"📤 Uploading {i+1}/{total}: `{filename}`...", parse_mode="markdown", buttons=None)
+            except Exception:
+                pass
+
+            ul_id = f"vsend_{chat_id}_{msg_id}"
+            active_uploads[ul_id] = {"paused": False, "cancelled": False}
+            try:
+                await send_file_with_progress(
+                    client=event.client,
+                    chat_id=chat_id,
+                    filepath=tmp_path,
+                    caption=title,
+                    status_msg=None,
+                    ul_id=ul_id,
+                )
+                sent += 1
+            finally:
+                active_uploads.pop(ul_id, None)
+
+        except Exception as e:
+            logger.error(f"[VSEND] Error sending {filename}: {e}", exc_info=True)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    try:
+        result_text = f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
+        await event.edit(result_text, buttons=None)
     except Exception:
         pass
 
@@ -4407,6 +4567,9 @@ async def main():
     )
     client.add_event_handler(
         vgh_no_callback, events.CallbackQuery(pattern=r"vgh_no_(.+)")
+    )
+    client.add_event_handler(
+        vsend_callback, events.CallbackQuery(pattern=r"vsend_(.+)")
     )
     client.add_event_handler(
         snapwc_select_callback, events.CallbackQuery(pattern=r"snapwc_q_(.+)")
