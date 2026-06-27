@@ -82,6 +82,9 @@ video_send_pending: Dict[str, Dict] = {}
 # تسک‌های تایمر batch ویدیو
 video_send_timers: Dict[str, asyncio.Task] = {}
 
+# نگه‌داری ویدیوهایی که منتظر فایل زیرنویس هستن
+subtitle_sessions: Dict[int, Dict] = {}  # key: chat_id
+
 
 # ====================== DISK UTILITIES ======================
 def get_free_space(path: str = OUTPUT_FOLDER) -> int:
@@ -2087,6 +2090,62 @@ async def compress_video(
                 pass
 
 
+
+# ====================== SUBTITLE BURN-IN ======================
+async def burn_subtitle(
+    video_path: str,
+    subtitle_path: str,
+    status_msg,
+) -> Tuple[Optional[str], str]:
+    """
+    زیرنویس رو روی ویدیو می‌سوزونه (hard subtitle).
+    رنگ زرد با outline سیاه.
+    """
+    output_path = os.path.join(
+        OUTPUT_FOLDER, f"subbed_{int(time.time())}.mp4"
+    )
+    sub_ext = os.path.splitext(subtitle_path)[1].lower()
+
+    # escape مسیر فایل برای ffmpeg filter — کاراکترهای خاص رو escape کن
+    escaped_sub = subtitle_path.replace("\\", "/").replace(":", "\\:")
+
+    if sub_ext in (".ass", ".ssa"):
+        # فایل ASS استایل خودش رو داره، فقط override رنگ و outline میکنیم
+        vf = f"ass={escaped_sub}"
+    else:
+        # SRT و بقیه — استایل دستی: زرد با outline سیاه
+        vf = (
+            f"subtitles={escaped_sub}:force_style='"
+            "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFF00,"
+            "OutlineColour=&H00000000,Outline=2,Shadow=1,"
+            "Bold=1,Alignment=2'"
+        )
+
+    await safe_edit(status_msg, "🔥 Burning subtitles into video...")
+
+    args = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    rc, err = await _run_ffmpeg(args)
+    if rc != 0:
+        logger.error(f"[SUBTITLE] FFmpeg error: {err[-300:]}")
+        return None, f"FFmpeg error: {err[-200:]}"
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return None, "Output file is empty or missing."
+
+    return output_path, "✅ Subtitles burned successfully"
+
+
 # ====================== DIRPY FLOW ======================
 processing_messages = set()
 
@@ -3557,6 +3616,10 @@ async def _flush_video_send_batch(batch_key: str, client, chat_id: int, reply_to
         [Button.inline(f"▶️ Send as Video ({count} file{'s' if count > 1 else ''})", f"vsend_{batch_key}")]
     ]
 
+    # دکمه زیرنویس فقط برای یه فایل منطقی‌تره
+    if count == 1:
+        buttons.append([Button.inline("🔤 Burn Subtitle", f"subburn_{batch_key}")])
+
     if GITHUB_ENABLED:
         buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])
 
@@ -3812,6 +3875,189 @@ async def vsend_callback(event):
     try:
         result_text = f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
         await event.edit(result_text, buttons=None)
+    except Exception:
+        pass
+
+
+
+# ====================== SUBTITLE HANDLER ======================
+
+
+async def subburn_callback(event):
+    """دکمه Burn Subtitle — ویدیو رو دانلود میکنه و منتظر فایل زیرنویس میمونه."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    batch_key = event.data.decode().replace("subburn_", "")
+    batch = video_send_pending.pop(batch_key, None)
+    if not batch or not batch.get("files"):
+        return await event.answer("❌ Session expired.", alert=True)
+
+    await event.answer("⬇️ Downloading video...", alert=False)
+    chat_id = batch["chat_id"]
+    file_info = batch["files"][0]
+    msg_id = file_info["message_id"]
+    filename = file_info["filename"]
+
+    try:
+        await event.edit(f"⬇️ Downloading `{filename}`...", parse_mode="markdown", buttons=None)
+    except Exception:
+        pass
+
+    tmp_path = os.path.join(OUTPUT_FOLDER, f"subvid_{int(time.time())}_{filename}")
+    try:
+        msg = await event.client.get_messages(chat_id, ids=msg_id)
+        if not msg:
+            await event.edit("❌ Could not find the video message.", buttons=None)
+            return
+        await event.client.download_media(msg, file=tmp_path)
+    except Exception as e:
+        try:
+            await event.edit(f"❌ Download failed: {str(e)[:80]}", buttons=None)
+        except Exception:
+            pass
+        return
+
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        try:
+            await event.edit("❌ Download failed.", buttons=None)
+        except Exception:
+            pass
+        return
+
+    # ذخیره session و منتظر زیرنویس
+    prompt_msg = await event.client.send_message(
+        chat_id,
+        "🔤 **Send the subtitle file** (`.srt`, `.ass`, `.ssa`)\n\nVideo is ready and waiting.",
+        parse_mode="markdown",
+        buttons=[[Button.inline("❌ Cancel", f"subcancl_{chat_id}")]],
+    )
+    subtitle_sessions[chat_id] = {
+        "video_path": tmp_path,
+        "status_msg_id": prompt_msg.id,
+    }
+    try:
+        await event.edit(f"✅ Video downloaded. Now send the subtitle file.", buttons=None)
+    except Exception:
+        pass
+
+
+async def subtitle_receive_handler(event):
+    """وقتی کاربر فایل زیرنویس میفرسته و قبلاً ویدیو داده، burn-in میکنه."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return
+
+    chat_id = event.chat_id
+    session = subtitle_sessions.get(chat_id)
+    if not session:
+        return
+
+    # چک کن که document هست و پسوند زیرنویس داره
+    doc = event.document
+    if not doc:
+        return
+    fname = ""
+    for attr in getattr(doc, "attributes", []):
+        fn = getattr(attr, "file_name", None)
+        if fn:
+            fname = fn
+            break
+    sub_ext = os.path.splitext(fname)[1].lower()
+    if sub_ext not in (".srt", ".ass", ".ssa", ".vtt", ".sub"):
+        return
+
+    # این handler اولویت داره — بقیه handler ها نباید اجرا بشن
+    raise_stop = True
+
+    video_path = session.get("video_path")
+    status_msg_id = session.get("status_msg_id")
+    subtitle_sessions.pop(chat_id, None)
+
+    # پاک کردن پیام "منتظر زیرنویس"
+    if status_msg_id:
+        try:
+            await event.client.delete_messages(chat_id, status_msg_id)
+        except Exception:
+            pass
+
+    if not video_path or not os.path.exists(video_path):
+        await event.reply("❌ Video file expired. Please send the video again.")
+        raise events.StopPropagation
+
+    status_msg = await event.reply("⬇️ Downloading subtitle file...")
+
+    # دانلود فایل زیرنویس
+    sub_path = os.path.join(OUTPUT_FOLDER, f"sub_{int(time.time())}{sub_ext}")
+    try:
+        await event.client.download_media(event.message, file=sub_path)
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Failed to download subtitle: {str(e)[:80]}")
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+        raise events.StopPropagation
+
+    if not os.path.exists(sub_path) or os.path.getsize(sub_path) == 0:
+        await safe_edit(status_msg, "❌ Subtitle file is empty.")
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+        raise events.StopPropagation
+
+    # burn subtitle
+    output_path, result_msg = await burn_subtitle(video_path, sub_path, status_msg)
+
+    # cleanup موقت‌ها
+    for p in (video_path, sub_path):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+    if not output_path:
+        await safe_edit(status_msg, f"❌ {result_msg}")
+        raise events.StopPropagation
+
+    # آپلود نتیجه
+    out_size = os.path.getsize(output_path)
+    await safe_edit(status_msg, "📤 Uploading...")
+    ul_id = f"sub_{chat_id}_{event.id}"
+    try:
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=chat_id,
+            filepath=output_path,
+            caption=f"🎬 {os.path.splitext(os.path.basename(output_path))[0]} • {human_readable_size(out_size)}",
+            status_msg=status_msg,
+            ul_id=ul_id,
+        )
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:80]}")
+    finally:
+        active_uploads.pop(ul_id, None)
+        try:
+            os.remove(output_path)
+        except Exception:
+            pass
+
+    raise events.StopPropagation
+
+
+async def subtitle_cancel_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    chat_id = int(event.data.decode().replace("subcancl_", ""))
+    session = subtitle_sessions.pop(chat_id, None)
+    if session:
+        try:
+            os.remove(session["video_path"])
+        except Exception:
+            pass
+    await event.answer("Cancelled", alert=False)
+    try:
+        await event.delete()
     except Exception:
         pass
 
@@ -4571,6 +4817,12 @@ async def main():
         vsend_callback, events.CallbackQuery(pattern=r"vsend_(.+)")
     )
     client.add_event_handler(
+        subburn_callback, events.CallbackQuery(pattern=r"subburn_(.+)")
+    )
+    client.add_event_handler(
+        subtitle_cancel_callback, events.CallbackQuery(pattern=r"subcancl_(.+)")
+    )
+    client.add_event_handler(
         snapwc_select_callback, events.CallbackQuery(pattern=r"snapwc_q_(.+)")
     )
     client.add_event_handler(
@@ -4629,6 +4881,10 @@ async def main():
     # ===== Message handlers (order matters - specific before generic) =====
     client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
     client.add_event_handler(size_input_handler, events.NewMessage(incoming=True))
+    client.add_event_handler(
+        subtitle_receive_handler,
+        events.NewMessage(incoming=True, func=lambda e: bool(e.document)),
+    )
     client.add_event_handler(
         video_receive_handler,
         events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)),
