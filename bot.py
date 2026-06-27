@@ -1239,18 +1239,24 @@ async def send_file_with_progress(
         sent = None
         try:
             with open(filepath, "rb") as f:
-                uploaded = await fast_upload_file(
-                    client, f, progress_callback=progress_cb, connection_count=15
+                uploaded = await asyncio.wait_for(
+                    fast_upload_file(
+                        client, f, progress_callback=progress_cb, connection_count=15
+                    ),
+                    timeout=1200,  # 20 min per part
                 )
+        except asyncio.TimeoutError:
+            try:
+                await status_msg.edit("🚫 Upload timed out (20min).", buttons=None)
+            except Exception:
+                pass
+            raise
         except asyncio.CancelledError:
             try:
                 await status_msg.edit("🚫 Upload cancelled.", buttons=None)
             except Exception:
                 pass
             raise
-
-        if ul_id:
-            active_uploads.pop(ul_id, None)
 
         if is_video:
             duration_int = int(duration) if duration else 0
@@ -3267,15 +3273,18 @@ async def generic_url_handler(event):
                     if gh_url:
                         gh_line = f"\n☁️ [GitHub DL]({gh_url})"
                     await safe_edit(status_msg, "📤 Uploading...")
+                _ul_id = f"ul_{event.chat_id}_{event.id}"
                 await send_file_with_progress(
                     client=event.client,
                     chat_id=event.chat_id,
                     filepath=filepath,
                     caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
                     status_msg=status_msg,
-                    ul_id=f"ul_{event.chat_id}_{event.id}",
+                    ul_id=_ul_id,
                 )
+                active_uploads.pop(_ul_id, None)
             except Exception as e:
+                active_uploads.pop(_ul_id, None)
                 await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
                 return
             try:
