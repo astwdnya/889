@@ -172,12 +172,12 @@ async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
             convert_selectors = [
                 'li[role="tab"]',
                 'a[role="tab"]',
-                '.nav-tabs li',
-                '.tabs li',
-                '[data-tab]',
-                '.tab',
-                'button.tab',
-                '.nav-link',
+                ".nav-tabs li",
+                ".tabs li",
+                "[data-tab]",
+                ".tab",
+                "button.tab",
+                ".nav-link",
             ]
 
             for selector in convert_selectors:
@@ -424,10 +424,8 @@ async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
                     progress_cb(f"⚠️ Round {rd + 1}: {str(e)[:80]}")
 
                 rd += 1
-                elapsed = rd * 3
-                if rd >= 120:
-                    progress_cb("❌ Timeout waiting for conversion")
-                    break
+                if rd % 100 == 0:
+                    progress_cb(f"⏳ Still converting... ({rd * 3}s elapsed)")
 
             return ["❌ Download link not found"]
 
@@ -440,7 +438,6 @@ async def _async_extract_savep_v2(video_url, progress_cb, stop_event=None):
                     await browser.close()
                 except Exception:
                     pass
-
 
 
 # نگهداری stop_event ها برای cancel کردن از callback
@@ -511,7 +508,9 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         await update_status("🌐 **Opening browser...**")
-        links = await _async_extract_savep_v2(url, sync_progress_cb, stop_event=stop_event)
+        links = await _async_extract_savep_v2(
+            url, sync_progress_cb, stop_event=stop_event
+        )
     finally:
         progress_task.cancel()
         try:
@@ -553,10 +552,16 @@ async def process_savep_request(event, url, safe_edit_fn, send_file_fn, download
     )
 
     if not success or not os.path.exists(filepath):
-        await safe_edit_fn(status_msg, f"❌ **Download failed:** `{dl_error}`", buttons=None)
+        await safe_edit_fn(
+            status_msg, f"❌ **Download failed:** `{dl_error}`", buttons=None
+        )
         return
     if final_size < 1024:
-        await safe_edit_fn(status_msg, f"❌ **Download failed:** File too small ({final_size}B)", buttons=None)
+        await safe_edit_fn(
+            status_msg,
+            f"❌ **Download failed:** File too small ({final_size}B)",
+            buttons=None,
+        )
         try:
             os.remove(filepath)
         except Exception:
