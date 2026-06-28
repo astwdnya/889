@@ -3389,9 +3389,8 @@ async def generic_url_handler(event):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
         )
-        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
-            await _run_snapwc_flow(event, target_url, status_msg)
+            await _run_snapwc_flow(event, target_url, None)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -4813,6 +4812,9 @@ async def snapwc_command(event):
 
 
 async def _run_snapwc_flow(event, url, status_msg):
+
+    if status_msg is None:
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
 
     session = SnapWCSession()
     try:

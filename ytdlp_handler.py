@@ -92,11 +92,21 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
             "--no-warnings",
             "--dump-json",
             "--skip-download",
+            "--add-header",
+            f"User-Agent:{USER_AGENT}",
             url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            return [], "yt-dlp timed out (30s)"
         if process.returncode != 0:
             stderr_text = stderr.decode(errors="replace")[:300]
             return [], f"yt-dlp error: {stderr_text}"
@@ -104,7 +114,8 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
         try:
             data = json.loads(stdout.decode(errors="replace"))
         except json.JSONDecodeError:
-            return [], "Failed to parse yt-dlp output"
+            stderr_text = stderr.decode(errors="replace")[:300]
+            return [], f"Failed to parse yt-dlp output: {stderr_text}"
     except FileNotFoundError:
         return [], "yt-dlp not found on server"
     except Exception as e:
@@ -124,6 +135,18 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
 
     formats = data.get("formats", [])
     if not formats:
+        direct_url = data.get("url", "")
+        if direct_url:
+            qualities.append(
+                {
+                    "label": "🎥 Video (best)",
+                    "format_id": "best",
+                    "method": "ytdlp",
+                    "ext": "mp4",
+                    "height": 0,
+                }
+            )
+            return qualities, title if title else "video"
         return [], "No formats found"
 
     formats.sort(
