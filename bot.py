@@ -43,7 +43,27 @@ from github import (
     GITHUB_BASE_DIR,
 )
 from savep_handler import process_savep_request, trigger_savep_cancel
-from xnxx_handler import is_xnxx_url, extract_xnxx_qualities, download_xnxx_direct, download_xnxx_m3u8, xnxx_sessions
+from xnxx_handler import (
+    is_xnxx_url,
+    extract_xnxx_qualities,
+    download_xnxx_direct,
+    download_xnxx_m3u8,
+    xnxx_sessions,
+)
+from ytdlp_handler import (
+    is_ytdlp_site_url,
+    extract_qualities_ytdlp,
+    download_with_ytdlp,
+    ytdlp_sessions,
+    is_xhamster_url,
+    is_xvideos_url,
+    is_pornhub_url,
+    is_inxxx_url,
+    is_hentaiheaven_url,
+    is_tube8_url,
+    is_pornhat_url,
+    get_site_name,
+)
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
@@ -3365,22 +3385,14 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
-    if (
-        "pornhub.com" in target_url
-        or "xvideos.com" in target_url
-        or "xhamster.com" in target_url
-    ):
-        logger.info(
-            f"[URL] Adult site detected, routing via SaveTheVideo | url={target_url[:120]}"
-        )
-        await process_savep_request(
-            event=event,
-            url=target_url,
-            safe_edit_fn=safe_edit,
-            send_file_fn=send_file_with_progress,
-            download_dir=OUTPUT_FOLDER,
-        )
-        processing_messages.discard(msg_id)
+    if is_ytdlp_site_url(target_url):
+        site_name = get_site_name(target_url)
+        logger.info(f"[URL] {site_name} detected via yt-dlp | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_ytdlp_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
         return
 
     logger.info(
@@ -5438,10 +5450,8 @@ async def savep_cancel_callback(event):
             pass
 
 
-
-
-
 # ====================== XNXX HANDLER ======================
+
 
 async def process_xnxx_request(event, url: str, status_msg):
     qualities, title = await extract_xnxx_qualities(url)
@@ -5497,15 +5507,21 @@ async def xnxx_quality_callback(event):
 
     try:
         if chosen["method"] == "direct":
-            success, error, size = await download_xnxx_direct(chosen["url"], filepath, progress_cb)
+            success, error, size = await download_xnxx_direct(
+                chosen["url"], filepath, progress_cb
+            )
         else:
-            success, error, size = await download_xnxx_m3u8(chosen["url"], filepath, progress_cb)
+            success, error, size = await download_xnxx_m3u8(
+                chosen["url"], filepath, progress_cb
+            )
         if not success or not os.path.exists(filepath) or size < 1024:
             err_msg = error or "Unknown error"
             await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
             return
         await safe_edit(status_msg, "📤 **در حال آپلود...**")
-        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        caption = (
+            f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        )
         await send_file_with_progress(
             client=event.client,
             chat_id=entry["chat_id"],
@@ -5535,6 +5551,106 @@ async def xnxx_cancel_callback(event):
         await event.edit("❌ **لغو شد.**", buttons=None)
     except Exception:
         pass
+
+
+# ====================== YT-DLP GENERIC HANDLER ======================
+
+
+async def process_ytdlp_request(event, url: str, status_msg):
+    qualities, title = await extract_qualities_ytdlp(url)
+    if not qualities:
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
+        return
+    session_id = f"ytdlp_{event.chat_id}_{event.id}_{int(time.time())}"
+    ytdlp_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو"
+    site_name = get_site_name(url).upper()
+    text = f"🎬 **{title_display}**\n🌐 {site_name}\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"ytdlp_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"ytdlp_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def ytdlp_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in ytdlp_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = ytdlp_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "video"
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+    try:
+        await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_with_ytdlp(
+            entry["url"], chosen["format_id"], filepath, progress_cb
+        )
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = (
+            f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        )
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+        )
+    except Exception as e:
+        logger.error(f"[YTDLP] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def ytdlp_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("ytdlp_cancel_", "")
+    ytdlp_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
 
 async def main():
     print("\n" + "=" * 60)
@@ -5657,6 +5773,12 @@ async def main():
     )
     client.add_event_handler(
         xnxx_cancel_callback, events.CallbackQuery(pattern=r"xnxx_cancel_.+")
+    )
+    client.add_event_handler(
+        ytdlp_quality_callback, events.CallbackQuery(pattern=r"ytdlp_q_.+")
+    )
+    client.add_event_handler(
+        ytdlp_cancel_callback, events.CallbackQuery(pattern=r"ytdlp_cancel_.+")
     )
 
     # ===== Command handlers =====
