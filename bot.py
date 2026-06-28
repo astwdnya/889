@@ -75,6 +75,9 @@ y2mate_sessions: Dict[str, dict] = {}  # Y2Mate session cache
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
 
+# burn subtitle — با /sub فعال/غیرفعال میشه
+SUB_BURN_ENABLED: bool = False
+
 # نگه‌داری فایل‌های ویدیویی که کاربر فرستاده و منتظر تأیید گیتهاب هستن
 video_github_pending: Dict[str, Dict] = {}
 
@@ -1948,6 +1951,59 @@ async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
         return None, 0, 0
 
 
+PERSIAN_SUB_TAGS = {"fa", "farsi", "persian", "parsi"}
+
+
+async def extract_persian_subtitle(video_path: str) -> Optional[str]:
+    """
+    با ffprobe چک میکنه ویدیو soft subtitle فارسی داره یا نه.
+    اگه داشت، با ffmpeg اون stream رو به فایل .srt اکسترکت میکنه.
+    برمیگردونه: مسیر فایل srt یا None
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-select_streams", "s",
+        video_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+
+    try:
+        info = json.loads(stdout.decode())
+        streams = info.get("streams", [])
+    except Exception:
+        return None
+
+    target_index = None
+    for s in streams:
+        tags = s.get("tags", {})
+        lang = (tags.get("language") or tags.get("title") or "").lower().strip()
+        if any(tag in lang for tag in PERSIAN_SUB_TAGS):
+            target_index = s.get("index")
+            break
+
+    if target_index is None:
+        return None
+
+    out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
+    proc2 = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", video_path,
+        "-map", f"0:{target_index}",
+        "-c:s", "srt",
+        out_srt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc2.communicate()
+
+    if os.path.exists(out_srt) and os.path.getsize(out_srt) > 0:
+        return out_srt
+    return None
+
+
 async def compress_video(
     input_path: str, target_size_bytes: int, status_msg: Message
 ) -> Tuple[Optional[str], str]:
@@ -2803,6 +2859,33 @@ async def admin_cancel_callback(event):
         pass
 
 
+async def sub_cmd(event):
+    global SUB_BURN_ENABLED
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    SUB_BURN_ENABLED = not SUB_BURN_ENABLED
+    status = "✅ ON" if SUB_BURN_ENABLED else "🔴 OFF"
+    await event.reply(
+        f"🔤 **Subtitle Burn Mode: {status}**\n\n"
+        + (
+            "From now on, when a video is downloaded:\n"
+            "• If it has a Persian soft subtitle → burned automatically\n"
+            "• If not → you'll be asked to send a subtitle file"
+            if SUB_BURN_ENABLED
+            else "Videos will be uploaded directly without subtitle processing."
+        ),
+        parse_mode="markdown",
+    )
+
+
+async def suboff_cmd(event):
+    global SUB_BURN_ENABLED
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    SUB_BURN_ENABLED = False
+    await event.reply("🔴 **Subtitle Burn Mode: OFF**\nVideos will be uploaded directly without subtitle processing.", parse_mode="markdown")
+
+
 async def startgithub_cmd(event):
     global GITHUB_ENABLED
     logger.info(f"[CMD] /startgithub from user={event.sender_id}")
@@ -3328,6 +3411,87 @@ async def generic_url_handler(event):
                         dur_str = f" | ⏱ {mins}:{secs:02d}"
                 else:
                     dur_str = ""
+
+                # ── Subtitle burn flow ──────────────────────────────────
+                if is_video and SUB_BURN_ENABLED:
+                    orig_name = os.path.basename(filepath)
+
+                    # چک soft subtitle فارسی
+                    await safe_edit(status_msg, "🔍 Checking for Persian subtitle...")
+                    persian_sub = await extract_persian_subtitle(filepath)
+
+                    if persian_sub:
+                        # soft sub فارسی پیدا شد — مستقیم burn میکنیم
+                        await safe_edit(status_msg, "🔤 Persian subtitle found! Sending to HappyScribe...")
+
+                        async def _prog(text):
+                            await safe_edit(status_msg, text)
+
+                        dl_url, err = await hardcode_subtitle_online(
+                            video_path=filepath,
+                            subtitle_path=persian_sub,
+                            progress_callback=_prog,
+                        )
+                        try:
+                            os.remove(persian_sub)
+                        except Exception:
+                            pass
+
+                        if dl_url:
+                            # دانلود نتیجه
+                            out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
+                            out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+                            await safe_edit(status_msg, "⬇️ Downloading result...")
+                            try:
+                                async with aiohttp.ClientSession() as sess:
+                                    async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                                        if resp.status == 200:
+                                            async with aiofiles.open(out_path, "wb") as f:
+                                                async for chunk in resp.content.iter_chunked(524288):
+                                                    await f.write(chunk)
+                            except Exception as e:
+                                await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+                                out_path = None
+
+                            if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                                try:
+                                    os.remove(filepath)
+                                except Exception:
+                                    pass
+                                filepath = out_path
+                                size = os.path.getsize(filepath)
+                                orig_name = out_name
+                                # fallthrough به آپلود عادی
+                            else:
+                                await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+                        else:
+                            await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...")
+
+                    else:
+                        # soft sub نداشت — از کاربر بخواه
+                        prompt_msg = await event.client.send_message(
+                            event.chat_id,
+                            f"🔤 **Send subtitle file** for:\n`{orig_name}`\n\n"
+                            "Formats: `.srt` `.ass` `.ssa` `.vtt`\n"
+                            "Or skip to upload without subtitle.",
+                            parse_mode="markdown",
+                            buttons=[
+                                [Button.inline("⏭ Skip — upload as-is", f"subskip_{event.chat_id}_{event.id}")],
+                                [Button.inline("❌ Cancel", f"subcancl_{event.chat_id}")],
+                            ],
+                        )
+                        subtitle_sessions[event.chat_id] = {
+                            "video_path": filepath,
+                            "video_orig_name": orig_name,
+                            "status_msg": status_msg,
+                            "status_msg_id": prompt_msg.id,
+                            "size": size,
+                            "dur_str": dur_str,
+                        }
+                        # اینجا return میکنیم — ادامه آپلود توی subtitle_receive_handler یا subskip_callback
+                        return
+                # ── پایان subtitle flow ─────────────────────────────────
+
                 gh_line = ""
                 if GITHUB_ENABLED:
                     await safe_edit(status_msg, "☁️ Uploading to GitHub...")
@@ -4071,16 +4235,97 @@ async def subtitle_receive_handler(event):
     raise events.StopPropagation
 
 
+async def subskip_callback(event):
+    """کاربر skip زد — ویدیو رو بدون subtitle آپلود کن."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    parts = event.data.decode().replace("subskip_", "").split("_")
+    chat_id = int(parts[0])
+
+    session = subtitle_sessions.pop(chat_id, None)
+    if not session:
+        return await event.answer("❌ Session expired.", alert=True)
+
+    await event.answer("⏭ Skipping subtitle...", alert=False)
+
+    video_path = session.get("video_path")
+    video_orig_name = session.get("video_orig_name", "video")
+    status_msg = session.get("status_msg")
+    size = session.get("size", 0)
+    dur_str = session.get("dur_str", "")
+
+    # پاک کردن پیام prompt
+    status_msg_id = session.get("status_msg_id")
+    if status_msg_id:
+        try:
+            await event.client.delete_messages(chat_id, status_msg_id)
+        except Exception:
+            pass
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    if not video_path or not os.path.exists(video_path):
+        if status_msg:
+            await safe_edit(status_msg, "❌ Video file expired.")
+        return
+
+    if status_msg:
+        await safe_edit(status_msg, "📤 Uploading...")
+
+    gh_line = ""
+    if GITHUB_ENABLED:
+        if status_msg:
+            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+        gh_url = await maybe_upload_github(event.client, chat_id, video_path, size)
+        if gh_url:
+            gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        if status_msg:
+            await safe_edit(status_msg, "📤 Uploading...")
+
+    _ul_id = f"subskip_{chat_id}_{event.id}"
+    try:
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=chat_id,
+            filepath=video_path,
+            caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
+            status_msg=status_msg,
+            ul_id=_ul_id,
+        )
+    except Exception as e:
+        if status_msg:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:80]}")
+    finally:
+        active_uploads.pop(_ul_id, None)
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+
+
 async def subtitle_cancel_callback(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.answer("⛔ Unauthorized", alert=True)
-    chat_id = int(event.data.decode().replace("subcancl_", ""))
+    raw = event.data.decode().replace("subcancl_", "")
+    try:
+        chat_id = int(raw.split("_")[0])
+    except Exception:
+        chat_id = int(raw)
     session = subtitle_sessions.pop(chat_id, None)
     if session:
         try:
             os.remove(session["video_path"])
         except Exception:
             pass
+        status_msg = session.get("status_msg")
+        if status_msg:
+            try:
+                await safe_edit(status_msg, "🚫 Subtitle burn cancelled.")
+            except Exception:
+                pass
     await event.answer("Cancelled", alert=False)
     try:
         await event.delete()
@@ -4846,6 +5091,9 @@ async def main():
         subburn_callback, events.CallbackQuery(pattern=r"subburn_(.+)")
     )
     client.add_event_handler(
+        subskip_callback, events.CallbackQuery(pattern=r"subskip_(.+)")
+    )
+    client.add_event_handler(
         subtitle_cancel_callback, events.CallbackQuery(pattern=r"subcancl_(.+)")
     )
     client.add_event_handler(
@@ -4881,6 +5129,12 @@ async def main():
     )
     client.add_event_handler(
         github_cmd, events.NewMessage(pattern=r"^/github(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        sub_cmd, events.NewMessage(pattern=r"^/sub(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        suboff_cmd, events.NewMessage(pattern=r"^/suboff(\s|$)", incoming=True)
     )
     client.add_event_handler(
         admin_cmd, events.NewMessage(pattern=r"^/admin(\s|$)", incoming=True)
