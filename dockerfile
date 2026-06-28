@@ -45,6 +45,7 @@ COPY savep_handler.py .
 COPY snapwc_handler.py .
 COPY y2mate.py .
 COPY youtube_extractor.py .
+COPY happyscribe_subtitle.py .
 
 # ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
