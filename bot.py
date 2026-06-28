@@ -43,6 +43,7 @@ from github import (
     GITHUB_BASE_DIR,
 )
 from savep_handler import process_savep_request, trigger_savep_cancel
+from xnxx_handler import is_xnxx_url, extract_xnxx_qualities, download_xnxx_direct, download_xnxx_m3u8, xnxx_sessions
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
@@ -3355,9 +3356,17 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_xnxx_url(target_url):
+        logger.info(f"[URL] XNXX detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_xnxx_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if (
         "pornhub.com" in target_url
-        or "xnxx.com" in target_url
         or "xvideos.com" in target_url
         or "xhamster.com" in target_url
     ):
@@ -5429,6 +5438,104 @@ async def savep_cancel_callback(event):
             pass
 
 
+
+
+
+# ====================== XNXX HANDLER ======================
+
+async def process_xnxx_request(event, url: str, status_msg):
+    qualities, title = await extract_xnxx_qualities(url)
+    if not qualities:
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
+        return
+    session_id = f"xnxx_{event.chat_id}_{event.id}_{int(time.time())}"
+    xnxx_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو XNXX"
+    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"xnxx_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"xnxx_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def xnxx_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in xnxx_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = xnxx_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "xnxx_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "xnxx_video"
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+    try:
+        await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
+    except Exception:
+        pass
+    status_msg = event.message
+
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    try:
+        if chosen["method"] == "direct":
+            success, error, size = await download_xnxx_direct(chosen["url"], filepath, progress_cb)
+        else:
+            success, error, size = await download_xnxx_m3u8(chosen["url"], filepath, progress_cb)
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+        )
+    except Exception as e:
+        logger.error(f"[XNXX] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def xnxx_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("xnxx_cancel_", "")
+    xnxx_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
 async def main():
     print("\n" + "=" * 60)
     print("🚀 ULTIMATE BOT v5")
@@ -5544,6 +5651,12 @@ async def main():
     )
     client.add_event_handler(
         savep_cancel_callback, events.CallbackQuery(pattern=r"savep_cancel_.+")
+    )
+    client.add_event_handler(
+        xnxx_quality_callback, events.CallbackQuery(pattern=r"xnxx_q_.+")
+    )
+    client.add_event_handler(
+        xnxx_cancel_callback, events.CallbackQuery(pattern=r"xnxx_cancel_.+")
     )
 
     # ===== Command handlers =====
