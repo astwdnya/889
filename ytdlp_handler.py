@@ -1,9 +1,3 @@
-"""
-ytdlp_handler.py
----------------
-استخراج کیفیت و دانلود ویدیو از سایت‌های مختلف با yt-dlp
-"""
-
 import asyncio
 import json
 import logging
@@ -46,129 +40,21 @@ def is_hentaiheaven_url(url: str) -> bool:
 
 
 def is_tube8_url(url: str) -> bool:
-    return "tube8.com" in url.lower() or "t8" in url.lower()
+    return "tube8.com" in url.lower()
 
 
 def is_pornhat_url(url: str) -> bool:
     return "pornhat.com" in url.lower()
 
 
-# === New site detectors ===
-
-def is_youporn_url(url: str) -> bool:
-    return "youporn.com" in url.lower() or "youporngay.com" in url.lower()
-
-
-def is_redtube_url(url: str) -> bool:
-    return "redtube.com" in url.lower()
-
-
-def is_eporner_url(url: str) -> bool:
-    return "eporner.com" in url.lower()
-
-
-def is_spankbang_url(url: str) -> bool:
-    return "spankbang.com" in url.lower()
-
-
-def is_beeg_url(url: str) -> bool:
-    return "beeg.com" in url.lower()
-
-
-def is_thisvid_url(url: str) -> bool:
-    return "thisvid.com" in url.lower()
-
-
-def is_brattysis_url(url: str) -> bool:
-    return "brattysis.com" in url.lower() or "brattysisters.com" in url.lower()
-
-
-def is_realitykings_url(url: str) -> bool:
-    return "realitykings.com" in url.lower()
-
-
-def is_xfantazy_url(url: str) -> bool:
-    return "xfantazy.com" in url.lower() or "xfantazy.org" in url.lower()
-
-
-def is_anysex_url(url: str) -> bool:
-    return "anysex.com" in url.lower()
-
-
-def is_tnaflix_url(url: str) -> bool:
-    return "tnaflix.com" in url.lower()
-
-
-def is_momvids_url(url: str) -> bool:
-    return "momvids.com" in url.lower()
-
-
-def is_faapy_url(url: str) -> bool:
-    return "faapy.com" in url.lower()
-
-
-def is_pornid_url(url: str) -> bool:
-    return "pornid.xxx" in url.lower() or "pornid.com" in url.lower()
-
-
-def is_hotmovies_url(url: str) -> bool:
-    return "hotmovies.com" in url.lower()
-
-
-def is_fapcat_url(url: str) -> bool:
-    return "fapcat.com" in url.lower()
-
-
-def is_okxxx_url(url: str) -> bool:
-    return "ok.xxx" in url.lower()
-
-
-def is_pornhex_url(url: str) -> bool:
-    return "pornhex.com" in url.lower()
-
-
-def is_porntrex_url(url: str) -> bool:
-    return "porntrex.com" in url.lower()
-
-
 def is_ytdlp_site_url(url: str) -> bool:
-    """Check if URL is supported by ytdlp handler (excluding dedicated handlers)."""
     return any(
         [
+            is_xhamster_url(url),
             is_inxxx_url(url),
             is_hentaiheaven_url(url),
             is_tube8_url(url),
             is_pornhat_url(url),
-            is_youporn_url(url),
-            is_redtube_url(url),
-            is_eporner_url(url),
-            is_spankbang_url(url),
-            is_beeg_url(url),
-            is_thisvid_url(url),
-            is_brattysis_url(url),
-            is_realitykings_url(url),
-            is_xfantazy_url(url),
-            is_anysex_url(url),
-            is_tnaflix_url(url),
-            is_momvids_url(url),
-            is_faapy_url(url),
-            is_pornid_url(url),
-            is_hotmovies_url(url),
-            is_fapcat_url(url),
-            is_okxxx_url(url),
-            is_pornhex_url(url),
-            is_porntrex_url(url),
-            # Generic catch for many others
-            any(domain in url.lower() for domain in [
-                "youx.xxx", "xgroovy", "rat.xxx", "sexvid", "nakedgirls", "hdtube",
-                "fapcat", "ok.xxx", "momvids", "xfantazy", "anysex", "tnaflix",
-                "porntrex", "pornwhite", "spankbang", "eporner", "brattysis",
-                "realitykings", "thisvid", "pornid", "hotmovies", "pornhex",
-                "teensexvideos", "44sex", "fetishshrine", "pornozmo", "xxxbp",
-                "milfnut", "porntn", "videoxxx", "xfree", "videomonstr", "fapnado",
-                "auntymaza", "best18porn", "xlx.xxx", "melons tube", "cartoonporn",
-                "porndiff", "uiporn", "perfectgirls", "family therapy"
-            ])
         ]
     )
 
@@ -176,10 +62,6 @@ def is_ytdlp_site_url(url: str) -> bool:
 def get_site_name(url: str) -> str:
     if is_xhamster_url(url):
         return "xhamster"
-    if is_xvideos_url(url):
-        return "xvideos"
-    if is_pornhub_url(url):
-        return "pornhub"
     if is_inxxx_url(url):
         return "inxxx"
     if is_hentaiheaven_url(url):
@@ -188,50 +70,16 @@ def get_site_name(url: str) -> str:
         return "tube8"
     if is_pornhat_url(url):
         return "pornhat"
-    if is_youporn_url(url):
-        return "youporn"
-    if is_redtube_url(url):
-        return "redtube"
-    if is_eporner_url(url):
-        return "eporner"
-    if is_spankbang_url(url):
-        return "spankbang"
-    if is_beeg_url(url):
-        return "beeg"
-    if is_thisvid_url(url):
-        return "thisvid"
-    if is_brattysis_url(url):
-        return "brattysis"
-    if is_realitykings_url(url):
-        return "realitykings"
-    if is_xfantazy_url(url):
-        return "xfantazy"
-    if is_anysex_url(url):
-        return "anysex"
-    if is_tnaflix_url(url):
-        return "tnaflix"
-    if is_momvids_url(url):
-        return "momvids"
-    if is_faapy_url(url):
-        return "faapy"
-    if is_pornid_url(url):
-        return "pornid"
-    if is_hotmovies_url(url):
-        return "hotmovies"
-    if is_fapcat_url(url):
-        return "fapcat"
-    if is_okxxx_url(url):
-        return "okxxx"
-    if is_pornhex_url(url):
-        return "pornhex"
-    if is_porntrex_url(url):
-        return "porntrex"
     return "video"
 
 
 async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
     """
     Extract available qualities using yt-dlp --dump-json.
+    Returns:
+        (qualities, title)
+        qualities: list of dict with keys: label, format_id, method, ext, height
+        title: video title
     """
     try:
         process = await asyncio.create_subprocess_exec(
@@ -271,16 +119,12 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
     title = data.get("title", "") or ""
     if title:
         title = re.sub(
-            r"\s*[-|]\s*(xhamster|xvideos|pornhub|inxxx|hentaihaven|tube8|pornhat|"
-            r"youporn|redtube|eporner|spankbang|beeg|thisvid|brattysis|realitykings|"
-            r"xfantazy|anysex|tnaflix|momvids|faapy|pornid|hotmovies|fapcat|okxxx|"
-            r"pornhex|porntrex)\.?(com|eu|xxx|net|org)?\s*$",
+            r"\s*[-|]\s*(xhamster|inxxx|hentaihaven|tube8|pornhat)\.?(com|eu|xxx)?\s*$",
             "",
             title,
             flags=re.IGNORECASE,
         ).strip()
 
-    # ... (بقیه کد extract_qualities_ytdlp بدون تغییر)
     qualities = []
     seen_formats = set()
 
@@ -381,6 +225,7 @@ async def download_with_ytdlp(
             stderr=asyncio.subprocess.PIPE,
         )
         last_update = 0.0
+        stderr_lines = []
         while True:
             line = await process.stdout.readline()
             if not line:
@@ -391,6 +236,7 @@ async def download_with_ytdlp(
                 last_update = now
                 await progress_cb(f"📥 **Downloading...**\n`{text[:80]}`")
 
+        # collect remaining stderr
         remaining_stderr = await process.stderr.read()
         stderr_text = remaining_stderr.decode(errors="replace")
 
