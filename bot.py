@@ -5570,9 +5570,9 @@ async def xnxx_cancel_callback(event):
 
 
 async def process_ytdlp_request(event, url: str, status_msg):
-    qualities, err_or_title = await extract_qualities_ytdlp(url)
+    qualities, title = await extract_qualities_ytdlp(url)
     if not qualities:
-        err_detail = f" — `{err_or_title[:150]}`" if err_or_title else ""
+        err_detail = f" — `{title[:150]}`" if title else ""
         await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
         return
     session_id = f"ytdlp_{event.chat_id}_{event.id}_{int(time.time())}"
