@@ -199,6 +199,45 @@ def human_readable_size(num_bytes: int) -> str:
     return f"{num_bytes:.2f} TB"
 
 
+def extract_quality(filename: str) -> str:
+    name = filename.lower()
+    for q in ["2160", "1080", "720", "480", "360", "240"]:
+        if f"{q}p" in name:
+            return q
+    if "4k" in name:
+        return "4K"
+    return ""
+
+
+def clean_filename(name: str) -> str:
+    name = re.sub(r"^hs_\d+_", "", name)
+    name = re.sub(r"_\d+_subtitled$", "", name)
+    name = re.sub(r"_subtitled$", "", name)
+    return name
+
+
+def build_video_caption(
+    orig_name: str, size: int, duration: float = 0, subtitle_name: str = ""
+) -> str:
+    clean = clean_filename(orig_name)
+    lines = [f"🎬 {clean}"]
+    if subtitle_name:
+        lines.append(f"\nزیرنویس چسبیده: دارد ({subtitle_name}) ✅")
+    else:
+        lines.append(f"\nزیرنویس چسبیده: ندارد ❌")
+    q = extract_quality(orig_name)
+    if q:
+        lines.append(f"کیفیت: {q}")
+    if duration and duration > 0:
+        mins = int(duration // 60)
+        if mins > 0:
+            lines.append(f"⏱ مدت : {mins} دقیقه")
+        else:
+            lines.append(f"⏱ مدت : {int(duration)} ثانیه")
+    lines.append(f"📦 حجم : {human_readable_size(size)}")
+    return "\n".join(lines)
+
+
 def safe_filename(title: str) -> str:
     return (
         re.sub(r'[<>:"/\\|?*]', "_", title.strip()[:80]) or f"file_{int(time.time())}"
@@ -3487,6 +3526,7 @@ async def generic_url_handler(event):
                     dur_str = ""
 
                 # ── Subtitle burn flow ──────────────────────────────────
+                subtitle_name = ""
                 if is_video and SUB_BURN_ENABLED:
                     orig_name = os.path.basename(filepath)
 
@@ -3551,6 +3591,7 @@ async def generic_url_handler(event):
                                     os.remove(filepath)
                                 except Exception:
                                     pass
+                                subtitle_name = "Persian"
                                 filepath = out_path
                                 size = os.path.getsize(filepath)
                                 orig_name = out_name
@@ -3612,6 +3653,9 @@ async def generic_url_handler(event):
                             "size": size,
                             "dur_str": dur_str,
                             "pending_sub_index": non_persian_info["index"],
+                            "subtitle_name": sub_lang
+                            if sub_lang != "unknown"
+                            else (sub_title or "Subtitle"),
                         }
                         return
 
@@ -3659,15 +3703,22 @@ async def generic_url_handler(event):
                         gh_line = f"\n☁️ [GitHub DL]({gh_url})"
                     await safe_edit(status_msg, "📤 Uploading...")
                 _ul_id = f"ul_{event.chat_id}_{event.id}"
+                cap = build_video_caption(orig_name, size, vid_duration, subtitle_name)
+                if gh_line:
+                    cap += gh_line
                 await send_file_with_progress(
                     client=event.client,
                     chat_id=event.chat_id,
                     filepath=filepath,
-                    caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
+                    caption=cap,
                     status_msg=status_msg,
                     ul_id=_ul_id,
                 )
                 active_uploads.pop(_ul_id, None)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             except Exception as e:
                 active_uploads.pop(_ul_id, None)
                 await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
@@ -4424,14 +4475,16 @@ async def subtitle_receive_handler(event):
 
     # ── آپلود به تلگرام ──────────────────────────────────────────────────
     out_size = os.path.getsize(out_path)
-    await safe_edit(status_msg, "📤 Uploading to Telegram...")
+    vid_duration, _, _ = await get_video_info(out_path)
+    sub_name = os.path.splitext(fname)[0]
     ul_id = f"sub_{chat_id}_{event.id}"
+    cap = build_video_caption(out_name, out_size, vid_duration, sub_name)
     try:
         await send_file_with_progress(
             client=event.client,
             chat_id=chat_id,
             filepath=out_path,
-            caption=f"🎬 {os.path.splitext(video_orig_name)[0]} • {human_readable_size(out_size)}",
+            caption=cap,
             status_msg=status_msg,
             ul_id=ul_id,
         )
@@ -4441,6 +4494,10 @@ async def subtitle_receive_handler(event):
         active_uploads.pop(ul_id, None)
         try:
             os.remove(out_path)
+        except Exception:
+            pass
+        try:
+            await status_msg.delete()
         except Exception:
             pass
 
@@ -4469,6 +4526,8 @@ async def subextr_callback(event):
         await event.edit("⏳ Extracting subtitle from video...", buttons=None)
     except Exception:
         pass
+
+    subtitle_name = session.get("subtitle_name", "")
 
     out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
     proc = await asyncio.create_subprocess_exec(
@@ -4539,6 +4598,7 @@ async def subextr_callback(event):
 
     filepath = out_path
     size = os.path.getsize(filepath)
+    vid_duration, _, _ = await get_video_info(filepath)
     gh_line = ""
     if GITHUB_ENABLED:
         await safe_edit(status_msg, "☁️ Uploading to GitHub...")
@@ -4547,17 +4607,28 @@ async def subextr_callback(event):
             gh_line = f"\n☁️ [GitHub DL]({gh_url})"
         await safe_edit(status_msg, "📤 Uploading...")
     _ul_id = f"ul_{chat_id}_{int(time.time())}"
+    cap = build_video_caption(out_name, size, vid_duration, subtitle_name)
+    if gh_line:
+        cap += gh_line
     await send_file_with_progress(
         client=event.client,
         chat_id=chat_id,
         filepath=filepath,
-        caption=f"🎬 {os.path.splitext(out_name)[0]} • {human_readable_size(size)}{gh_line}",
+        caption=cap,
         status_msg=status_msg,
         ul_id=_ul_id,
     )
     active_uploads.pop(_ul_id, None)
     try:
         os.remove(filepath)
+    except Exception:
+        pass
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    try:
+        await event.delete()
     except Exception:
         pass
     raise events.StopPropagation
@@ -4614,12 +4685,16 @@ async def subskip_callback(event):
             await safe_edit(status_msg, "📤 Uploading...")
 
     _ul_id = f"subskip_{chat_id}_{event.id}"
+    vid_duration, _, _ = await get_video_info(video_path)
+    cap = build_video_caption(video_orig_name, size, vid_duration)
+    if gh_line:
+        cap += gh_line
     try:
         await send_file_with_progress(
             client=event.client,
             chat_id=chat_id,
             filepath=video_path,
-            caption=f"📦 {human_readable_size(size)}{dur_str}{gh_line}",
+            caption=cap,
             status_msg=status_msg,
             ul_id=_ul_id,
         )
