@@ -5487,7 +5487,7 @@ async def xnxx_quality_callback(event):
         await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
     except Exception:
         pass
-    status_msg = event.message
+    status_msg = await event.get_message()
 
     async def progress_cb(text):
         try:
