@@ -3385,6 +3385,17 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_pornhub_url(target_url):
+        logger.info(
+            f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
+        )
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await _run_snapwc_flow(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_ytdlp_site_url(target_url):
         site_name = get_site_name(target_url)
         logger.info(f"[URL] {site_name} detected via yt-dlp | url={target_url[:120]}")
@@ -5557,9 +5568,10 @@ async def xnxx_cancel_callback(event):
 
 
 async def process_ytdlp_request(event, url: str, status_msg):
-    qualities, title = await extract_qualities_ytdlp(url)
+    qualities, err_or_title = await extract_qualities_ytdlp(url)
     if not qualities:
-        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
+        err_detail = f" — `{err_or_title[:150]}`" if err_or_title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
         return
     session_id = f"ytdlp_{event.chat_id}_{event.id}_{int(time.time())}"
     ytdlp_sessions[session_id] = {

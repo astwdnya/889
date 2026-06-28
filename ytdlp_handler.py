@@ -36,7 +36,7 @@ def is_inxxx_url(url: str) -> bool:
 
 
 def is_hentaiheaven_url(url: str) -> bool:
-    return "hentaiheaven.com" in url.lower()
+    return "hentaiheaven.com" in url.lower() or "hentaihaven.xxx" in url.lower()
 
 
 def is_tube8_url(url: str) -> bool:
@@ -52,7 +52,6 @@ def is_ytdlp_site_url(url: str) -> bool:
         [
             is_xhamster_url(url),
             is_xvideos_url(url),
-            is_pornhub_url(url),
             is_inxxx_url(url),
             is_hentaiheaven_url(url),
             is_tube8_url(url),
@@ -114,7 +113,7 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
     title = data.get("title", "") or ""
     if title:
         title = re.sub(
-            r"\s*[-|]\s*(xhamster|xvideos|pornhub|inxxx|hentaiheaven|tube8|pornhat)\.?(com|eu)?\s*$",
+            r"\s*[-|]\s*(xhamster|xvideos|pornhub|inxxx|hentaihaven|tube8|pornhat)\.?(com|eu|xxx)?\s*$",
             "",
             title,
             flags=re.IGNORECASE,
@@ -132,12 +131,13 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
     )
 
     for f in formats:
-        vcodec = f.get("vcodec", "none")
-        if vcodec == "none":
+        vcodec = f.get("vcodec") or ""
+        height = f.get("height", 0) or 0
+
+        if not vcodec and height == 0:
             continue
 
         format_id = f.get("format_id", "")
-        height = f.get("height", 0) or 0
         ext = f.get("ext", "mp4")
         tbr = f.get("tbr", 0) or 0
         filesize = f.get("filesize") or f.get("filesize_approx") or 0
@@ -184,6 +184,7 @@ async def download_with_ytdlp(
     """Download video using yt-dlp with the selected format."""
     await progress_cb("📥 **در حال دانلود با yt-dlp...**")
     try:
+        format_spec = f"{format_id}+bestaudio/best"
         cmd = [
             "yt-dlp",
             "--no-warnings",
@@ -191,9 +192,11 @@ async def download_with_ytdlp(
             "--progress",
             "--newline",
             "-f",
-            format_id,
+            format_spec,
             "--add-header",
             f"User-Agent:{USER_AGENT}",
+            "--add-header",
+            f"Referer:{url}",
             "-o",
             filepath,
             url,
@@ -204,6 +207,7 @@ async def download_with_ytdlp(
             stderr=asyncio.subprocess.PIPE,
         )
         last_update = 0.0
+        stderr_lines = []
         while True:
             line = await process.stdout.readline()
             if not line:
@@ -214,10 +218,13 @@ async def download_with_ytdlp(
                 last_update = now
                 await progress_cb(f"📥 **Downloading...**\n`{text[:80]}`")
 
+        # collect remaining stderr
+        remaining_stderr = await process.stderr.read()
+        stderr_text = remaining_stderr.decode(errors="replace")
+
         await process.wait()
         if process.returncode != 0:
-            stderr = (await process.stderr.read()).decode(errors="replace")
-            return False, stderr[:200], 0
+            return False, stderr_text[:300], 0
 
         if not os.path.exists(filepath):
             for ext in [".mp4", ".mkv", ".webm"]:
@@ -234,6 +241,8 @@ async def download_with_ytdlp(
             return False, "Output file not found", 0
 
         size = os.path.getsize(filepath)
+        if size < 1024:
+            return False, f"File too small ({size}B)", 0
         return True, "", size
     except Exception as e:
         return False, str(e)[:150], 0
