@@ -1954,22 +1954,78 @@ async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
 PERSIAN_SUB_TAGS = {"fa", "farsi", "persian", "parsi"}
 
 
-async def extract_persian_subtitle(video_path: str) -> Optional[str]:
+async def extract_persian_subtitle(
+    video_path: str,
+) -> Tuple[Optional[str], Optional[dict]]:
     """
     با ffprobe چک میکنه ویدیو soft subtitle فارسی داره یا نه.
-    اگه داشت، با ffmpeg اون stream رو به فایل .srt اکسترکت میکنه.
-    برمیگردونه: مسیر فایل srt یا None
+    اگر زیرنویس فارسی داشت: برمیگردونه (مسیر srt, None)
+    اگر زیرنویس غیرفارسی داشت: برمیگردونه (None, dict info)
+    اگر هیچ زیرنویسی نداشت: برمیگردونه (None, None)
     """
     proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", "-select_streams", "s",
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-select_streams",
+        "s",
         video_path,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
-        return None
+        return None, None
+
+    try:
+        info = json.loads(stdout.decode())
+        streams = info.get("streams", [])
+    except Exception:
+        return None, None
+
+    target_index = None
+    first_sub = None
+    for s in streams:
+        tags = s.get("tags", {})
+        lang = (tags.get("language") or tags.get("title") or "").lower().strip()
+        if first_sub is None:
+            first_sub = {
+                "index": s.get("index"),
+                "lang": lang or "unknown",
+                "title": tags.get("title", ""),
+                "codec": s.get("codec_name", ""),
+            }
+        if any(tag in lang for tag in PERSIAN_SUB_TAGS):
+            target_index = s.get("index")
+            break
+
+    if target_index is None:
+        if first_sub is None:
+            return None, None
+        return None, first_sub
+
+    out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
+    proc2 = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        f"0:{target_index}",
+        "-c:s",
+        "srt",
+        out_srt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc2.communicate()
+
+    if os.path.exists(out_srt) and os.path.getsize(out_srt) > 0:
+        return out_srt, None
+    return None, None
 
     try:
         info = json.loads(stdout.decode())
@@ -1978,21 +2034,31 @@ async def extract_persian_subtitle(video_path: str) -> Optional[str]:
         return None
 
     target_index = None
+    first_sub_index = None
     for s in streams:
         tags = s.get("tags", {})
         lang = (tags.get("language") or tags.get("title") or "").lower().strip()
+        if first_sub_index is None:
+            first_sub_index = s.get("index")
         if any(tag in lang for tag in PERSIAN_SUB_TAGS):
             target_index = s.get("index")
             break
 
     if target_index is None:
+        target_index = first_sub_index
+    if target_index is None:
         return None
 
     out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
     proc2 = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", video_path,
-        "-map", f"0:{target_index}",
-        "-c:s", "srt",
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        f"0:{target_index}",
+        "-c:s",
+        "srt",
         out_srt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -2147,7 +2213,6 @@ async def compress_video(
                 pass
 
 
-
 # ====================== SUBTITLE BURN-IN ======================
 async def burn_subtitle(
     video_path: str,
@@ -2158,9 +2223,7 @@ async def burn_subtitle(
     زیرنویس رو روی ویدیو می‌سوزونه (hard subtitle).
     رنگ زرد با outline سیاه.
     """
-    output_path = os.path.join(
-        OUTPUT_FOLDER, f"subbed_{int(time.time())}.mp4"
-    )
+    output_path = os.path.join(OUTPUT_FOLDER, f"subbed_{int(time.time())}.mp4")
     sub_ext = os.path.splitext(subtitle_path)[1].lower()
 
     # escape مسیر فایل برای ffmpeg filter — کاراکترهای خاص رو escape کن
@@ -2181,14 +2244,22 @@ async def burn_subtitle(
     await safe_edit(status_msg, "🔥 Burning subtitles into video...")
 
     args = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "18",
-        "-c:a", "copy",
-        "-movflags", "+faststart",
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
         output_path,
     ]
 
@@ -2883,7 +2954,10 @@ async def suboff_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     SUB_BURN_ENABLED = False
-    await event.reply("🔴 **Subtitle Burn Mode: OFF**\nVideos will be uploaded directly without subtitle processing.", parse_mode="markdown")
+    await event.reply(
+        "🔴 **Subtitle Burn Mode: OFF**\nVideos will be uploaded directly without subtitle processing.",
+        parse_mode="markdown",
+    )
 
 
 async def startgithub_cmd(event):
@@ -3416,13 +3490,18 @@ async def generic_url_handler(event):
                 if is_video and SUB_BURN_ENABLED:
                     orig_name = os.path.basename(filepath)
 
-                    # چک soft subtitle فارسی
-                    await safe_edit(status_msg, "🔍 Checking for Persian subtitle...")
-                    persian_sub = await extract_persian_subtitle(filepath)
+                    # چک soft subtitle
+                    await safe_edit(status_msg, "🔍 Checking for subtitle...")
+                    persian_sub, non_persian_info = await extract_persian_subtitle(
+                        filepath
+                    )
 
                     if persian_sub:
                         # soft sub فارسی پیدا شد — مستقیم burn میکنیم
-                        await safe_edit(status_msg, "🔤 Persian subtitle found! Sending to HappyScribe...")
+                        await safe_edit(
+                            status_msg,
+                            "🔤 Persian subtitle found! Sending to HappyScribe...",
+                        )
 
                         async def _prog(text):
                             await safe_edit(status_msg, text)
@@ -3440,20 +3519,34 @@ async def generic_url_handler(event):
                         if dl_url:
                             # دانلود نتیجه
                             out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
-                            out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+                            out_path = os.path.join(
+                                OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}"
+                            )
                             await safe_edit(status_msg, "⬇️ Downloading result...")
                             try:
                                 async with aiohttp.ClientSession() as sess:
-                                    async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                                    async with sess.get(
+                                        dl_url, timeout=ClientTimeout(total=600)
+                                    ) as resp:
                                         if resp.status == 200:
-                                            async with aiofiles.open(out_path, "wb") as f:
-                                                async for chunk in resp.content.iter_chunked(524288):
+                                            async with aiofiles.open(
+                                                out_path, "wb"
+                                            ) as f:
+                                                async for (
+                                                    chunk
+                                                ) in resp.content.iter_chunked(524288):
                                                     await f.write(chunk)
                             except Exception as e:
-                                await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+                                await safe_edit(
+                                    status_msg, f"❌ Download error: {str(e)[:80]}"
+                                )
                                 out_path = None
 
-                            if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                            if (
+                                out_path
+                                and os.path.exists(out_path)
+                                and os.path.getsize(out_path) > 0
+                            ):
                                 try:
                                     os.remove(filepath)
                                 except Exception:
@@ -3463,12 +3556,67 @@ async def generic_url_handler(event):
                                 orig_name = out_name
                                 # fallthrough به آپلود عادی
                             else:
-                                await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+                                await safe_edit(
+                                    status_msg,
+                                    "⚠️ HappyScribe failed, uploading original...",
+                                )
                         else:
-                            await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...")
+                            await safe_edit(
+                                status_msg,
+                                f"⚠️ HappyScribe error: {err[:80]}\nUploading original...",
+                            )
+
+                    elif non_persian_info:
+                        # زیرنویس غیرفارسی پیدا شد — از کاربر تأیید بگیر
+                        sub_lang = non_persian_info.get("lang", "unknown")
+                        sub_title = non_persian_info.get("title", "")
+                        sub_codec = non_persian_info.get("codec", "")
+                        info_parts = [f"`{sub_lang}`"]
+                        if sub_title:
+                            info_parts.append(f"📝 `{sub_title}`")
+                        if sub_codec:
+                            info_parts.append(f"📄 `{sub_codec}`")
+                        sub_desc = " | ".join(info_parts)
+
+                        prompt_msg = await event.client.send_message(
+                            event.chat_id,
+                            f"🔤 **Subtitle found** in:\n`{orig_name}`\n\n"
+                            f"Language: {sub_desc}\n\n"
+                            "Use this subtitle?",
+                            parse_mode="markdown",
+                            buttons=[
+                                [
+                                    Button.inline(
+                                        "✅ Use this subtitle",
+                                        f"subextr_{event.chat_id}",
+                                    )
+                                ],
+                                [
+                                    Button.inline(
+                                        "⏭ Skip — upload as-is",
+                                        f"subskip_{event.chat_id}_{event.id}",
+                                    )
+                                ],
+                                [
+                                    Button.inline(
+                                        "❌ Cancel", f"subcancl_{event.chat_id}"
+                                    )
+                                ],
+                            ],
+                        )
+                        subtitle_sessions[event.chat_id] = {
+                            "video_path": filepath,
+                            "video_orig_name": orig_name,
+                            "status_msg": status_msg,
+                            "status_msg_id": prompt_msg.id,
+                            "size": size,
+                            "dur_str": dur_str,
+                            "pending_sub_index": non_persian_info["index"],
+                        }
+                        return
 
                     else:
-                        # soft sub نداشت — از کاربر بخواه
+                        # هیچ زیرنویسی توی فایل نبود — از کاربر بخواه فایل بفرسته
                         prompt_msg = await event.client.send_message(
                             event.chat_id,
                             f"🔤 **Send subtitle file** for:\n`{orig_name}`\n\n"
@@ -3476,8 +3624,17 @@ async def generic_url_handler(event):
                             "Or skip to upload without subtitle.",
                             parse_mode="markdown",
                             buttons=[
-                                [Button.inline("⏭ Skip — upload as-is", f"subskip_{event.chat_id}_{event.id}")],
-                                [Button.inline("❌ Cancel", f"subcancl_{event.chat_id}")],
+                                [
+                                    Button.inline(
+                                        "⏭ Skip — upload as-is",
+                                        f"subskip_{event.chat_id}_{event.id}",
+                                    )
+                                ],
+                                [
+                                    Button.inline(
+                                        "❌ Cancel", f"subcancl_{event.chat_id}"
+                                    )
+                                ],
                             ],
                         )
                         subtitle_sessions[event.chat_id] = {
@@ -3760,7 +3917,9 @@ async def process_y2mate_request(event, url: str, status_msg):
 # ====================== VIDEO RECEIVE -> GITHUB OFFER ======================
 
 
-async def _flush_video_send_batch(batch_key: str, client, chat_id: int, reply_to_id: int):
+async def _flush_video_send_batch(
+    batch_key: str, client, chat_id: int, reply_to_id: int
+):
     """بعد از ۳ ثانیه، پیام batch ویدیو رو ارسال میکنه."""
     await asyncio.sleep(3)
     video_send_timers.pop(batch_key, None)
@@ -3773,12 +3932,21 @@ async def _flush_video_send_batch(batch_key: str, client, chat_id: int, reply_to
     total_size = sum(f["file_size"] for f in files)
     size_str = human_readable_size(total_size)
 
-    lines = [f"🎬 **{count} video file{'s' if count > 1 else ''} received** — {size_str}\n"]
+    lines = [
+        f"🎬 **{count} video file{'s' if count > 1 else ''} received** — {size_str}\n"
+    ]
     for i, f in enumerate(files, 1):
-        lines.append(f"  {i}. `{f['filename']}` ({human_readable_size(f['file_size'])})")
+        lines.append(
+            f"  {i}. `{f['filename']}` ({human_readable_size(f['file_size'])})"
+        )
 
     buttons = [
-        [Button.inline(f"▶️ Send as Video ({count} file{'s' if count > 1 else ''})", f"vsend_{batch_key}")]
+        [
+            Button.inline(
+                f"▶️ Send as Video ({count} file{'s' if count > 1 else ''})",
+                f"vsend_{batch_key}",
+            )
+        ]
     ]
 
     # دکمه زیرنویس فقط برای یه فایل منطقی‌تره
@@ -3823,8 +3991,24 @@ async def video_receive_handler(event):
         if fn:
             fname_attr = fn
             break
-    video_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
-                  ".m4v", ".mpg", ".mpeg", ".3gp", ".ts", ".mts", ".ogv", ".rmvb", ".f4v"}
+    video_exts = {
+        ".mp4",
+        ".mkv",
+        ".avi",
+        ".mov",
+        ".wmv",
+        ".flv",
+        ".webm",
+        ".m4v",
+        ".mpg",
+        ".mpeg",
+        ".3gp",
+        ".ts",
+        ".mts",
+        ".ogv",
+        ".rmvb",
+        ".f4v",
+    }
     ext = os.path.splitext(fname_attr)[1].lower() if fname_attr else ""
     is_video_ext = ext in video_exts
 
@@ -3842,11 +4026,13 @@ async def video_receive_handler(event):
 
     if batch_key in video_send_pending:
         # اضافه کردن به batch موجود
-        video_send_pending[batch_key]["files"].append({
-            "message_id": event.id,
-            "file_size": file_size,
-            "filename": filename,
-        })
+        video_send_pending[batch_key]["files"].append(
+            {
+                "message_id": event.id,
+                "file_size": file_size,
+                "filename": filename,
+            }
+        )
         # ریست تایمر
         old_task = video_send_timers.pop(batch_key, None)
         if old_task and not old_task.done():
@@ -3856,11 +4042,13 @@ async def video_receive_handler(event):
         video_send_pending[batch_key] = {
             "chat_id": event.chat_id,
             "reply_to_id": event.id,
-            "files": [{
-                "message_id": event.id,
-                "file_size": file_size,
-                "filename": filename,
-            }],
+            "files": [
+                {
+                    "message_id": event.id,
+                    "file_size": file_size,
+                    "filename": filename,
+                }
+            ],
         }
 
     # شروع (یا ریست) تایمر ۳ ثانیه‌ای
@@ -3972,7 +4160,9 @@ async def vsend_callback(event):
     batch_key = event.data.decode().replace("vsend_", "")
     batch = video_send_pending.pop(batch_key, None)
     if not batch:
-        return await event.answer("❌ Session expired or already processed.", alert=True)
+        return await event.answer(
+            "❌ Session expired or already processed.", alert=True
+        )
 
     await event.answer("⏳ Sending as video...", alert=False)
     chat_id = batch["chat_id"]
@@ -3980,7 +4170,10 @@ async def vsend_callback(event):
     total = len(files)
 
     try:
-        await event.edit(f"⏳ Downloading and sending {total} video{'s' if total > 1 else ''}...", buttons=None)
+        await event.edit(
+            f"⏳ Downloading and sending {total} video{'s' if total > 1 else ''}...",
+            buttons=None,
+        )
     except Exception:
         pass
 
@@ -3990,7 +4183,9 @@ async def vsend_callback(event):
         filename = file_info["filename"]
         title = os.path.splitext(filename)[0]
 
-        tmp_path = os.path.join(OUTPUT_FOLDER, f"vsend_{int(time.time())}_{i}_{filename}")
+        tmp_path = os.path.join(
+            OUTPUT_FOLDER, f"vsend_{int(time.time())}_{i}_{filename}"
+        )
         try:
             msg = await event.client.get_messages(chat_id, ids=msg_id)
             if not msg:
@@ -3998,7 +4193,11 @@ async def vsend_callback(event):
                 continue
 
             try:
-                await event.edit(f"⬇️ Downloading {i+1}/{total}: `{filename}`...", parse_mode="markdown", buttons=None)
+                await event.edit(
+                    f"⬇️ Downloading {i + 1}/{total}: `{filename}`...",
+                    parse_mode="markdown",
+                    buttons=None,
+                )
             except Exception:
                 pass
 
@@ -4009,7 +4208,11 @@ async def vsend_callback(event):
                 continue
 
             try:
-                await event.edit(f"📤 Uploading {i+1}/{total}: `{filename}`...", parse_mode="markdown", buttons=None)
+                await event.edit(
+                    f"📤 Uploading {i + 1}/{total}: `{filename}`...",
+                    parse_mode="markdown",
+                    buttons=None,
+                )
             except Exception:
                 pass
 
@@ -4038,11 +4241,12 @@ async def vsend_callback(event):
                 pass
 
     try:
-        result_text = f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
+        result_text = (
+            f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
+        )
         await event.edit(result_text, buttons=None)
     except Exception:
         pass
-
 
 
 # ====================== SUBTITLE HANDLER ======================
@@ -4065,7 +4269,9 @@ async def subburn_callback(event):
     filename = file_info["filename"]
 
     try:
-        await event.edit(f"⬇️ Downloading `{filename}`...", parse_mode="markdown", buttons=None)
+        await event.edit(
+            f"⬇️ Downloading `{filename}`...", parse_mode="markdown", buttons=None
+        )
     except Exception:
         pass
 
@@ -4103,7 +4309,9 @@ async def subburn_callback(event):
         "status_msg_id": prompt_msg.id,
     }
     try:
-        await event.edit(f"✅ Video downloaded. Now send the subtitle file.", buttons=None)
+        await event.edit(
+            f"✅ Video downloaded. Now send the subtitle file.", buttons=None
+        )
     except Exception:
         pass
 
@@ -4185,7 +4393,9 @@ async def subtitle_receive_handler(event):
             pass
 
     if error or not download_url:
-        await safe_edit(status_msg, f"❌ HappyScribe error: {error or 'No download link received.'}")
+        await safe_edit(
+            status_msg, f"❌ HappyScribe error: {error or 'No download link received.'}"
+        )
         raise events.StopPropagation
 
     # ── دانلود نتیجه از HappyScribe ─────────────────────────────────────
@@ -4197,7 +4407,9 @@ async def subtitle_receive_handler(event):
         async with aiohttp.ClientSession() as sess:
             async with sess.get(download_url, timeout=ClientTimeout(total=600)) as resp:
                 if resp.status != 200:
-                    await safe_edit(status_msg, f"❌ Download failed (HTTP {resp.status})")
+                    await safe_edit(
+                        status_msg, f"❌ Download failed (HTTP {resp.status})"
+                    )
                     raise events.StopPropagation
                 async with aiofiles.open(out_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(1024 * 512):
@@ -4232,6 +4444,122 @@ async def subtitle_receive_handler(event):
         except Exception:
             pass
 
+    raise events.StopPropagation
+
+
+async def subextr_callback(event):
+    """کاربر تأیید کرد از زیرنویس غیرفارسی داخل ویدیو استفاده کنه."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    chat_id = int(event.data.decode().replace("subextr_", ""))
+    session = subtitle_sessions.pop(chat_id, None)
+    if not session:
+        return await event.answer("❌ Session expired.", alert=True)
+
+    video_path = session["video_path"]
+    orig_name = session["video_orig_name"]
+    status_msg = session["status_msg"]
+    sub_index = session.get("pending_sub_index")
+    if sub_index is None:
+        return await event.answer("❌ No subtitle stream info.", alert=True)
+
+    await event.answer("⏳ Extracting subtitle...", alert=False)
+    try:
+        await event.edit("⏳ Extracting subtitle from video...", buttons=None)
+    except Exception:
+        pass
+
+    out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-map",
+        f"0:{sub_index}",
+        "-c:s",
+        "srt",
+        out_srt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    if not os.path.exists(out_srt) or os.path.getsize(out_srt) == 0:
+        try:
+            await event.edit("❌ Failed to extract subtitle.", buttons=None)
+        except Exception:
+            pass
+        return
+
+    await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
+
+    async def _prog(text):
+        await safe_edit(status_msg, text)
+
+    dl_url, err = await hardcode_subtitle_online(
+        video_path=video_path,
+        subtitle_path=out_srt,
+        progress_callback=_prog,
+    )
+    try:
+        os.remove(out_srt)
+    except Exception:
+        pass
+
+    if not dl_url:
+        await safe_edit(
+            status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original..."
+        )
+        raise events.StopPropagation
+
+    out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
+    out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+    await safe_edit(status_msg, "⬇️ Downloading result...")
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                if resp.status == 200:
+                    async with aiofiles.open(out_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(524288):
+                            await f.write(chunk)
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+        raise events.StopPropagation
+
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+        raise events.StopPropagation
+
+    try:
+        os.remove(video_path)
+    except Exception:
+        pass
+
+    filepath = out_path
+    size = os.path.getsize(filepath)
+    gh_line = ""
+    if GITHUB_ENABLED:
+        await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+        gh_url = await maybe_upload_github(event.client, chat_id, filepath, size)
+        if gh_url:
+            gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        await safe_edit(status_msg, "📤 Uploading...")
+    _ul_id = f"ul_{chat_id}_{int(time.time())}"
+    await send_file_with_progress(
+        client=event.client,
+        chat_id=chat_id,
+        filepath=filepath,
+        caption=f"🎬 {os.path.splitext(out_name)[0]} • {human_readable_size(size)}{gh_line}",
+        status_msg=status_msg,
+        ul_id=_ul_id,
+    )
+    active_uploads.pop(_ul_id, None)
+    try:
+        os.remove(filepath)
+    except Exception:
+        pass
     raise events.StopPropagation
 
 
@@ -5089,6 +5417,9 @@ async def main():
     )
     client.add_event_handler(
         subburn_callback, events.CallbackQuery(pattern=r"subburn_(.+)")
+    )
+    client.add_event_handler(
+        subextr_callback, events.CallbackQuery(pattern=r"subextr_(.+)")
     )
     client.add_event_handler(
         subskip_callback, events.CallbackQuery(pattern=r"subskip_(.+)")
