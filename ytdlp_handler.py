@@ -140,7 +140,7 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
         height = f.get("height", 0) or 0
         ext = f.get("ext", "mp4")
         tbr = f.get("tbr", 0) or 0
-        filesize = f.get("filesize", 0) or f.get("filesize_approx", 0)
+        filesize = f.get("filesize") or f.get("filesize_approx") or 0
         fps = f.get("fps", 0) or 0
 
         res_key = height or format_id
