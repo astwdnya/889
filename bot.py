@@ -46,6 +46,7 @@ from savep_handler import process_savep_request, trigger_savep_cancel
 from snapwc_handler import SnapWCSession
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
+from happyscribe_subtitle import hardcode_subtitle_online
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
@@ -3934,6 +3935,7 @@ async def subburn_callback(event):
     )
     subtitle_sessions[chat_id] = {
         "video_path": tmp_path,
+        "video_orig_name": filename,
         "status_msg_id": prompt_msg.id,
     }
     try:
@@ -3943,7 +3945,7 @@ async def subburn_callback(event):
 
 
 async def subtitle_receive_handler(event):
-    """وقتی کاربر فایل زیرنویس میفرسته و قبلاً ویدیو داده، burn-in میکنه."""
+    """وقتی کاربر فایل زیرنویس میفرسته → HappyScribe burn-in آنلاین."""
     if event.sender_id not in AUTHORIZED_USERS:
         return
 
@@ -3952,7 +3954,6 @@ async def subtitle_receive_handler(event):
     if not session:
         return
 
-    # چک کن که document هست و پسوند زیرنویس داره
     doc = event.document
     if not doc:
         return
@@ -3966,14 +3967,11 @@ async def subtitle_receive_handler(event):
     if sub_ext not in (".srt", ".ass", ".ssa", ".vtt", ".sub"):
         return
 
-    # این handler اولویت داره — بقیه handler ها نباید اجرا بشن
-    raise_stop = True
-
     video_path = session.get("video_path")
+    video_orig_name = session.get("video_orig_name", "video")
     status_msg_id = session.get("status_msg_id")
     subtitle_sessions.pop(chat_id, None)
 
-    # پاک کردن پیام "منتظر زیرنویس"
     if status_msg_id:
         try:
             await event.client.delete_messages(chat_id, status_msg_id)
@@ -3986,7 +3984,6 @@ async def subtitle_receive_handler(event):
 
     status_msg = await event.reply("⬇️ Downloading subtitle file...")
 
-    # دانلود فایل زیرنویس
     sub_path = os.path.join(OUTPUT_FOLDER, f"sub_{int(time.time())}{sub_ext}")
     try:
         await event.client.download_media(event.message, file=sub_path)
@@ -4006,30 +4003,59 @@ async def subtitle_receive_handler(event):
             pass
         raise events.StopPropagation
 
-    # burn subtitle
-    output_path, result_msg = await burn_subtitle(video_path, sub_path, status_msg)
+    # ── HappyScribe burn-in ──────────────────────────────────────────────
+    async def _progress(text: str):
+        await safe_edit(status_msg, text)
 
-    # cleanup موقت‌ها
+    download_url, error = await hardcode_subtitle_online(
+        video_path=video_path,
+        subtitle_path=sub_path,
+        progress_callback=_progress,
+    )
+
+    # cleanup فایل‌های موقت
     for p in (video_path, sub_path):
         try:
             os.remove(p)
         except Exception:
             pass
 
-    if not output_path:
-        await safe_edit(status_msg, f"❌ {result_msg}")
+    if error or not download_url:
+        await safe_edit(status_msg, f"❌ HappyScribe error: {error or 'No download link received.'}")
         raise events.StopPropagation
 
-    # آپلود نتیجه
-    out_size = os.path.getsize(output_path)
-    await safe_edit(status_msg, "📤 Uploading...")
+    # ── دانلود نتیجه از HappyScribe ─────────────────────────────────────
+    out_name = os.path.splitext(video_orig_name)[0] + "_subtitled.mp4"
+    out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+
+    await safe_edit(status_msg, "⬇️ Downloading result from HappyScribe...")
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(download_url, timeout=ClientTimeout(total=600)) as resp:
+                if resp.status != 200:
+                    await safe_edit(status_msg, f"❌ Download failed (HTTP {resp.status})")
+                    raise events.StopPropagation
+                async with aiofiles.open(out_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 512):
+                        await f.write(chunk)
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+        raise events.StopPropagation
+
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        await safe_edit(status_msg, "❌ Downloaded file is empty.")
+        raise events.StopPropagation
+
+    # ── آپلود به تلگرام ──────────────────────────────────────────────────
+    out_size = os.path.getsize(out_path)
+    await safe_edit(status_msg, "📤 Uploading to Telegram...")
     ul_id = f"sub_{chat_id}_{event.id}"
     try:
         await send_file_with_progress(
             client=event.client,
             chat_id=chat_id,
-            filepath=output_path,
-            caption=f"🎬 {os.path.splitext(os.path.basename(output_path))[0]} • {human_readable_size(out_size)}",
+            filepath=out_path,
+            caption=f"🎬 {os.path.splitext(video_orig_name)[0]} • {human_readable_size(out_size)}",
             status_msg=status_msg,
             ul_id=ul_id,
         )
@@ -4038,7 +4064,7 @@ async def subtitle_receive_handler(event):
     finally:
         active_uploads.pop(ul_id, None)
         try:
-            os.remove(output_path)
+            os.remove(out_path)
         except Exception:
             pass
 
