@@ -7,6 +7,7 @@ xgroovy_handler.py
   - از yt-dlp با impersonation برای دور زدن Cloudflare استفاده میکنه
   - لینک‌های مستقیم MP4 و M3U8 از yt-dlp --dump-json استخراج میشن
   - اگه yt-dlp فشل شد، با curl_cffi مستقیم سعی میکنه
+  - دانلود هم با curl_cffi/yt-dlp انجام میشه (نه aiohttp ساده)
   - کاربر با دکمه کیفیت انتخاب میکنه
 """
 
@@ -19,7 +20,7 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote
 
 import aiofiles
 import aiohttp
@@ -92,6 +93,7 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 
 
 def _is_allowed_host(url: str) -> bool:
+    """بررسی اینکه URL به دامنه‌های مجاز اشاره میکنه."""
     try:
         host = urlparse(url).hostname or ""
         return (
@@ -103,6 +105,7 @@ def _is_allowed_host(url: str) -> bool:
 
 
 def _is_video_cdn_url(url: str) -> bool:
+    """بررسی گسترده‌تر برای CDN های ویدیو."""
     if _is_allowed_host(url):
         return True
     try:
@@ -123,6 +126,7 @@ def _is_video_cdn_url(url: str) -> bool:
 
 
 def is_xgroovy_url(url: str) -> bool:
+    """بررسی اینکه URL مربوط به xgroovy هست."""
     try:
         host = urlparse(url).hostname or ""
         return host in _ALLOWED_HOSTS or host.endswith(".xgroovy.com")
@@ -131,6 +135,7 @@ def is_xgroovy_url(url: str) -> bool:
 
 
 def cleanup_expired_sessions() -> int:
+    """پاکسازی session های منقضی شده."""
     now = time.time()
     expired = [
         sid for sid, data in xgroovy_sessions.items()
@@ -144,6 +149,7 @@ def cleanup_expired_sessions() -> int:
 
 
 def _cleanup_file(filepath: str) -> None:
+    """حذف فایل اگه وجود داشته باشه."""
     try:
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
@@ -153,6 +159,7 @@ def _cleanup_file(filepath: str) -> None:
 
 
 def _normalize_url(url: str, base_url: str = "") -> Optional[str]:
+    """نرمال‌سازی URL. اگه نامعتبر بود None برمیگردونه."""
     url = url.replace("\\/", "/").strip()
     if url.startswith("//"):
         url = "https:" + url
@@ -164,6 +171,7 @@ def _normalize_url(url: str, base_url: str = "") -> Optional[str]:
 
 
 def _quality_sort_key(q: dict) -> int:
+    """کلید مرتب‌سازی بر اساس عدد کیفیت."""
     nums = re.findall(r"\d+", q["label"])
     return int(nums[-1]) if nums else 0
 
@@ -174,6 +182,7 @@ def _format_progress(
     start_time: float,
     now: float,
 ) -> str:
+    """فرمت پیام پیشرفت دانلود."""
     elapsed = now - start_time
     speed = downloaded / elapsed if elapsed > 0 else 0
     dl_mb = downloaded / 1024 / 1024
@@ -203,11 +212,28 @@ def _check_impersonation_support() -> bool:
         return False
 
 
+def _find_output_file(filepath: str) -> Optional[str]:
+    """پیدا کردن فایل خروجی yt-dlp."""
+    if os.path.exists(filepath):
+        return filepath
+    base, _ = os.path.splitext(filepath)
+    for ext in (".mp4", ".mkv", ".webm", ".ts"):
+        candidate = base + ext
+        if os.path.exists(candidate):
+            try:
+                os.rename(candidate, filepath)
+                return filepath
+            except OSError:
+                return candidate
+    return None
+
+
 # ─── HTTP helpers ───────────────────────────────────────────
 
 
 @asynccontextmanager
 async def _get_session(timeout: Optional[ClientTimeout] = None):
+    """ساخت و مدیریت aiohttp session با cookie jar و cleanup خودکار."""
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar(unsafe=True)
     session = aiohttp.ClientSession(
@@ -225,6 +251,7 @@ async def _fetch_with_retry(
     max_retries: int = MAX_RETRIES,
     timeout: Optional[ClientTimeout] = None,
 ) -> Tuple[Optional[str], int]:
+    """دریافت ساده URL با retry (برای CDN ها و M3U8)."""
     last_error = ""
     for attempt in range(1, max_retries + 1):
         try:
@@ -252,37 +279,6 @@ async def _fetch_with_retry(
     return None, 0
 
 
-async def _fetch_with_curl_cffi(url: str) -> Tuple[Optional[str], int]:
-    """
-    دریافت صفحه با curl_cffi برای دور زدن Cloudflare.
-    curl_cffi TLS fingerprint واقعی Chrome رو شبیه‌سازی میکنه.
-    """
-    try:
-        from curl_cffi.requests import AsyncSession
-
-        async with AsyncSession() as session:
-            resp = await session.get(
-                url,
-                impersonate="chrome",
-                headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                },
-                allow_redirects=True,
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                return resp.text, 200
-            return None, resp.status_code
-
-    except ImportError:
-        logger.debug("curl_cffi not available for direct fetch")
-        return None, 0
-    except Exception as e:
-        logger.warning("curl_cffi fetch failed: %s", e)
-        return None, 0
-
-
 # ─── yt-dlp extraction with impersonation ───────────────────
 
 
@@ -290,9 +286,6 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
     """
     استخراج لینک‌های ویدیو با yt-dlp.
     اول با --impersonate سعی میکنه، اگه نشد بدون اون.
-
-    Returns:
-        (qualities, title)
     """
     if not shutil.which("yt-dlp"):
         logger.error("yt-dlp is not installed")
@@ -300,7 +293,6 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
 
     has_impersonation = _check_impersonation_support()
 
-    # لیست تلاش‌ها: اول با impersonate، بعد بدون
     attempts = []
     if has_impersonation:
         for target in _IMPERSONATE_TARGETS:
@@ -308,12 +300,12 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
     attempts.append(("extractor-args", None))
     attempts.append(("basic", None))
 
+    error = ""
     for method, target in attempts:
         qualities, title, error = await _try_ytdlp_extract(url, method, target)
         if qualities:
             return qualities, title
         if "HTTP Error 403" not in error and "Cloudflare" not in error:
-            # خطای غیر 403 - ادامه ندیم
             break
 
     return [], error if error else "Extraction failed"
@@ -324,12 +316,7 @@ async def _try_ytdlp_extract(
     method: str,
     target: Optional[str],
 ) -> Tuple[List[dict], str, str]:
-    """
-    یک تلاش استخراج با yt-dlp.
-
-    Returns:
-        (qualities, title, error)
-    """
+    """یک تلاش استخراج با yt-dlp."""
     cmd = [
         "yt-dlp",
         "--no-warnings",
@@ -342,10 +329,7 @@ async def _try_ytdlp_extract(
         cmd.extend(["--impersonate", target])
         logger.info("Trying yt-dlp with --impersonate %s", target)
     elif method == "extractor-args":
-        # بعضی وقتا extractor args کمک میکنه
-        cmd.extend([
-            "--extractor-args", "generic:impersonate=chrome",
-        ])
+        cmd.extend(["--extractor-args", "generic:impersonate=chrome"])
         logger.info("Trying yt-dlp with extractor-args impersonate")
     else:
         logger.info("Trying yt-dlp basic (no impersonation)")
@@ -377,8 +361,6 @@ async def _try_ytdlp_extract(
         if not raw:
             return [], "", "Empty output"
 
-        # yt-dlp ممکنه چند خط JSON بده (برای playlist)
-        # اولین خط رو بگیر
         first_line = raw.split("\n")[0]
         data = json.loads(first_line)
 
@@ -400,7 +382,6 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
 
     formats = data.get("formats", [])
     if not formats:
-        # فرمت تکی
         direct_url = data.get("url", "")
         if direct_url:
             ext = data.get("ext", "mp4")
@@ -427,7 +408,6 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
         format_note = fmt.get("format_note", "")
         filesize = fmt.get("filesize") or fmt.get("filesize_approx") or 0
 
-        # فقط فرمت‌هایی که ویدیو دارن
         if vcodec == "none":
             continue
 
@@ -437,7 +417,6 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             or ext == "m3u8"
         )
 
-        # ساخت label
         size_str = f" ({filesize / 1024 / 1024:.0f}MB)" if filesize else ""
         if height:
             if is_m3u8:
@@ -462,10 +441,7 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
 
 
 async def _extract_with_curl_cffi(url: str) -> Tuple[List[dict], str]:
-    """
-    استخراج با curl_cffi مستقیم (بدون yt-dlp).
-    از TLS fingerprint واقعی Chrome استفاده میکنه.
-    """
+    """استخراج با curl_cffi مستقیم (بدون yt-dlp)."""
     try:
         from curl_cffi.requests import AsyncSession
     except ImportError:
@@ -473,7 +449,6 @@ async def _extract_with_curl_cffi(url: str) -> Tuple[List[dict], str]:
 
     try:
         async with AsyncSession() as session:
-            # مرحله 1: صفحه اصلی برای کوکی
             try:
                 await session.get(
                     "https://www.xgroovy.com/",
@@ -483,7 +458,6 @@ async def _extract_with_curl_cffi(url: str) -> Tuple[List[dict], str]:
             except Exception:
                 pass
 
-            # مرحله 2: صفحه ویدیو
             resp = await session.get(
                 url,
                 impersonate="chrome",
@@ -528,9 +502,6 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
       1. yt-dlp با --impersonate (بهترین روش برای Cloudflare)
       2. curl_cffi مستقیم (اگه yt-dlp impersonation نداشت)
       3. request ساده (بعید که کار کنه ولی سعی میکنه)
-
-    Returns:
-        (qualities, title)
     """
     if not is_xgroovy_url(url):
         logger.warning("URL is not a valid xgroovy URL: %s", url)
@@ -543,7 +514,10 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
     qualities, title = await _extract_with_ytdlp(url)
     if qualities:
         qualities.sort(key=_quality_sort_key, reverse=True)
-        logger.info("Extracted %d qualities (yt-dlp) for: %s", len(qualities), title[:60])
+        logger.info(
+            "Extracted %d qualities (yt-dlp) for: %s",
+            len(qualities), title[:60],
+        )
         return qualities, title
 
     # ── روش 2: curl_cffi مستقیم ──
@@ -551,12 +525,15 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
     qualities, title = await _extract_with_curl_cffi(url)
     if qualities:
         qualities.sort(key=_quality_sort_key, reverse=True)
-        logger.info("Extracted %d qualities (curl_cffi) for: %s", len(qualities), title[:60])
+        logger.info(
+            "Extracted %d qualities (curl_cffi) for: %s",
+            len(qualities), title[:60],
+        )
         return qualities, title
 
     # ── روش 3: request ساده (آخرین تلاش) ──
     logger.info("curl_cffi failed, trying direct request for: %s", url)
-    html, status = await _fetch_with_curl_cffi_simple(url)
+    html, status = await _fetch_with_retry(url)
     if html:
         title = _extract_title(html)
         qualities = []
@@ -569,7 +546,6 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
 
     logger.warning("All extraction methods failed for: %s", url)
 
-    # پیام خطای مفید
     has_ytdlp = shutil.which("yt-dlp") is not None
     has_curl_cffi = _check_impersonation_support()
 
@@ -585,18 +561,11 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
     return [], "Extraction failed - site may have updated its protection"
 
 
-async def _fetch_with_curl_cffi_simple(url: str) -> Tuple[Optional[str], int]:
-    """تلاش ساده با curl_cffi بدون استخراج کامل."""
-    html, status = await _fetch_with_curl_cffi(url)
-    if isinstance(html, str):
-        return html, 200
-    return await _fetch_with_retry(url)
-
-
 # ─── HTML extraction helpers ───────────────────────────────
 
 
 def _extract_title(html: str) -> str:
+    """استخراج عنوان ویدیو از HTML."""
     m = re.search(
         r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
         html, re.IGNORECASE,
@@ -625,6 +594,7 @@ def _extract_title(html: str) -> str:
 def _extract_from_video_tag(
     html: str, page_url: str, qualities: List[dict]
 ) -> None:
+    """استخراج از تگ <video> با attribute src."""
     for m in re.finditer(
         r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
     ):
@@ -643,6 +613,7 @@ def _extract_from_video_tag(
 def _extract_from_source_tags(
     html: str, page_url: str, qualities: List[dict]
 ) -> None:
+    """استخراج از تگ‌های <source> داخل <video>."""
     for m in re.finditer(
         r'<source[^>]+src=["\']([^"\']+)["\']([^>]*)', html, re.IGNORECASE
     ):
@@ -670,14 +641,23 @@ def _extract_from_source_tags(
             q_label = f"{url_res.group(1)}p" if url_res else "Default"
 
         if is_m3u8:
-            qualities.append({"label": f"📡 M3U8 {q_label}", "url": src, "method": "m3u8"})
+            qualities.append({
+                "label": f"📡 M3U8 {q_label}",
+                "url": src,
+                "method": "m3u8",
+            })
         else:
-            qualities.append({"label": f"🎥 MP4 {q_label}", "url": src, "method": "direct"})
+            qualities.append({
+                "label": f"🎥 MP4 {q_label}",
+                "url": src,
+                "method": "direct",
+            })
 
 
 def _extract_from_json_ld(
     html: str, page_url: str, qualities: List[dict]
 ) -> None:
+    """استخراج از JSON-LD structured data."""
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.DOTALL | re.IGNORECASE,
@@ -708,6 +688,7 @@ def _extract_from_json_ld(
 def _extract_from_js_vars(
     html: str, page_url: str, qualities: List[dict]
 ) -> None:
+    """استخراج لینک ویدیو از متغیرهای JavaScript."""
     js_patterns = [
         (r"""(?:var\s+)?video_url\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
         (r"""(?:var\s+)?video[_]?[Ff]ile\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
@@ -725,7 +706,6 @@ def _extract_from_js_vars(
                 raw_url = m.group(2)
                 label = f"🎥 MP4 {quality_num}p"
             elif ptype == "encoded":
-                from urllib.parse import unquote
                 raw_url = unquote(m.group(1))
                 url_res = re.search(r"(\d{3,4})p", raw_url)
                 label = f"🎥 MP4 {url_res.group(1)}p" if url_res else "🎥 MP4"
@@ -739,12 +719,17 @@ def _extract_from_js_vars(
                 continue
             if any(q["url"] == video_url for q in qualities):
                 continue
-            qualities.append({"label": label, "url": video_url, "method": "direct"})
+            qualities.append({
+                "label": label,
+                "url": video_url,
+                "method": "direct",
+            })
 
 
 def _extract_from_player_config(
     html: str, page_url: str, qualities: List[dict]
 ) -> None:
+    """استخراج از JSON config پلیر."""
     config_patterns = [
         r"(?:flashvars|playerConfig|videoConfig|player_config)\s*=\s*(\{[^;]+\})",
         r"(?:flashvars|playerConfig|videoConfig)\s*=\s*'(\{[^']+\})'",
@@ -763,6 +748,7 @@ def _extract_from_player_config(
 def _extract_urls_from_dict(
     data: dict, page_url: str, qualities: List[dict], depth: int = 0
 ) -> None:
+    """بازگشتی URL های ویدیو رو از dict استخراج میکنه."""
     if depth > 5:
         return
     for key, value in data.items():
@@ -775,9 +761,15 @@ def _extract_urls_from_dict(
             is_m3u8 = ".m3u8" in video_url
             url_res = re.search(r"(\d{3,4})p", video_url)
             if is_m3u8:
-                label = f"📡 M3U8 {url_res.group(1)}p" if url_res else "📡 M3U8 Stream"
+                label = (
+                    f"📡 M3U8 {url_res.group(1)}p"
+                    if url_res else "📡 M3U8 Stream"
+                )
             else:
-                label = f"🎥 MP4 {url_res.group(1)}p" if url_res else f"🎥 MP4 ({key})"
+                label = (
+                    f"🎥 MP4 {url_res.group(1)}p"
+                    if url_res else f"🎥 MP4 ({key})"
+                )
             qualities.append({
                 "label": label,
                 "url": video_url,
@@ -788,128 +780,127 @@ def _extract_urls_from_dict(
         elif isinstance(value, list):
             for item in value:
                 if isinstance(item, dict):
-                    _extract_urls_from_dict(item, page_url, qualities, depth + 1)
+                    _extract_urls_from_dict(
+                        item, page_url, qualities, depth + 1
+                    )
 
 
-# ─── Download: Direct MP4 ──────────────────────────────────
+# ─── Download: curl_cffi ───────────────────────────────────
 
 
-async def download_xgroovy_direct(
+async def _download_with_curl_cffi(
     url: str,
     filepath: str,
     progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
-    if not _is_video_cdn_url(url):
-        return False, "URL host not allowed", 0
+    """دانلود با curl_cffi و TLS fingerprint واقعی Chrome."""
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        return False, "curl_cffi not installed", 0
 
-    headers = {
-        **_DEFAULT_HEADERS,
-        "Referer": "https://www.xgroovy.com/",
-        "Origin": "https://www.xgroovy.com",
-    }
+    try:
+        await progress_cb("📥 **شروع دانلود (curl_cffi)...**")
 
-    error = ""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            success, error, size = await _do_direct_download(
-                url, filepath, headers, progress_cb
+        async with AsyncSession() as session:
+            resp = await session.get(
+                url,
+                impersonate="chrome",
+                headers={
+                    "Referer": "https://www.xgroovy.com/",
+                    "Origin": "https://www.xgroovy.com",
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                allow_redirects=True,
+                timeout=600,
+                stream=True,
             )
-            if success:
-                return True, "", size
-            if error.startswith("HTTP 4") and "403" not in error:
-                _cleanup_file(filepath)
-                return False, error, 0
-        except asyncio.CancelledError:
-            _cleanup_file(filepath)
-            raise
-        except Exception as e:
-            error = str(e)[:150]
-            logger.warning("Download attempt %d/%d failed: %s", attempt, MAX_RETRIES, error)
 
-        if attempt < MAX_RETRIES:
-            _cleanup_file(filepath)
-            await asyncio.sleep(RETRY_DELAY * attempt)
-
-    _cleanup_file(filepath)
-    return False, f"Failed after {MAX_RETRIES} attempts: {error}", 0
-
-
-async def _do_direct_download(
-    url: str,
-    filepath: str,
-    headers: dict,
-    progress_cb: ProgressCallback,
-) -> Tuple[bool, str, int]:
-    timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
-
-    async with _get_session(timeout) as session:
-        async with session.get(url, headers=headers, allow_redirects=True) as resp:
-            if resp.status != 200:
-                return False, f"HTTP {resp.status}", 0
+            if resp.status_code != 200:
+                return False, f"HTTP {resp.status_code}", 0
 
             content_length = int(resp.headers.get("Content-Length", 0))
+
             if content_length > MAX_DOWNLOAD_SIZE:
-                return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                return (
+                    False,
+                    f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                    0,
+                )
 
             downloaded = 0
             start_time = time.time()
             last_update = 0.0
 
             async with aiofiles.open(filepath, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                async for chunk in resp.aiter_content():
+                    if not chunk:
+                        continue
                     await f.write(chunk)
                     downloaded += len(chunk)
+
                     if downloaded > MAX_DOWNLOAD_SIZE:
                         _cleanup_file(filepath)
                         return False, "Download exceeded size limit", 0
+
                     now = time.time()
                     if now - last_update >= 2.0:
                         last_update = now
                         await progress_cb(
-                            _format_progress(downloaded, content_length, start_time, now)
+                            _format_progress(
+                                downloaded, content_length, start_time, now
+                            )
                         )
 
-    return True, "", os.path.getsize(filepath)
+        if not os.path.exists(filepath):
+            return False, "File not created", 0
+
+        size = os.path.getsize(filepath)
+        if size == 0:
+            _cleanup_file(filepath)
+            return False, "Downloaded file is empty", 0
+
+        return True, "", size
+
+    except Exception as e:
+        logger.warning("curl_cffi download error: %s", e)
+        return False, str(e)[:150], 0
 
 
-# ─── Download: M3U8 ────────────────────────────────────────
+# ─── Download: yt-dlp ──────────────────────────────────────
 
 
-async def download_xgroovy_m3u8(
-    m3u8_url: str,
+async def _download_with_ytdlp(
+    url: str,
     filepath: str,
     progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
-    if not _is_video_cdn_url(m3u8_url):
-        return False, "URL host not allowed", 0
-
+    """دانلود با yt-dlp (هم direct هم m3u8 رو هندل میکنه)."""
     if not shutil.which("yt-dlp"):
-        return False, "yt-dlp is not installed", 0
+        return False, "yt-dlp not installed", 0
 
-    await progress_cb("📡 **دانلود M3U8 stream...**")
+    await progress_cb("📥 **شروع دانلود (yt-dlp)...**")
 
     try:
         cmd = [
             "yt-dlp",
             "--no-warnings",
-            "--quiet",
             "--progress",
             "--newline",
-            "-f", "best",
-            "--hls-prefer-native",
             "--no-check-certificates",
+            "-f", "best",
             "--max-filesize", str(MAX_DOWNLOAD_SIZE),
             "--add-header", "Referer:https://www.xgroovy.com/",
             "--add-header", "Origin:https://www.xgroovy.com",
             "--add-header", f"User-Agent:{_USER_AGENT}",
             "-o", filepath,
-            m3u8_url,
         ]
 
-        # اضافه کردن impersonate اگه پشتیبانی میشه
         if _check_impersonation_support():
-            cmd.insert(-1, "--impersonate")
-            cmd.insert(-1, "chrome")
+            cmd.extend(["--impersonate", "chrome"])
+
+        cmd.append(url)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -920,7 +911,9 @@ async def download_xgroovy_m3u8(
         last_update = 0.0
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=120)
+                line = await asyncio.wait_for(
+                    process.stdout.readline(), timeout=120
+                )
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
@@ -934,24 +927,22 @@ async def download_xgroovy_m3u8(
             now = time.time()
             if now - last_update >= 2.0 and text:
                 last_update = now
-                await progress_cb(f"📡 **Downloading M3U8...**\n`{text[:80]}`")
+                await progress_cb(f"📥 **Downloading...**\n`{text[:80]}`")
 
         await process.wait()
 
         if process.returncode != 0:
             stderr = (await process.stderr.read()).decode(errors="replace")
-            logger.error("yt-dlp failed (code %d): %s", process.returncode, stderr[:200])
-            _cleanup_file(filepath)
             return False, stderr[:200], 0
 
-        filepath = _find_output_file(filepath)
-        if not filepath:
+        actual_path = _find_output_file(filepath)
+        if not actual_path:
             return False, "Output file not found", 0
 
-        size = os.path.getsize(filepath)
+        size = os.path.getsize(actual_path)
         if size > MAX_DOWNLOAD_SIZE:
-            _cleanup_file(filepath)
-            return False, "Downloaded file exceeds size limit", 0
+            _cleanup_file(actual_path)
+            return False, "File exceeds size limit", 0
 
         return True, "", size
 
@@ -959,21 +950,171 @@ async def download_xgroovy_m3u8(
         _cleanup_file(filepath)
         raise
     except Exception as e:
-        logger.exception("M3U8 download error")
-        _cleanup_file(filepath)
         return False, str(e)[:150], 0
 
 
-def _find_output_file(filepath: str) -> Optional[str]:
-    if os.path.exists(filepath):
-        return filepath
-    base, _ = os.path.splitext(filepath)
-    for ext in (".mp4", ".mkv", ".webm", ".ts"):
-        candidate = base + ext
-        if os.path.exists(candidate):
-            try:
-                os.rename(candidate, filepath)
-                return filepath
-            except OSError:
-                return candidate
-    return None
+# ─── Download: aiohttp fallback ────────────────────────────
+
+
+async def _download_with_aiohttp(
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+) -> Tuple[bool, str, int]:
+    """دانلود با aiohttp ساده (آخرین تلاش)."""
+    headers = {
+        **_DEFAULT_HEADERS,
+        "Referer": "https://www.xgroovy.com/",
+        "Origin": "https://www.xgroovy.com",
+    }
+
+    error = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
+            async with _get_session(timeout) as session:
+                async with session.get(
+                    url, headers=headers, allow_redirects=True
+                ) as resp:
+                    if resp.status != 200:
+                        error = f"HTTP {resp.status}"
+                        if resp.status != 403 and 400 <= resp.status < 500:
+                            _cleanup_file(filepath)
+                            return False, error, 0
+                    else:
+                        content_length = int(
+                            resp.headers.get("Content-Length", 0)
+                        )
+                        if content_length > MAX_DOWNLOAD_SIZE:
+                            return (
+                                False,
+                                f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                                0,
+                            )
+
+                        downloaded = 0
+                        start_time = time.time()
+                        last_update = 0.0
+
+                        async with aiofiles.open(filepath, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(
+                                1024 * 1024
+                            ):
+                                await f.write(chunk)
+                                downloaded += len(chunk)
+
+                                if downloaded > MAX_DOWNLOAD_SIZE:
+                                    _cleanup_file(filepath)
+                                    return (
+                                        False,
+                                        "Download exceeded size limit",
+                                        0,
+                                    )
+
+                                now = time.time()
+                                if now - last_update >= 2.0:
+                                    last_update = now
+                                    await progress_cb(
+                                        _format_progress(
+                                            downloaded,
+                                            content_length,
+                                            start_time,
+                                            now,
+                                        )
+                                    )
+
+                        size = os.path.getsize(filepath)
+                        return True, "", size
+
+        except asyncio.CancelledError:
+            _cleanup_file(filepath)
+            raise
+        except Exception as e:
+            error = str(e)[:150]
+
+        if attempt < MAX_RETRIES:
+            _cleanup_file(filepath)
+            await asyncio.sleep(RETRY_DELAY * attempt)
+
+    _cleanup_file(filepath)
+    return False, f"Failed after {MAX_RETRIES} attempts: {error}", 0
+
+
+# ─── Download: Public API ──────────────────────────────────
+
+
+async def download_xgroovy_direct(
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+) -> Tuple[bool, str, int]:
+    """
+    دانلود لینک مستقیم MP4.
+    اول با curl_cffi، بعد yt-dlp، آخر aiohttp.
+
+    Returns:
+        (success, error_message, file_size)
+    """
+    if not _is_video_cdn_url(url):
+        return False, "URL host not allowed", 0
+
+    # ── روش 1: curl_cffi ──
+    if _check_impersonation_support():
+        logger.info("Trying download with curl_cffi: %s", url[:80])
+        success, error, size = await _download_with_curl_cffi(
+            url, filepath, progress_cb
+        )
+        if success:
+            return True, "", size
+        logger.info("curl_cffi download failed: %s", error)
+        _cleanup_file(filepath)
+
+    # ── روش 2: yt-dlp ──
+    if shutil.which("yt-dlp"):
+        logger.info("Trying download with yt-dlp: %s", url[:80])
+        success, error, size = await _download_with_ytdlp(
+            url, filepath, progress_cb
+        )
+        if success:
+            return True, "", size
+        logger.info("yt-dlp download failed: %s", error)
+        _cleanup_file(filepath)
+
+    # ── روش 3: aiohttp ──
+    logger.info("Trying download with aiohttp: %s", url[:80])
+    success, error, size = await _download_with_aiohttp(
+        url, filepath, progress_cb
+    )
+    if success:
+        return True, "", size
+
+    _cleanup_file(filepath)
+    return False, error, 0
+
+
+async def download_xgroovy_m3u8(
+    m3u8_url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+) -> Tuple[bool, str, int]:
+    """
+    دانلود M3U8 stream.
+    از yt-dlp استفاده میکنه چون بهترین ابزار برای M3U8 هست.
+
+    Returns:
+        (success, error_message, file_size)
+    """
+    if not _is_video_cdn_url(m3u8_url):
+        return False, "URL host not allowed", 0
+
+    if not shutil.which("yt-dlp"):
+        return False, "yt-dlp is not installed", 0
+
+    success, error, size = await _download_with_ytdlp(
+        m3u8_url, filepath, progress_cb
+    )
+    if success:
+        return True, "", size
+
+    _cleanup_file(filepath)
+    return False, error, 0
