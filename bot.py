@@ -78,6 +78,13 @@ from otherwebsiteshandler.xgroovy_handler import (
     download_xgroovy_m3u8,
     xgroovy_sessions,
 )
+from otherwebsiteshandler.TeenSexVideos_handler import (
+    is_teensexvideos_url,
+    extract_teensexvideos_qualities,
+    download_teensexvideos_direct,
+    download_teensexvideos_m3u8,
+    teensexvideos_sessions,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3416,6 +3423,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_teensexvideos_url(target_url):
+        logger.info(f"[URL] TeenSexVideos detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_teensexvideos_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3434,6 +3450,21 @@ async def generic_url_handler(event):
             await process_ytdlp_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
+        return
+
+    # Safety guard: skip URLs that should have been handled by dedicated handlers
+    if (
+        is_xnxx_url(target_url)
+        or is_xvideos_url(target_url)
+        or is_xgroovy_url(target_url)
+        or is_teensexvideos_url(target_url)
+        or is_pornhub_url(target_url)
+        or is_ytdlp_site_url(target_url)
+    ):
+        logger.warning(
+            f"[URL] Dedicated-site URL fell through to direct download — skipping | url={target_url[:120]}"
+        )
+        processing_messages.discard(msg_id)
         return
 
     logger.info(
@@ -5835,6 +5866,19 @@ process_xgroovy_request, xgroovy_quality_callback, xgroovy_cancel_callback = (
     )
 )
 
+(
+    process_teensexvideos_request,
+    teensexvideos_quality_callback,
+    teensexvideos_cancel_callback,
+) = _make_site_handler(
+    "tsv",
+    extract_teensexvideos_qualities,
+    download_teensexvideos_direct,
+    download_teensexvideos_m3u8,
+    teensexvideos_sessions,
+    "TeenSexVideos",
+)
+
 
 async def main():
     print("\n" + "=" * 60)
@@ -5975,6 +6019,12 @@ async def main():
     )
     client.add_event_handler(
         xgroovy_cancel_callback, events.CallbackQuery(pattern=r"xg_cancel_.+")
+    )
+    client.add_event_handler(
+        teensexvideos_quality_callback, events.CallbackQuery(pattern=r"tsv_q_.+")
+    )
+    client.add_event_handler(
+        teensexvideos_cancel_callback, events.CallbackQuery(pattern=r"tsv_cancel_.+")
     )
 
     # ===== Command handlers =====
