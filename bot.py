@@ -209,6 +209,25 @@ def extract_quality(filename: str) -> str:
     return ""
 
 
+def extract_season_episode(name: str) -> tuple:
+    s = name.lower()
+    # S02E06 / s02e06 / S2E6
+    m = re.search(r"s0*(\d+)\s*[. -]?\s*e0*(\d+)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # Season 2 Episode 6
+    m = re.search(r"season\s*(\d+)\s*episode\s*(\d+)", s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    # 2x06 / 02x6 — but NOT resolution like 720x480
+    m = re.search(r"(?:^|[^0-9])0*(\d+)\s*x\s*0*(\d+)", s)
+    if m:
+        s_num, e_num = int(m.group(1)), int(m.group(2))
+        if s_num <= 99 and e_num <= 999:
+            return s_num, e_num
+    return None, None
+
+
 def clean_filename(name: str) -> str:
     name = re.sub(r"^hs_\d+_", "", name)
     name = re.sub(r"_\d+_subtitled$", "", name)
@@ -221,6 +240,11 @@ def build_video_caption(
 ) -> str:
     clean = clean_filename(orig_name)
     lines = [f"🎬 {clean}"]
+    season, episode = extract_season_episode(orig_name)
+    if season is not None:
+        lines.append(f"فصل :{season}")
+    if episode is not None:
+        lines.append(f"قسمت :{episode}")
     if subtitle_name:
         lines.append(f"\nزیرنویس چسبیده: دارد ({subtitle_name}) ✅")
     else:
