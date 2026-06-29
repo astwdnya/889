@@ -85,7 +85,7 @@ from otherwebsiteshandler.TeenSexVideos_handler import (
     download_teensexvideos_m3u8,
     teensexvideos_sessions,
 )
-from otherwebsiteshandler.userporn_handler import (
+from otherwebsiteshandler.usersporn_handler import (
     is_usersporn_url,
     extract_usersporn_qualities,
     download_usersporn_direct,
