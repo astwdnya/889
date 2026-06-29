@@ -119,6 +119,13 @@ from otherwebsiteshandler.sexvid_handler import (
     download_sexvid_m3u8,
     sexvid_sessions,
 )
+from otherwebsiteshandler.tube8_handler import (
+    is_tube8_url,
+    extract_tube8_qualities,
+    download_tube8_direct,
+    download_tube8_m3u8,
+    tube8_sessions,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3597,6 +3604,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_tube8_url(target_url):
+        logger.info(f"[URL] Tube8 detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_tube8_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3628,6 +3644,7 @@ async def generic_url_handler(event):
         or is_rat_url(target_url)
         or is_youporn_url(target_url)
         or is_sexvid_url(target_url)
+        or is_tube8_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -6101,6 +6118,19 @@ process_xgroovy_request, xgroovy_quality_callback, xgroovy_cancel_callback = (
     "Sexvid",
 )
 
+(
+    process_tube8_request,
+    tube8_quality_callback,
+    tube8_cancel_callback,
+) = _make_site_handler(
+    "tb",
+    extract_tube8_qualities,
+    download_tube8_direct,
+    download_tube8_m3u8,
+    tube8_sessions,
+    "Tube8",
+)
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -6370,6 +6400,12 @@ async def main():
     )
     client.add_event_handler(
         sexvid_cancel_callback, events.CallbackQuery(pattern=r"sx_cancel_.+")
+    )
+    client.add_event_handler(
+        tube8_quality_callback, events.CallbackQuery(pattern=r"tb_q_.+")
+    )
+    client.add_event_handler(
+        tube8_cancel_callback, events.CallbackQuery(pattern=r"tb_cancel_.+")
     )
     client.add_event_handler(
         youporn_quality_callback, events.CallbackQuery(pattern=r"yp_q_.+")
