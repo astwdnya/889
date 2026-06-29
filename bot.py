@@ -3137,83 +3137,89 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """دستور /debughh برای دیباگ hentaihaven"""
+    """دستور /debughh برای دیباگ hentaihaven - مرحله 2: بررسی player.php"""
     import re
-    from otherwebsiteshandler.hentaihaven_handler import (
-        _fetch_page,
-        _find_video_iframes,
-        _extract_title,
+    from otherwebsiteshandler.hentaihaven_handler import _fetch_page
+
+    player_url = (
+        "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
+        "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
     )
+    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
 
-    url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
-    await event.reply("🔍 Fetching page...")
+    await event.reply("🔍 Fetching player.php...")
 
-    html, status, final_url = await _fetch_page(url)
+    html, status, final_url = await _fetch_page(player_url, referer=page_url)
 
     if not html:
-        await event.reply(f"❌ Could not fetch page. Status: {status}")
+        await event.reply(f"❌ player.php failed. Status: {status}")
         return
 
     lines = []
-    lines.append(f"✅ Got HTML: {len(html)} bytes")
+    lines.append(f"✅ player.php HTML: {len(html)} bytes")
     lines.append(f"📍 Final URL: {final_url}")
-    lines.append(f"📝 Title: {_extract_title(html)}")
 
-    all_iframes = re.findall(
+    iframes = re.findall(
         r'<iframe[^>]+(?:src|data-src)\s*=\s*["\']([^"\']+)["\']',
         html,
         re.IGNORECASE,
     )
-    lines.append(f"\n🖼 ALL iframes ({len(all_iframes)}):")
-    for i, iframe in enumerate(all_iframes[:15]):
-        lines.append(f"  {i}: {iframe[:100]}")
+    lines.append(f"\n🖼 Iframes in player ({len(iframes)}):")
+    for i, iframe in enumerate(iframes[:10]):
+        lines.append(f"  {i}: {iframe[:150]}")
 
-    player_urls = re.findall(
-        r'["\']([^"\']*player[^"\']*\.php[^"\']*)["\']', html, re.IGNORECASE
-    )
-    lines.append(f"\n🎬 Player URLs ({len(player_urls)}):")
-    for i, pu in enumerate(player_urls[:10]):
-        lines.append(f"  {i}: {pu[:100]}")
-
-    data_attrs = re.findall(
-        r'(?:data-video|data-embed|data-player|data-url)\s*=\s*["\']([^"\']+)["\']',
+    video_tags = re.findall(
+        r'<(?:video|source)[^>]+src=["\']([^"\']+)["\']',
         html,
         re.IGNORECASE,
     )
-    lines.append(f"\n📦 Data attrs ({len(data_attrs)}):")
-    for i, da in enumerate(data_attrs[:10]):
-        lines.append(f"  {i}: {da[:100]}")
-
-    video_tags = re.findall(
-        r'<(?:video|source)[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    )
-    lines.append(f"\n📹 Video/Source tags ({len(video_tags)}):")
+    lines.append(f"\n📹 Video/Source ({len(video_tags)}):")
     for i, vt in enumerate(video_tags[:10]):
-        lines.append(f"  {i}: {vt[:100]}")
+        lines.append(f"  {i}: {vt[:150]}")
 
-    mp4_links = re.findall(r'["\']([^"\']+\.mp4[^"\']*)["\']', html)
-    m3u8_links = re.findall(r'["\']([^"\']+\.m3u8[^"\']*)["\']', html)
-    lines.append(f"\n🎥 MP4 links ({len(mp4_links)}):")
-    for i, ml in enumerate(mp4_links[:5]):
-        lines.append(f"  {i}: {ml[:100]}")
-    lines.append(f"\n📡 M3U8 links ({len(m3u8_links)}):")
-    for i, ml in enumerate(m3u8_links[:5]):
-        lines.append(f"  {i}: {ml[:100]}")
+    mp4s = re.findall(r'["\']([^"\']+\.mp4[^"\']*)["\']', html)
+    m3u8s = re.findall(r'["\']([^"\']+\.m3u8[^"\']*)["\']', html)
+    lines.append(f"\n🎥 MP4 ({len(mp4s)}):")
+    for i, m in enumerate(mp4s[:5]):
+        lines.append(f"  {i}: {m[:150]}")
+    lines.append(f"\n📡 M3U8 ({len(m3u8s)}):")
+    for i, m in enumerate(m3u8s[:5]):
+        lines.append(f"  {i}: {m[:150]}")
 
-    idx = html.lower().find("player")
-    if idx >= 0:
-        snippet = html[max(0, idx - 100) : idx + 300].replace("\n", " ")
-        lines.append(f"\n📄 HTML near 'player':\n{snippet[:400]}")
+    js_sources = re.findall(
+        r"""(?:sources|file|src|source|videoUrl|video_url)\s*[:=]\s*['"]([^'"]+)['"]""",
+        html,
+    )
+    lines.append(f"\n📜 JS sources ({len(js_sources)}):")
+    for i, js in enumerate(js_sources[:10]):
+        lines.append(f"  {i}: {js[:150]}")
 
-    idx = html.lower().find("<iframe")
-    if idx >= 0:
-        snippet = html[idx : idx + 500].replace("\n", " ")
-        lines.append(f"\n📄 First <iframe>:\n{snippet[:400]}")
+    api_calls = re.findall(
+        r"""(?:fetch|ajax|axios|XMLHttpRequest|\.get|\.post)\s*\(\s*['"]([^'"]+)['"]""",
+        html,
+    )
+    lines.append(f"\n🌐 API calls ({len(api_calls)}):")
+    for i, ac in enumerate(api_calls[:10]):
+        lines.append(f"  {i}: {ac[:150]}")
 
-    filtered = _find_video_iframes(html, final_url or url)
-    lines.append(f"\n✅ Filtered embed URLs ({len(filtered)}):")
-    for i, fu in enumerate(filtered):
-        lines.append(f"  {i}: {fu[:100]}")
+    api_refs = re.findall(r'["\']([^"\']*api\.php[^"\']*)["\']', html, re.IGNORECASE)
+    lines.append(f"\n🔌 api.php refs ({len(api_refs)}):")
+    for i, ar in enumerate(api_refs[:10]):
+        lines.append(f"  {i}: {ar[:150]}")
+
+    scripts = re.findall(
+        r"<script[^>]*>(.*?)</script>", html, re.DOTALL | re.IGNORECASE
+    )
+    lines.append(f"\n📝 Script blocks ({len(scripts)}):")
+    for i, script in enumerate(scripts):
+        script_clean = script.strip()
+        if script_clean and len(script_clean) > 10:
+            lines.append(
+                f"  script[{i}] ({len(script_clean)} chars): {script_clean[:200]}"
+            )
+
+    lines.append(f"\n📄 First 1500 chars of player HTML:")
+    lines.append(html[:1500])
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
