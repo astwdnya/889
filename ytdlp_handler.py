@@ -36,7 +36,7 @@ def is_inxxx_url(url: str) -> bool:
 
 
 def is_hentaiheaven_url(url: str) -> bool:
-    return "hentaiheaven.com" in url.lower() or "hentaihaven.xxx" in url.lower()
+    return "hentaiheaven.com" in url.lower()
 
 
 def is_tube8_url(url: str) -> bool:
