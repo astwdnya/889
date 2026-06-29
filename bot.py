@@ -3136,6 +3136,90 @@ async def github_cmd(event):
         )
 
 
+async def debug_hentaihaven(event):
+    """دستور /debughh برای دیباگ hentaihaven"""
+    import re
+    from otherwebsiteshandler.hentaihaven_handler import (
+        _fetch_page,
+        _find_video_iframes,
+        _extract_title,
+    )
+
+    url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
+    await event.reply("🔍 Fetching page...")
+
+    html, status, final_url = await _fetch_page(url)
+
+    if not html:
+        await event.reply(f"❌ Could not fetch page. Status: {status}")
+        return
+
+    lines = []
+    lines.append(f"✅ Got HTML: {len(html)} bytes")
+    lines.append(f"📍 Final URL: {final_url}")
+    lines.append(f"📝 Title: {_extract_title(html)}")
+
+    all_iframes = re.findall(
+        r'<iframe[^>]+(?:src|data-src)\s*=\s*["\']([^"\']+)["\']',
+        html,
+        re.IGNORECASE,
+    )
+    lines.append(f"\n🖼 ALL iframes ({len(all_iframes)}):")
+    for i, iframe in enumerate(all_iframes[:15]):
+        lines.append(f"  {i}: {iframe[:100]}")
+
+    player_urls = re.findall(
+        r'["\']([^"\']*player[^"\']*\.php[^"\']*)["\']', html, re.IGNORECASE
+    )
+    lines.append(f"\n🎬 Player URLs ({len(player_urls)}):")
+    for i, pu in enumerate(player_urls[:10]):
+        lines.append(f"  {i}: {pu[:100]}")
+
+    data_attrs = re.findall(
+        r'(?:data-video|data-embed|data-player|data-url)\s*=\s*["\']([^"\']+)["\']',
+        html,
+        re.IGNORECASE,
+    )
+    lines.append(f"\n📦 Data attrs ({len(data_attrs)}):")
+    for i, da in enumerate(data_attrs[:10]):
+        lines.append(f"  {i}: {da[:100]}")
+
+    video_tags = re.findall(
+        r'<(?:video|source)[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
+    )
+    lines.append(f"\n📹 Video/Source tags ({len(video_tags)}):")
+    for i, vt in enumerate(video_tags[:10]):
+        lines.append(f"  {i}: {vt[:100]}")
+
+    mp4_links = re.findall(r'["\']([^"\']+\.mp4[^"\']*)["\']', html)
+    m3u8_links = re.findall(r'["\']([^"\']+\.m3u8[^"\']*)["\']', html)
+    lines.append(f"\n🎥 MP4 links ({len(mp4_links)}):")
+    for i, ml in enumerate(mp4_links[:5]):
+        lines.append(f"  {i}: {ml[:100]}")
+    lines.append(f"\n📡 M3U8 links ({len(m3u8_links)}):")
+    for i, ml in enumerate(m3u8_links[:5]):
+        lines.append(f"  {i}: {ml[:100]}")
+
+    idx = html.lower().find("player")
+    if idx >= 0:
+        snippet = html[max(0, idx - 100) : idx + 300].replace("\n", " ")
+        lines.append(f"\n📄 HTML near 'player':\n{snippet[:400]}")
+
+    idx = html.lower().find("<iframe")
+    if idx >= 0:
+        snippet = html[idx : idx + 500].replace("\n", " ")
+        lines.append(f"\n📄 First <iframe>:\n{snippet[:400]}")
+
+    filtered = _find_video_iframes(html, final_url or url)
+    lines.append(f"\n✅ Filtered embed URLs ({len(filtered)}):")
+    for i, fu in enumerate(filtered):
+        lines.append(f"  {i}: {fu[:100]}")
+
+    result = "\n".join(lines)
+    for i in range(0, len(result), 4000):
+        await event.reply(result[i : i + 4000])
+
+
 async def start_cmd(event):
     logger.info(f"[CMD] /start from user={event.sender_id}")
     if event.sender_id not in AUTHORIZED_USERS:
@@ -6130,6 +6214,9 @@ async def main():
     )
     client.add_event_handler(
         savep_command, events.NewMessage(pattern=r"^/savep(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        debug_hentaihaven, events.NewMessage(pattern=r"^/debughh(\s|$)", incoming=True)
     )
     client.add_event_handler(
         pdf_command, events.NewMessage(pattern=r"^/pdf(\s|$)", incoming=True)
