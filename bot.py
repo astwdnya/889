@@ -3137,123 +3137,161 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 6: آنالیز player.js برای decrypt logic"""
+    """مرحله 7: decode token و تست api.php"""
     import re
-    from otherwebsiteshandler.hentaihaven_handler import _fetch_page
+    import json
+    import base64
+    from otherwebsiteshandler.hentaihaven_handler import (
+        _fetch_page,
+        _check_impersonation_support,
+    )
 
+    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
     player_url = (
         "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
         "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
     )
-    js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
-
-    await event.reply("🔍 Deep analysis of player.js...")
-
-    js, _, _ = await _fetch_page(js_url, referer=player_url)
-    if not js:
-        await event.reply("❌ Could not fetch player.js")
-        return
 
     lines = []
-    lines.append(f"📜 player.js: {len(js)} bytes")
 
-    config_patterns = [
-        r"config\.en\s*=",
-        r"config\.iv\s*=",
-        r"this\.config\.en",
-        r"this\.config\.iv",
-        r"this\.config\.uri",
-        r"\.en\s*=\s*",
-        r"\.iv\s*=\s*",
-        r'"en"\s*:',
-        r'"iv"\s*:',
-        r'"uri"\s*:',
-        r"\.uri\s*=",
-    ]
-    for pat in config_patterns:
-        matches = list(re.finditer(pat, js))
-        if matches:
-            lines.append(f"\n🔑 '{pat}' found {len(matches)} times:")
-            for m in matches[:3]:
-                start = max(0, m.start() - 100)
-                end = min(len(js), m.end() + 200)
-                lines.append(f"  pos {m.start()}: ...{js[start:end][:300]}...")
+    if not _check_impersonation_support():
+        await event.reply("❌ curl_cffi required")
+        return
 
-    url_patterns = [
-        r"URLSearchParams",
-        r"searchParams",
-        r"location\.search",
-        r"location\.href",
-        r"window\.location",
-        r"getParameter",
-        r'get\s*\(\s*["\']data["\']',
-        r"querySelector.*data",
-    ]
-    for pat in url_patterns:
-        matches = list(re.finditer(pat, js))
-        if matches:
-            lines.append(f"\n🌐 '{pat}' found {len(matches)} times:")
-            for m in matches[:2]:
-                start = max(0, m.start() - 80)
-                end = min(len(js), m.end() + 200)
-                lines.append(f"  ...{js[start:end][:300]}...")
+    await event.reply("🔍 Step 1: Fetching player.php...")
 
-    crypto_patterns = [
-        r"decrypt",
-        r"AES",
-        r"CryptoJS",
-        r"crypto\.subtle",
-        r"atob\s*\(",
-        r"btoa\s*\(",
-        r"fromCharCode",
-        r"charCodeAt",
-        r"TextDecoder",
-        r"Uint8Array\.from",
-    ]
-    for pat in crypto_patterns:
-        matches = list(re.finditer(pat, js))
-        if matches:
-            lines.append(f"\n🔐 '{pat}' found {len(matches)} times:")
-            for m in matches[:2]:
-                start = max(0, m.start() - 100)
-                end = min(len(js), m.end() + 200)
-                lines.append(f"  ...{js[start:end][:300]}...")
+    from curl_cffi.requests import AsyncSession
 
-    init_patterns = [
-        r"constructor\s*\([^)]*\)\s*\{[^}]{0,500}config",
-        r"init\s*\([^)]*\)\s*\{[^}]{0,500}config",
-        r"class\s+\w+Player",
-        r"class\s+\w+Logic",
-        r"zarat",
-    ]
-    for pat in init_patterns:
-        matches = list(re.finditer(pat, js, re.DOTALL))
-        if matches:
-            lines.append(f"\n🏗 '{pat[:30]}' found {len(matches)} times:")
-            for m in matches[:2]:
-                lines.append(f"  ...{m.group()[:400]}...")
+    def reverse_str(s):
+        return s[::-1]
 
-    fetch_idx = js.find("fetchPlayerData")
-    if fetch_idx >= 0:
-        start = max(0, fetch_idx - 500)
-        end = min(len(js), fetch_idx + 800)
-        lines.append(f"\n🎯 fetchPlayerData full context:")
-        lines.append(js[start:end])
+    async with AsyncSession() as session:
+        try:
+            await session.get(
+                "https://hentaihaven.xxx/", impersonate="chrome", timeout=15
+            )
+        except Exception:
+            pass
 
-    token_patterns = [
-        r"x-secure-token",
-        r"secure.token",
-        r"secureToken",
-        r"meta.*token",
-    ]
-    for pat in token_patterns:
-        matches = list(re.finditer(pat, js, re.IGNORECASE))
-        if matches:
-            lines.append(f"\n🔒 '{pat}' found {len(matches)} times:")
-            for m in matches[:2]:
-                start = max(0, m.start() - 100)
-                end = min(len(js), m.end() + 200)
-                lines.append(f"  ...{js[start:end][:300]}...")
+        player_resp = await session.get(
+            player_url,
+            impersonate="chrome",
+            headers={"Referer": page_url},
+            timeout=15,
+        )
+        player_html = player_resp.text
+
+        token_m = re.search(
+            r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
+            player_html,
+            re.IGNORECASE,
+        )
+        if not token_m:
+            await event.reply("❌ x-secure-token not found")
+            return
+
+        raw_token = token_m.group(1)
+        lines.append(f"🔑 Raw token ({len(raw_token)} chars): {raw_token[:80]}...")
+
+        try:
+            val = raw_token.replace("sha512-", "")
+            lines.append(f"\n📝 After remove sha512- ({len(val)}): {val[:60]}...")
+
+            val = reverse_str(val)
+            lines.append(f"📝 After reverse1 ({len(val)}): {val[:60]}...")
+            val = base64.b64decode(val).decode("utf-8", errors="replace")
+            lines.append(f"📝 After atob1 ({len(val)}): {val[:60]}...")
+
+            val = reverse_str(val)
+            lines.append(f"📝 After reverse2 ({len(val)}): {val[:60]}...")
+            val = base64.b64decode(val).decode("utf-8", errors="replace")
+            lines.append(f"📝 After atob2 ({len(val)}): {val[:60]}...")
+
+            val = reverse_str(val)
+            lines.append(f"📝 After reverse3 ({len(val)}): {val[:60]}...")
+            val = base64.b64decode(val).decode("utf-8", errors="replace")
+            lines.append(f"📝 After atob3 ({len(val)}): {val[:60]}...")
+
+            config = json.loads(val)
+            lines.append(f"\n✅ DECODED CONFIG:")
+            lines.append(json.dumps(config, indent=2, ensure_ascii=False)[:1000])
+
+            en_val = config.get("en", "")
+            iv_val = config.get("iv", "")
+            uri_val = config.get("uri", "")
+
+            lines.append(f"\n🔐 en ({len(en_val)}): {en_val[:80]}...")
+            lines.append(f"🔐 iv ({len(iv_val)}): {iv_val[:80]}...")
+            lines.append(f"🌐 uri: {uri_val}")
+
+        except Exception as e:
+            lines.append(f"\n❌ Decode error: {e}")
+            try:
+                val2 = raw_token.replace("sha512-", "")
+                val2 = base64.b64decode(val2).decode("utf-8", errors="replace")
+                lines.append(f"\n📝 Direct atob: {val2[:200]}...")
+            except Exception as e2:
+                lines.append(f"❌ Direct atob also failed: {e2}")
+
+            result = "\n".join(lines)
+            for i in range(0, len(result), 4000):
+                await event.reply(result[i : i + 4000])
+            return
+
+        if en_val and iv_val:
+            await event.reply("🔍 Step 3: Testing api.php...")
+
+            api_url = (
+                f"{uri_val}api.php"
+                if uri_val
+                else "https://hentaihaven.xxx/wp-content/plugins/player-logic/api.php"
+            )
+
+            resp = await session.post(
+                api_url,
+                data={
+                    "action": "zarat_get_data_player_ajax",
+                    "a": en_val,
+                    "b": iv_val,
+                },
+                impersonate="chrome",
+                headers={
+                    "Referer": player_url,
+                    "Origin": "https://hentaihaven.xxx",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=15,
+            )
+
+            lines.append(f"\n🎯 api.php response:")
+            lines.append(f"  status: {resp.status_code}")
+            lines.append(f"  content-type: {resp.headers.get('content-type', '?')}")
+            lines.append(f"  length: {len(resp.text)}")
+
+            if resp.text:
+                lines.append(f"\n📦 Response body:")
+                lines.append(resp.text[:2000])
+
+                try:
+                    api_data = json.loads(resp.text)
+                    lines.append(f"\n✅ Parsed JSON keys: {list(api_data.keys())}")
+
+                    def find_urls(obj, prefix=""):
+                        if isinstance(obj, str):
+                            if "http" in obj or ".mp4" in obj or ".m3u8" in obj:
+                                lines.append(f"  🎥 {prefix}: {obj[:150]}")
+                        elif isinstance(obj, dict):
+                            for k, v in obj.items():
+                                find_urls(v, f"{prefix}.{k}")
+                        elif isinstance(obj, list):
+                            for i, v in enumerate(obj):
+                                find_urls(v, f"{prefix}[{i}]")
+
+                    find_urls(api_data)
+                except json.JSONDecodeError:
+                    lines.append("  (not valid JSON)")
+        else:
+            lines.append("\n❌ en or iv is empty")
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
