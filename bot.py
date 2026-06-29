@@ -3830,11 +3830,11 @@ async def generic_url_handler(event):
                 else:
                     dur_str = ""
 
+                orig_name = os.path.basename(filepath)
+
                 # ── Subtitle burn flow ──────────────────────────────────
                 subtitle_name = ""
                 if is_video and SUB_BURN_ENABLED:
-                    orig_name = os.path.basename(filepath)
-
                     # چک soft subtitle
                     await safe_edit(status_msg, "🔍 Checking for subtitle...")
                     persian_sub, non_persian_info = await extract_persian_subtitle(
