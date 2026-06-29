@@ -3137,90 +3137,155 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 9: پیدا کردن b0 و A0"""
+    """مرحله 10: ROT13 decode و api.php تست"""
     import re
-    from otherwebsiteshandler.hentaihaven_handler import _fetch_page
+    import json
+    import base64
+    import codecs
+    from otherwebsiteshandler.hentaihaven_handler import (
+        _fetch_page,
+        _check_impersonation_support,
+    )
 
+    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
     player_url = (
         "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
         "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
     )
-    js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
 
-    await event.reply("🔍 Finding b0 and A0...")
+    def rot13(s):
+        return codecs.encode(s, "rot_13")
 
-    js, _, _ = await _fetch_page(js_url, referer=player_url)
-    if not js:
-        await event.reply("❌ Could not fetch player.js")
-        return
+    def safe_b64(s):
+        s = s.strip()
+        missing = len(s) % 4
+        if missing:
+            s += "=" * (4 - missing)
+        return base64.b64decode(s).decode("utf-8")
 
     lines = []
 
-    idx = js.find("_r=b0(A0)")
-    if idx < 0:
-        idx = js.find("_r = b0(A0)")
-    if idx >= 0:
-        start = max(0, idx - 2000)
-        end = min(len(js), idx + 500)
-        nearby = js[start:end]
-        lines.append(f"📍 _r=b0(A0) at pos {idx}")
-        lines.append(f"\n📝 2000 chars BEFORE _r=b0(A0):")
-        lines.append(nearby[:2000])
-    else:
-        lines.append("❌ _r=b0(A0) not found")
+    from curl_cffi.requests import AsyncSession
 
-    b0_patterns = [
-        r"function\s+b0\s*\([^)]*\)\s*\{[^}]+\}",
-        r"const\s+b0\s*=\s*[^;]+;",
-        r"var\s+b0\s*=\s*[^;]+;",
-        r"let\s+b0\s*=\s*[^;]+;",
-        r"b0\s*=\s*function\s*\([^)]*\)\s*\{[^}]+\}",
-        r"b0\s*=\s*\([^)]*\)\s*=>\s*\{[^}]+\}",
-        r",b0\s*=\s*function\s*\([^)]*\)\s*\{[^}]+\}",
-    ]
-    for pat in b0_patterns:
-        matches = list(re.finditer(pat, js))
-        if matches:
-            lines.append(f"\n🔧 b0 found ({pat[:30]}...):")
-            for m in matches[:3]:
-                lines.append(f"  pos {m.start()}: {m.group()[:400]}")
-
-    a0_patterns = [
-        r"const\s+A0\s*=\s*[^;]+;",
-        r"var\s+A0\s*=\s*[^;]+;",
-        r"let\s+A0\s*=\s*[^;]+;",
-        r",A0\s*=\s*[^;,]+[;,]",
-        r"A0\s*=\s*\d+",
-        r'A0\s*=\s*["\'][^"\']+["\']',
-        r"A0\s*=\s*0x[0-9a-fA-F]+",
-    ]
-    for pat in a0_patterns:
-        matches = list(re.finditer(pat, js))
-        if matches:
-            lines.append(f"\n🔢 A0 found ({pat[:30]}...):")
-            for m in matches[:3]:
-                start = max(0, m.start() - 50)
-                end = min(len(js), m.end() + 50)
-                lines.append(f"  pos {m.start()}: ...{js[start:end][:300]}...")
-
-    if not any(re.findall(pat, js) for pat in b0_patterns):
-        lines.append("\n🔍 b0 not found as standalone, searching broader...")
-        if idx >= 0:
-            broad = js[max(0, idx - 5000) : idx + 200]
-            funcs = re.findall(
-                r"(?:function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:function|\([^)]*\)\s*=>))[^{]*\{[^}]{0,300}\}",
-                broad,
+    async with AsyncSession() as session:
+        try:
+            await session.get(
+                "https://hentaihaven.xxx/", impersonate="chrome", timeout=15
             )
-            lines.append(f"\n📝 Functions near _r ({len(funcs)}):")
-            for f in funcs[-10:]:
-                lines.append(f"  {f[:300]}")
+        except Exception:
+            pass
 
-            assigns = re.findall(
-                r"(?:const|let|var)\s+[A-Za-z0-9_]+\s*=\s*[^;]{1,200};", broad
-            )
-            lines.append(f"\n📝 Assignments near _r ({len(assigns)}):")
-            for a in assigns[-15:]:
-                lines.append(f"  {a[:300]}")
+        player_resp = await session.get(
+            player_url,
+            impersonate="chrome",
+            headers={"Referer": page_url},
+            timeout=15,
+        )
+
+        token_m = re.search(
+            r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
+            player_resp.text,
+            re.IGNORECASE,
+        )
+        if not token_m:
+            await event.reply("❌ token not found")
+            return
+
+        raw_token = token_m.group(1)
+
+        try:
+            val = raw_token.replace("sha512-", "")
+            lines.append(f"🔑 Start ({len(val)}): {val[:60]}...")
+
+            val = rot13(val)
+            lines.append(f"ROT13 → ({len(val)}): {val[:60]}...")
+
+            val = safe_b64(val)
+            lines.append(f"atob → ({len(val)}): {val[:60]}...")
+
+            val = rot13(val)
+            lines.append(f"ROT13 → ({len(val)}): {val[:60]}...")
+
+            val = safe_b64(val)
+            lines.append(f"atob → ({len(val)}): {val[:60]}...")
+
+            val = rot13(val)
+            lines.append(f"ROT13 → ({len(val)}): {val[:60]}...")
+
+            val = safe_b64(val)
+            lines.append(f"atob → ({len(val)}): {val[:60]}...")
+
+            config = json.loads(val)
+            lines.append(f"\n✅ DECODED CONFIG:")
+            lines.append(json.dumps(config, indent=2, ensure_ascii=False)[:1500])
+
+            en_val = config.get("en", "")
+            iv_val = config.get("iv", "")
+            uri_val = config.get("uri", "")
+
+            lines.append(f"\n🔐 en: {en_val[:80]}...")
+            lines.append(f"🔐 iv: {iv_val[:80]}...")
+            lines.append(f"🌐 uri: {uri_val}")
+
+            if en_val and iv_val:
+                await event.reply("🔍 Calling api.php...")
+
+                api_url = (
+                    f"{uri_val}api.php"
+                    if uri_val
+                    else "https://hentaihaven.xxx/wp-content/plugins/player-logic/api.php"
+                )
+
+                resp = await session.post(
+                    api_url,
+                    data={
+                        "action": "zarat_get_data_player_ajax",
+                        "a": en_val,
+                        "b": iv_val,
+                    },
+                    impersonate="chrome",
+                    headers={
+                        "Referer": player_url,
+                        "Origin": "https://hentaihaven.xxx",
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                    timeout=15,
+                )
+
+                lines.append(
+                    f"\n🎯 api.php: status={resp.status_code}, len={len(resp.text)}"
+                )
+                lines.append(f"  ct: {resp.headers.get('content-type', '?')}")
+
+                if resp.text:
+                    lines.append(f"\n📦 Body:")
+                    lines.append(resp.text[:2000])
+
+                    try:
+                        api_data = json.loads(resp.text)
+                        lines.append(f"\n✅ JSON keys: {list(api_data.keys())}")
+
+                        def find_urls(obj, prefix=""):
+                            if isinstance(obj, str) and (
+                                "http" in obj or ".mp4" in obj or ".m3u8" in obj
+                            ):
+                                lines.append(f"  🎥 {prefix}: {obj[:200]}")
+                            elif isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    find_urls(v, f"{prefix}.{k}")
+                            elif isinstance(obj, list):
+                                for i, v in enumerate(obj):
+                                    find_urls(v, f"{prefix}[{i}]")
+
+                        find_urls(api_data)
+                    except json.JSONDecodeError:
+                        lines.append("  (not JSON)")
+
+        except Exception as e:
+            lines.append(f"\n❌ Error: {e}")
+            import traceback
+
+            lines.append(traceback.format_exc()[:500])
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
