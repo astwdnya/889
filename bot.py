@@ -3137,162 +3137,63 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 10: ROT13 decode و api.php تست"""
+    """مرحله 11: پیدا کردن پارامترهای واقعی api.php از فایل JS"""
     import re
-    import json
-    import base64
-    import codecs
-    from otherwebsiteshandler.hentaihaven_handler import (
-        _fetch_page,
-        _check_impersonation_support,
-    )
+    from curl_cffi.requests import AsyncSession
 
-    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
     player_url = (
         "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
         "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
     )
 
-    def rot13(s):
-        return codecs.encode(s, "rot_13")
-
-    def safe_b64(s):
-        s = s.strip()
-        missing = len(s) % 4
-        if missing:
-            s += "=" * (4 - missing)
-        return base64.b64decode(s).decode("utf-8")
-
     lines = []
-
-    from curl_cffi.requests import AsyncSession
-    from curl_cffi import CurlMime
-
     async with AsyncSession() as session:
-        try:
-            await session.get(
-                "https://hentaihaven.xxx/", impersonate="chrome", timeout=15
-            )
-        except Exception:
-            pass
+        await session.get("https://hentaihaven.xxx/", impersonate="chrome", timeout=15)
 
-        player_resp = await session.get(
+        pr = await session.get(
             player_url,
             impersonate="chrome",
-            headers={"Referer": page_url},
+            headers={"Referer": "https://hentaihaven.xxx/"},
             timeout=15,
         )
+        html = pr.text
 
-        token_m = re.search(
-            r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
-            player_resp.text,
-            re.IGNORECASE,
-        )
-        if not token_m:
-            await event.reply("❌ token not found")
-            return
+        js_files = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
+        lines.append(f"📜 JS files ({len(js_files)}):")
+        for j in js_files:
+            lines.append(f"  • {j}")
 
-        raw_token = token_m.group(1)
-
-        try:
-            val = raw_token.replace("sha512-", "")
-            lines.append(f"🔑 Start ({len(val)}): {val[:60]}...")
-
-            val = rot13(val)
-            lines.append(f"ROT13 → ({len(val)}): {val[:60]}...")
-
-            val = safe_b64(val)
-            lines.append(f"atob → ({len(val)}): {val[:60]}...")
-
-            val = rot13(val)
-            lines.append(f"ROT13 → ({len(val)}): {val[:60]}...")
-
-            val = safe_b64(val)
-            lines.append(f"atob → ({len(val)}): {val[:60]}...")
-
-            val = rot13(val)
-            lines.append(f"ROT13 → ({len(val)}): {val[:60]}...")
-
-            val = safe_b64(val)
-            lines.append(f"atob → ({len(val)}): {val[:60]}...")
-
-            config = json.loads(val)
-            lines.append(f"\n✅ DECODED CONFIG:")
-            lines.append(json.dumps(config, indent=2, ensure_ascii=False)[:1500])
-
-            en_val = config.get("en", "")
-            iv_val = config.get("iv", "")
-            uri_val = config.get("uri", "")
-
-            lines.append(f"\n🔐 en: {en_val[:80]}...")
-            lines.append(f"🔐 iv: {iv_val[:80]}...")
-            lines.append(f"🌐 uri: {uri_val}")
-
-            if en_val:
-                # uri protocol-relative (//...) → https:
-                api_uri = uri_val
-                if api_uri.startswith("//"):
-                    api_uri = "https:" + api_uri
-                api_url = (
-                    f"{api_uri}api.php"
-                    if api_uri
-                    else "https://hentaihaven.xxx/wp-content/plugins/player-logic/api.php"
-                )
-                lines.append(f"🌐 API URL: {api_url}")
-
-                await event.reply("🔍 Calling api.php...")
-
-                multipart = CurlMime()
-                multipart.addpart(name="action", data=b"zarat_get_data_player_ajax")
-                multipart.addpart(name="a", data=en_val.encode())
-                multipart.addpart(name="b", data=iv_val.encode() if iv_val else b"")
-
-                resp = await session.post(
-                    api_url,
-                    multipart=multipart,
+        for js in js_files:
+            if js.startswith("//"):
+                js = "https:" + js
+            elif js.startswith("/"):
+                js = "https://hentaihaven.xxx" + js
+            if "player-logic" not in js and "player" not in js.lower():
+                continue
+            try:
+                jr = await session.get(
+                    js,
                     impersonate="chrome",
-                    headers={
-                        "Referer": player_url,
-                        "Origin": "https://hentaihaven.xxx",
-                        "X-Requested-With": "XMLHttpRequest",
-                    },
+                    headers={"Referer": player_url},
                     timeout=15,
                 )
+                jtext = jr.text
+                lines.append(f"\n📄 {js[:70]} (len={len(jtext)})")
 
-                lines.append(
-                    f"\n🎯 api.php: status={resp.status_code}, len={len(resp.text)}"
-                )
-                lines.append(f"  ct: {resp.headers.get('content-type', '?')}")
-
-                if resp.text:
-                    lines.append(f"\n📦 Body:")
-                    lines.append(resp.text[:2000])
-
-                    try:
-                        api_data = json.loads(resp.text)
-                        lines.append(f"\n✅ JSON keys: {list(api_data.keys())}")
-
-                        def find_urls(obj, prefix=""):
-                            if isinstance(obj, str) and (
-                                "http" in obj or ".mp4" in obj or ".m3u8" in obj
-                            ):
-                                lines.append(f"  🎥 {prefix}: {obj[:200]}")
-                            elif isinstance(obj, dict):
-                                for k, v in obj.items():
-                                    find_urls(v, f"{prefix}.{k}")
-                            elif isinstance(obj, list):
-                                for i, v in enumerate(obj):
-                                    find_urls(v, f"{prefix}[{i}]")
-
-                        find_urls(api_data)
-                    except json.JSONDecodeError:
-                        lines.append("  (not JSON)")
-
-        except Exception as e:
-            lines.append(f"\n❌ Error: {e}")
-            import traceback
-
-            lines.append(traceback.format_exc()[:500])
+                for m in re.finditer(r'\.append\(\s*["\']([^"\']+)["\']', jtext):
+                    lines.append(f"  append: {m.group(1)}")
+                for m in re.finditer(
+                    r"(zarat_\w+|action\s*[:=]\s*[\"'][^\"']+)", jtext
+                ):
+                    lines.append(f"  action: {m.group(1)[:60]}")
+                idx = jtext.find("api.php")
+                if idx != -1:
+                    lines.append(f"  ...api.php context...")
+                    start = max(0, idx - 300)
+                    ctx = jtext[start : idx + 100]
+                    lines.append(f"  {ctx}")
+            except Exception as e:
+                lines.append(f"  ❌ {e}")
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
