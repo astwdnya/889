@@ -4,21 +4,20 @@ rat_handler.py
 استخراج لینک‌های دانلود از rat.xxx (پلتفرم KVS / Kernel Video Sharing).
 
 روش کار:
-  - سایت مبتنی بر KVS هست
-  - flashvars شامل video_url با پیشوند 'function/0/' و license_code هست
-  - مسیر get_file با الگوریتم KVS و license_code رمزگشایی میشه
-  - چند کیفیت: video_url (360p), video_alt_url (480p), video_alt_url2 (720p)
+  - flashvars شامل video_url* با پیشوند 'function/0/' و license_code هست
+  - مسیر get_file با الگوریتم رسمی KVS (پورت‌شده از yt-dlp) رمزگشایی میشه
+  - چند کیفیت: 360p / 480p / 720p / ...
 """
 
 import asyncio
 import logging
 import os
 import re
-import shutil
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -47,18 +46,16 @@ _SITE_DOMAIN = "rat.xxx"
 _SITE_URL = "https://www.rat.xxx"
 _SITE_REFERER = f"{_SITE_URL}/"
 
-_ALLOWED_HOSTS = frozenset(
-    {
-        "rat.xxx",
-        "www.rat.xxx",
-    }
+_ALLOWED_HOSTS = frozenset({
+    "rat.xxx",
+    "www.rat.xxx",
+})
+
+_ALLOWED_HOST_SUFFIXES = (
+    ".rat.xxx",
 )
 
-_ALLOWED_HOST_SUFFIXES = (".rat.xxx",)
-
 ProgressCallback = Callable[[str], Awaitable[None]]
-
-rat_sessions: dict = {}
 
 
 # ─── Utility ────────────────────────────────────────────────
@@ -75,8 +72,9 @@ def is_rat_url(url: str) -> bool:
 def _is_allowed_host(url: str) -> bool:
     try:
         host = urlparse(url).hostname or ""
-        return host in _ALLOWED_HOSTS or any(
-            host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES
+        return (
+            host in _ALLOWED_HOSTS
+            or any(host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
         )
     except Exception:
         return False
@@ -96,10 +94,7 @@ def _quality_sort_key(q: dict) -> int:
 
 
 def _format_progress(
-    downloaded: int,
-    content_length: int,
-    start_time: float,
-    now: float,
+    downloaded: int, content_length: int, start_time: float, now: float,
 ) -> str:
     elapsed = now - start_time
     speed = downloaded / elapsed if elapsed > 0 else 0
@@ -123,90 +118,56 @@ def _format_progress(
 def _check_impersonation_support() -> bool:
     try:
         import curl_cffi  # noqa: F401
-
         return True
     except ImportError:
         return False
 
 
-# ─── KVS decoding ───────────────────────────────────────────
+# ─── KVS decoding (الگوریتم رسمی yt-dlp) ────────────────────
 
 
-def _kvs_decode_url(license_code: str, url_part: str) -> str:
-    """
-    رمزگشایی URL با الگوریتم KVS.
+def _kvs_get_license_token(license_code: str) -> List[int]:
+    """ساخت آرایه‌ی توکن از license_code (پورت دقیق از yt-dlp)."""
+    license_code = license_code.replace("$", "")
+    license_values = [int(char) for char in license_code]
 
-    ورودی url_part: بخش بعد از 'function/0/' (مسیر get_file رمزشده)
-    license_code: مثل '$310817210254405'
+    modlicense = license_code.replace("0", "1")
+    center = len(modlicense) // 2
+    fronthalf = int(modlicense[: center + 1])
+    backhalf = int(modlicense[center:])
+    modlicense = str(4 * abs(fronthalf - backhalf))[: center + 1]
 
-    خروجی: URL کامل و معتبر.
-    """
-    # پیدا کردن بخش رمزشده (۳۲ کاراکتر بعد از آخرین get_file segment)
-    # ساختار: .../get_file/N/<32hex_scrambled><rest>/...
-    # بخش scrambled همون ۳۲ کاراکتر اول قطعه‌ی hash هست.
-    parts = url_part.split("/")
-    # پیدا کردن قطعه‌ای که >=32 کاراکتر hex داره
-    idx = None
-    for i, seg in enumerate(parts):
-        if len(seg) >= 32 and re.fullmatch(r"[0-9a-f]+", seg[:32]):
-            idx = i
-            break
-    if idx is None:
-        return url_part
-
-    scrambled = parts[idx]
-    head = scrambled[:32]
-    tail = scrambled[32:]
-
-    license_arr = _kvs_license_to_array(license_code)
-    chars = list(head)
-
-    n = len(chars)
-    for k in range(n - 1, -1, -1):
-        offset = license_arr[k % len(license_arr)] % n if license_arr else 0
-        # swap با موقعیت محاسبه‌شده (الگوریتم استاندارد KVS)
-        j = (k + offset) % n
-        # نسخه‌ی رایج: جابه‌جایی دو کاراکتر
-        chars[k], chars[j] = chars[j], chars[k]
-
-    parts[idx] = "".join(chars) + tail
-    return "/".join(parts)
+    return [
+        (license_values[index + offset] + current) % 10
+        for index, current in enumerate(map(int, modlicense))
+        for offset in range(4)
+    ]
 
 
-def _kvs_license_to_array(license_code: str) -> List[int]:
-    """
-    تبدیل license_code به آرایه‌ی اعداد (الگوریتم KVS).
-    """
-    code = license_code.replace("$", "")
-    if not code.isdigit():
-        # اگه عددی نبود، از hash کاراکترها استفاده کن
-        code = "".join(str(ord(c)) for c in code)
+def _kvs_get_real_url(video_url: str, license_code: str) -> str:
+    """رمزگشایی video_url با الگوریتم رسمی KVS (پورت دقیق از yt-dlp)."""
+    if not video_url.startswith("function/0/"):
+        return video_url
 
-    result: List[int] = []
-    # KVS استاندارد: جفت رقم‌ها رو می‌گیره، اگه 0 بود +1
-    for i in range(0, len(code) - 1, 2):
-        pair = code[i : i + 2]
-        try:
-            val = int(pair)
-        except ValueError:
-            val = 1
-        result.append(val if val != 0 else 1)
-    return result or [1]
+    parsed = urllib.parse.urlparse(video_url[len("function/0/"):])
+    license_token = _kvs_get_license_token(license_code)
+    urlparts = parsed.path.split("/")
 
+    hash_length = 32
+    hash_ = urlparts[3][:hash_length]
+    indices = list(range(hash_length))
 
-def _build_quality_url(raw_value: str) -> Optional[str]:
-    """
-    تبدیل مقدار flashvars به URL آماده.
-    اگه 'function/0/' داره، اون رو حذف کن (بعد از decode).
-    """
-    if not raw_value:
-        return None
-    val = raw_value.replace("\\/", "/").strip()
-    if val.startswith("function/0/"):
-        val = val[len("function/0/") :]
-    if not val.startswith("http"):
-        return None
-    return val
+    accum = 0
+    for src in reversed(range(hash_length)):
+        accum += license_token[src]
+        dest = (src + accum) % hash_length
+        indices[src], indices[dest] = indices[dest], indices[src]
+
+    urlparts[3] = (
+        "".join(hash_[index] for index in indices)
+        + urlparts[3][hash_length:]
+    )
+    return urllib.parse.urlunparse(parsed._replace(path="/".join(urlparts)))
 
 
 # ─── HTTP helpers ───────────────────────────────────────────
@@ -216,7 +177,9 @@ def _build_quality_url(raw_value: str) -> Optional[str]:
 async def _get_session(timeout: Optional[ClientTimeout] = None):
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar()
-    session = aiohttp.ClientSession(timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar)
+    session = aiohttp.ClientSession(
+        timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
+    )
     try:
         yield session
     finally:
@@ -228,17 +191,14 @@ async def _fetch_page(url: str) -> Tuple[Optional[str], int]:
     if _check_impersonation_support():
         try:
             from curl_cffi.requests import AsyncSession
-
             async with AsyncSession() as session:
                 try:
                     await session.get(_SITE_REFERER, impersonate="chrome", timeout=15)
                 except Exception:
                     pass
                 resp = await session.get(
-                    url,
-                    impersonate="chrome",
-                    headers={"Referer": _SITE_REFERER},
-                    timeout=25,
+                    url, impersonate="chrome",
+                    headers={"Referer": _SITE_REFERER}, timeout=25,
                 )
                 if resp.status_code == 200:
                     return resp.text, 200
@@ -249,8 +209,7 @@ async def _fetch_page(url: str) -> Tuple[Optional[str], int]:
     try:
         async with _get_session() as session:
             async with session.get(
-                url,
-                headers={**_DEFAULT_HEADERS, "Referer": _SITE_REFERER},
+                url, headers={**_DEFAULT_HEADERS, "Referer": _SITE_REFERER},
                 allow_redirects=True,
             ) as resp:
                 if resp.status == 200:
@@ -271,7 +230,9 @@ def _parse_flashvars(html: str) -> dict:
         return {}
     block = m.group(1)
     result = {}
-    for fm in re.finditer(r"""['"]?([\w]+)['"]?\s*:\s*['"]([^'"]*)['"]""", block):
+    for fm in re.finditer(
+        r"""['"]?(\w+)['"]?\s*:\s*'([^']*)'""", block, re.DOTALL
+    ):
         result[fm.group(1)] = fm.group(2)
     return result
 
@@ -294,9 +255,7 @@ def _extract_title(html: str, flashvars: dict) -> str:
 
 
 async def extract_rat_qualities(url: str) -> Tuple[List[dict], str]:
-    """
-    لینک‌های کیفیت مختلف رو از صفحه rat.xxx استخراج میکنه.
-    """
+    """لینک‌های کیفیت مختلف رو از صفحه rat.xxx استخراج میکنه."""
     if not is_rat_url(url):
         return [], "Invalid URL"
 
@@ -329,28 +288,29 @@ async def extract_rat_qualities(url: str) -> Tuple[List[dict], str]:
         if not raw:
             continue
 
-        # اگه با function/N/ شروع بشه → باید decode بشه
         decoded = raw.replace("\\/", "/").strip()
-        m = re.match(r"function/\d+/(.+)", decoded)
-        if m and license_code:
-            inner = m.group(1)
-            decoded = _kvs_decode_url(license_code, inner)
+        if decoded.startswith("function/0/"):
+            if not license_code:
+                logger.debug("Encrypted url but no license_code for %s", key)
+                continue
+            try:
+                decoded = _kvs_get_real_url(decoded, license_code)
+            except Exception as e:
+                logger.warning("KVS decode failed for %s: %s", key, e)
+                continue
 
-        video_url = _build_quality_url(decoded)
-        if not video_url or video_url in seen:
+        if not decoded.startswith("http") or decoded in seen:
             continue
-        if not _is_allowed_host(video_url):
-            logger.debug("Skipping non-allowed host: %s", video_url[:60])
+        if not _is_allowed_host(decoded):
+            logger.debug("Skipping non-allowed host: %s", decoded[:60])
             continue
-        seen.add(video_url)
+        seen.add(decoded)
 
-        qualities.append(
-            {
-                "label": f"🎥 {label}",
-                "url": video_url,
-                "method": "direct",
-            }
-        )
+        qualities.append({
+            "label": f"🎥 {label}",
+            "url": decoded,
+            "method": "direct",
+        })
 
     if qualities:
         qualities.sort(key=_quality_sort_key, reverse=True)
@@ -364,9 +324,7 @@ async def extract_rat_qualities(url: str) -> Tuple[List[dict], str]:
 
 
 async def _download_with_curl_cffi(
-    url: str,
-    filepath: str,
-    progress_cb: ProgressCallback,
+    url: str, filepath: str, progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     try:
         from curl_cffi.requests import AsyncSession
@@ -377,23 +335,16 @@ async def _download_with_curl_cffi(
         await progress_cb("📥 **شروع دانلود...**")
         async with AsyncSession() as session:
             resp = await session.get(
-                url,
-                impersonate="chrome",
+                url, impersonate="chrome",
                 headers={"Referer": _SITE_REFERER, "Accept": "*/*"},
-                allow_redirects=True,
-                timeout=600,
-                stream=True,
+                allow_redirects=True, timeout=600, stream=True,
             )
             if resp.status_code != 200:
                 return False, f"HTTP {resp.status_code}", 0
 
             content_length = int(resp.headers.get("Content-Length", 0))
             if content_length > MAX_DOWNLOAD_SIZE:
-                return (
-                    False,
-                    f"File too large: {content_length / 1024 / 1024:.0f} MB",
-                    0,
-                )
+                return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
 
             ct = resp.headers.get("Content-Type", "").lower()
             if "text/html" in ct:
@@ -416,9 +367,7 @@ async def _download_with_curl_cffi(
                     if now - last_update >= 2.0:
                         last_update = now
                         await progress_cb(
-                            _format_progress(
-                                downloaded, content_length, start_time, now
-                            )
+                            _format_progress(downloaded, content_length, start_time, now)
                         )
 
         if not os.path.exists(filepath):
@@ -438,9 +387,7 @@ async def _download_with_curl_cffi(
 
 
 async def _download_with_aiohttp(
-    url: str,
-    filepath: str,
-    progress_cb: ProgressCallback,
+    url: str, filepath: str, progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     headers = {**_DEFAULT_HEADERS, "Referer": _SITE_REFERER}
     error = ""
@@ -500,29 +447,17 @@ async def _download_with_aiohttp(
     return False, error, 0
 
 
-async def download_rat_m3u8(
-    m3u8_url: str,
-    filepath: str,
-    progress_cb: ProgressCallback,
-) -> Tuple[bool, str, int]:
-    return False, "rat.xxx does not use m3u8 streams", 0
-
-
 async def download_rat_direct(
-    url: str,
-    filepath: str,
-    progress_cb: ProgressCallback,
+    url: str, filepath: str, progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     """دانلود لینک مستقیم MP4 از rat.xxx."""
     if not _is_allowed_host(url):
         return False, "URL host not allowed", 0
 
-    # curl_cffi اول (برای دور زدن محافظت)
+    # curl_cffi اول
     if _check_impersonation_support():
         logger.info("Trying download with curl_cffi: %s", url[:80])
-        success, error, size = await _download_with_curl_cffi(
-            url, filepath, progress_cb
-        )
+        success, error, size = await _download_with_curl_cffi(url, filepath, progress_cb)
         if success:
             return True, "", size
         logger.info("curl_cffi download failed: %s", error)
