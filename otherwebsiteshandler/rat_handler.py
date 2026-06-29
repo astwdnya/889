@@ -46,14 +46,14 @@ _SITE_DOMAIN = "rat.xxx"
 _SITE_URL = "https://www.rat.xxx"
 _SITE_REFERER = f"{_SITE_URL}/"
 
-_ALLOWED_HOSTS = frozenset({
-    "rat.xxx",
-    "www.rat.xxx",
-})
-
-_ALLOWED_HOST_SUFFIXES = (
-    ".rat.xxx",
+_ALLOWED_HOSTS = frozenset(
+    {
+        "rat.xxx",
+        "www.rat.xxx",
+    }
 )
+
+_ALLOWED_HOST_SUFFIXES = (".rat.xxx",)
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 
@@ -72,9 +72,8 @@ def is_rat_url(url: str) -> bool:
 def _is_allowed_host(url: str) -> bool:
     try:
         host = urlparse(url).hostname or ""
-        return (
-            host in _ALLOWED_HOSTS
-            or any(host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
+        return host in _ALLOWED_HOSTS or any(
+            host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES
         )
     except Exception:
         return False
@@ -94,7 +93,10 @@ def _quality_sort_key(q: dict) -> int:
 
 
 def _format_progress(
-    downloaded: int, content_length: int, start_time: float, now: float,
+    downloaded: int,
+    content_length: int,
+    start_time: float,
+    now: float,
 ) -> str:
     elapsed = now - start_time
     speed = downloaded / elapsed if elapsed > 0 else 0
@@ -118,6 +120,7 @@ def _format_progress(
 def _check_impersonation_support() -> bool:
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -149,7 +152,7 @@ def _kvs_get_real_url(video_url: str, license_code: str) -> str:
     if not video_url.startswith("function/0/"):
         return video_url
 
-    parsed = urllib.parse.urlparse(video_url[len("function/0/"):])
+    parsed = urllib.parse.urlparse(video_url[len("function/0/") :])
     license_token = _kvs_get_license_token(license_code)
     urlparts = parsed.path.split("/")
 
@@ -163,10 +166,7 @@ def _kvs_get_real_url(video_url: str, license_code: str) -> str:
         dest = (src + accum) % hash_length
         indices[src], indices[dest] = indices[dest], indices[src]
 
-    urlparts[3] = (
-        "".join(hash_[index] for index in indices)
-        + urlparts[3][hash_length:]
-    )
+    urlparts[3] = "".join(hash_[index] for index in indices) + urlparts[3][hash_length:]
     return urllib.parse.urlunparse(parsed._replace(path="/".join(urlparts)))
 
 
@@ -177,9 +177,7 @@ def _kvs_get_real_url(video_url: str, license_code: str) -> str:
 async def _get_session(timeout: Optional[ClientTimeout] = None):
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar()
-    session = aiohttp.ClientSession(
-        timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
-    )
+    session = aiohttp.ClientSession(timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar)
     try:
         yield session
     finally:
@@ -191,14 +189,17 @@ async def _fetch_page(url: str) -> Tuple[Optional[str], int]:
     if _check_impersonation_support():
         try:
             from curl_cffi.requests import AsyncSession
+
             async with AsyncSession() as session:
                 try:
                     await session.get(_SITE_REFERER, impersonate="chrome", timeout=15)
                 except Exception:
                     pass
                 resp = await session.get(
-                    url, impersonate="chrome",
-                    headers={"Referer": _SITE_REFERER}, timeout=25,
+                    url,
+                    impersonate="chrome",
+                    headers={"Referer": _SITE_REFERER},
+                    timeout=25,
                 )
                 if resp.status_code == 200:
                     return resp.text, 200
@@ -209,7 +210,8 @@ async def _fetch_page(url: str) -> Tuple[Optional[str], int]:
     try:
         async with _get_session() as session:
             async with session.get(
-                url, headers={**_DEFAULT_HEADERS, "Referer": _SITE_REFERER},
+                url,
+                headers={**_DEFAULT_HEADERS, "Referer": _SITE_REFERER},
                 allow_redirects=True,
             ) as resp:
                 if resp.status == 200:
@@ -230,9 +232,7 @@ def _parse_flashvars(html: str) -> dict:
         return {}
     block = m.group(1)
     result = {}
-    for fm in re.finditer(
-        r"""['"]?(\w+)['"]?\s*:\s*'([^']*)'""", block, re.DOTALL
-    ):
+    for fm in re.finditer(r"""['"]?(\w+)['"]?\s*:\s*'([^']*)'""", block, re.DOTALL):
         result[fm.group(1)] = fm.group(2)
     return result
 
@@ -306,11 +306,13 @@ async def extract_rat_qualities(url: str) -> Tuple[List[dict], str]:
             continue
         seen.add(decoded)
 
-        qualities.append({
-            "label": f"🎥 {label}",
-            "url": decoded,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": f"🎥 {label}",
+                "url": decoded,
+                "method": "direct",
+            }
+        )
 
     if qualities:
         qualities.sort(key=_quality_sort_key, reverse=True)
@@ -324,7 +326,9 @@ async def extract_rat_qualities(url: str) -> Tuple[List[dict], str]:
 
 
 async def _download_with_curl_cffi(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     try:
         from curl_cffi.requests import AsyncSession
@@ -335,16 +339,23 @@ async def _download_with_curl_cffi(
         await progress_cb("📥 **شروع دانلود...**")
         async with AsyncSession() as session:
             resp = await session.get(
-                url, impersonate="chrome",
+                url,
+                impersonate="chrome",
                 headers={"Referer": _SITE_REFERER, "Accept": "*/*"},
-                allow_redirects=True, timeout=600, stream=True,
+                allow_redirects=True,
+                timeout=600,
+                stream=True,
             )
             if resp.status_code != 200:
                 return False, f"HTTP {resp.status_code}", 0
 
             content_length = int(resp.headers.get("Content-Length", 0))
             if content_length > MAX_DOWNLOAD_SIZE:
-                return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                return (
+                    False,
+                    f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                    0,
+                )
 
             ct = resp.headers.get("Content-Type", "").lower()
             if "text/html" in ct:
@@ -367,7 +378,9 @@ async def _download_with_curl_cffi(
                     if now - last_update >= 2.0:
                         last_update = now
                         await progress_cb(
-                            _format_progress(downloaded, content_length, start_time, now)
+                            _format_progress(
+                                downloaded, content_length, start_time, now
+                            )
                         )
 
         if not os.path.exists(filepath):
@@ -387,7 +400,9 @@ async def _download_with_curl_cffi(
 
 
 async def _download_with_aiohttp(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     headers = {**_DEFAULT_HEADERS, "Referer": _SITE_REFERER}
     error = ""
@@ -447,8 +462,18 @@ async def _download_with_aiohttp(
     return False, error, 0
 
 
+async def download_rat_m3u8(
+    m3u8_url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+) -> Tuple[bool, str, int]:
+    return False, "rat.xxx does not use m3u8 streams", 0
+
+
 async def download_rat_direct(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     """دانلود لینک مستقیم MP4 از rat.xxx."""
     if not _is_allowed_host(url):
@@ -457,7 +482,9 @@ async def download_rat_direct(
     # curl_cffi اول
     if _check_impersonation_support():
         logger.info("Trying download with curl_cffi: %s", url[:80])
-        success, error, size = await _download_with_curl_cffi(url, filepath, progress_cb)
+        success, error, size = await _download_with_curl_cffi(
+            url, filepath, progress_cb
+        )
         if success:
             return True, "", size
         logger.info("curl_cffi download failed: %s", error)
