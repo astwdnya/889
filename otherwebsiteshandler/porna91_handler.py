@@ -23,7 +23,7 @@ import re
 import shutil
 import time
 from typing import Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 logger = logging.getLogger("Porna91Handler")
 
@@ -37,6 +37,7 @@ MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
 _SITE_DOMAIN = "91porna.com"
 _SITE_URL = "https://91porna.com"
 _SITE_REFERER = f"{_SITE_URL}/"
+_SITE_ORIGIN = _SITE_URL
 
 _ALLOWED_HOSTS = frozenset({"91porna.com", "www.91porna.com"})
 
@@ -59,6 +60,15 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 
 # فقط یک استخراج/دانلود همزمان (مدیریت RAM سرور)
 _SEMAPHORE = asyncio.Semaphore(1)
+
+# الگوهای خطای توکن منقضی‌شده
+_EXPIRED_PATTERNS = (
+    "http error 404",
+    "fragment not found",
+    "403",
+    "forbidden",
+    "auth_key",
+)
 
 
 # ─── Utility ────────────────────────────────────────────────
@@ -112,6 +122,11 @@ def _find_output_file(filepath: str) -> Optional[str]:
             except OSError:
                 return candidate
     return None
+
+
+def _looks_expired(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in _EXPIRED_PATTERNS)
 
 
 # ─── Extraction با Playwright ───────────────────────────────
@@ -192,7 +207,9 @@ async def _extract_m3u8_via_browser(url: str) -> Tuple[Optional[str], str]:
                     pass
 
     if found:
-        return found[0], title
+        # ترجیح master playlist (معمولاً شامل کلمه master یا کوتاه‌ترین مسیر)
+        master = next((u for u in found if "master" in u.lower()), None)
+        return (master or found[0]), title
     return None, title
 
 
@@ -214,7 +231,7 @@ async def extract_91porna_qualities(url: str) -> Tuple[List[dict], str]:
             logger.exception("Playwright extraction failed")
             return [], f"Browser extraction failed: {str(e)[:120]}"
         finally:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
     if not m3u8_url:
         return [], "m3u8 not found (پلیر لود نشد یا توکن گرفته نشد)"
@@ -224,6 +241,8 @@ async def extract_91porna_qualities(url: str) -> Tuple[List[dict], str]:
             "label": "📡 دانلود (HLS)",
             "url": m3u8_url,
             "method": "m3u8",
+            # آدرس صفحه اصلی رو نگه می‌داریم تا اگه توکن منقضی شد، دوباره extract کنیم
+            "page_url": url,
         }
     ]
     logger.info("Extracted m3u8 for: %s", title[:60])
@@ -254,18 +273,22 @@ async def _download_with_ytdlp(
             "--no-check-certificates",
             "--concurrent-fragments",
             "16",
+            # ── retry کوتاه: روی توکن منقضی سریع fail کن، دقایق هنگ نکن ──
             "--retries",
-            "10",
+            "3",
             "--fragment-retries",
-            "10",
+            "3",
             "--retry-sleep",
-            "fragment:exp=1:30",
+            "fragment:linear=1:3:1",
+            "--abort-on-unavailable-fragment",
             "--buffer-size",
             "16K",
             "--max-filesize",
             str(MAX_DOWNLOAD_SIZE),
             "--add-header",
             f"Referer:{_SITE_REFERER}",
+            "--add-header",
+            f"Origin:{_SITE_ORIGIN}",
             "--add-header",
             f"User-Agent:{_USER_AGENT}",
             "--merge-output-format",
@@ -314,6 +337,10 @@ async def _download_with_ytdlp(
 
         await process.wait()
         if process.returncode != 0:
+            full_err = "\n".join(tail)
+            # تشخیص توکن منقضی‌شده → پیام واضح
+            if _looks_expired(full_err):
+                return False, "__EXPIRED__", 0
             err = "\n".join(tail[-5:]) or "yt-dlp failed"
             return False, err[:200], 0
 
@@ -344,8 +371,14 @@ async def download_91porna_m3u8(
     m3u8_url: str,
     filepath: str,
     progress_cb: ProgressCallback,
+    page_url: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
-    """دانلود HLS stream از 91porna با yt-dlp."""
+    """
+    دانلود HLS stream از 91porna با yt-dlp.
+
+    اگه توکن منقضی شده باشه و page_url داده شده باشه، یک بار به‌صورت
+    خودکار دوباره extract می‌کنه و با لینک تازه دوباره تلاش می‌کنه.
+    """
     if not _is_allowed_host(m3u8_url):
         return False, "URL host not allowed", 0
 
@@ -353,9 +386,32 @@ async def download_91porna_m3u8(
         success, error, size = await _download_with_ytdlp(
             m3u8_url, filepath, progress_cb
         )
+
     if success:
         return True, "", size
+
     _cleanup_file(filepath)
+
+    # ── توکن منقضی شده: یک بار رفرش خودکار لینک و تلاش مجدد ──
+    if error == "__EXPIRED__" and page_url and is_91porna_url(page_url):
+        await progress_cb("♻️ **توکن منقضی شد، در حال گرفتن لینک تازه...**")
+        qualities, _title = await extract_91porna_qualities(page_url)
+        if qualities:
+            fresh_url = qualities[0]["url"]
+            async with _SEMAPHORE:
+                success, error, size = await _download_with_ytdlp(
+                    fresh_url, filepath, progress_cb
+                )
+            if success:
+                return True, "", size
+            _cleanup_file(filepath)
+
+    if error == "__EXPIRED__":
+        error = (
+            "لینک منقضی شد (توکن زمان‌دار). لطفاً دوباره لینک ویدیو رو بفرست "
+            "تا از نو استخراج بشه."
+        )
+
     return False, error, 0
 
 
@@ -363,6 +419,7 @@ async def download_91porna_direct(
     url: str,
     filepath: str,
     progress_cb: ProgressCallback,
+    page_url: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
     """دانلود مستقیم (برای سازگاری با API دیگر handlerها)."""
-    return await download_91porna_m3u8(url, filepath, progress_cb)
+    return await download_91porna_m3u8(url, filepath, progress_cb, page_url)
