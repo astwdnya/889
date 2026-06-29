@@ -157,6 +157,12 @@ from otherwebsiteshandler.porn300_handler import (
     download_porn300_direct,
     download_porn300_m3u8,
 )
+from otherwebsiteshandler.tnaflix_handler import (
+    is_tnaflix_url,
+    extract_tnaflix_qualities,
+    download_tnaflix_direct,
+    download_tnaflix_m3u8,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3709,6 +3715,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_tnaflix_url(target_url):
+        logger.info(f"[URL] Tnaflix detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_tnaflix_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3746,6 +3761,7 @@ async def generic_url_handler(event):
         or is_91porna_url(target_url)
         or is_playvids_url(target_url)
         or is_porn300_url(target_url)
+        or is_tnaflix_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -6317,6 +6333,21 @@ porn300_sessions: dict = {}
     "Porn300",
 )
 
+tnaflix_sessions: dict = {}
+
+(
+    process_tnaflix_request,
+    tnaflix_quality_callback,
+    tnaflix_cancel_callback,
+) = _make_site_handler(
+    "tf",
+    extract_tnaflix_qualities,
+    download_tnaflix_direct,
+    download_tnaflix_m3u8,
+    tnaflix_sessions,
+    "Tnaflix",
+)
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -6628,6 +6659,12 @@ async def main():
     )
     client.add_event_handler(
         porn300_cancel_callback, events.CallbackQuery(pattern=r"p3_cancel_.+")
+    )
+    client.add_event_handler(
+        tnaflix_quality_callback, events.CallbackQuery(pattern=r"tf_q_.+")
+    )
+    client.add_event_handler(
+        tnaflix_cancel_callback, events.CallbackQuery(pattern=r"tf_cancel_.+")
     )
 
     # ===== Command handlers =====
