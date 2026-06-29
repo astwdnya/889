@@ -1503,13 +1503,22 @@ async def send_file_with_progress(
                 force_file=True,
             )
 
-        sent = await client.send_file(
-            chat_id,
-            media,
-            caption=caption,
-            buttons=buttons,
-            parse_mode="markdown",
-        )
+        try:
+            sent = await client.send_file(
+                chat_id,
+                media,
+                caption=caption,
+                buttons=buttons,
+                parse_mode="markdown",
+            )
+        except Exception:
+            sent = await client.send_file(
+                chat_id,
+                media,
+                caption=caption,
+                buttons=buttons,
+                parse_mode=None,
+            )
     finally:
         if thumb_path and os.path.exists(thumb_path) and thumb_path != thumb_filepath:
             try:
@@ -4248,7 +4257,7 @@ async def process_y2mate_request(event, url: str, status_msg):
             caption_start = (
                 f"🎬 {_escape_md(yt_clean)}"
                 if yt_clean
-                else ("🎵 Audio" if is_audio else f"📄 {fname}")
+                else ("🎵 Audio" if is_audio else f"📄 {_escape_md(fname)}")
             )
             gh_line = ""
             if GITHUB_ENABLED:
@@ -5617,7 +5626,11 @@ async def y2mate_quality_callback(event):
             caption_start = (
                 f"🎬 {_escape_md(clean_title)}"
                 if clean_title
-                else ("🎵 Audio" if is_audio else f"📄 {os.path.basename(filepath)}")
+                else (
+                    "🎵 Audio"
+                    if is_audio
+                    else f"📄 {_escape_md(os.path.basename(filepath))}"
+                )
             )
             gh_line = ""
             if GITHUB_ENABLED:
@@ -5711,7 +5724,15 @@ async def y2mate_quality_callback(event):
                                 event.chat_id, sent_msg.id, text=new_caption
                             )
                         except Exception:
-                            pass
+                            try:
+                                await event.client.edit_message(
+                                    event.chat_id,
+                                    sent_msg.id,
+                                    text=new_caption,
+                                    parse_mode=None,
+                                )
+                            except Exception:
+                                pass
                 except Exception as e:
                     logger.error(f"[Y2MATE_EXTRACT] Error: {e}", exc_info=True)
                     try:
