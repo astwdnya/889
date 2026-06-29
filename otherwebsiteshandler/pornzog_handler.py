@@ -228,7 +228,10 @@ def _find_videotxxx_id(html: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
+async def extract_pornzog_qualities(
+    url: str,
+    debug_cb: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[dict], str]:
     """لینک‌های ویدیو رو از pornzog (via videotxxx) استخراج می‌کنه."""
     if not is_pornzog_url(url):
         return [], "Invalid URL"
@@ -236,75 +239,104 @@ async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
     if not _check_impersonation_support():
         return [], "curl_cffi لازمه: pip install curl_cffi"
 
+    def dbg(msg: str) -> None:
+        logger.info("[PZ-DEBUG] %s", msg)
+        if debug_cb:
+            debug_cb(msg)
+
     cleanup_expired_sessions()
 
     from curl_cffi.requests import AsyncSession
 
     async with AsyncSession() as s:
-        # 1. صفحه pornzog
+        dbg("📡 Step 1: Fetching pornzog page...")
         try:
             r = await _cffi_get(s, url, _SITE_REFERER)
             html = r.text
+            dbg(f"✅ Page fetched, size={len(html)} bytes")
         except Exception as e:
+            dbg(f"❌ Fetch failed: {e}")
             return [], f"Could not fetch page: {str(e)[:80]}"
 
         title = _extract_title(html)
+        dbg(f"🏷 Title: {title[:60]}")
 
-        # 2. video_id از iframe videotxxx
+        dbg("🔍 Step 2: Looking for videotxxx iframe...")
         video_id = _find_videotxxx_id(html)
+        dbg(f"video_id: {video_id}")
         if not video_id:
+            dbg("❌ No iframe found")
             return [], "iframe videotxxx پیدا نشد (ساختار سایت تغییر کرده؟)"
 
         embed_url = f"{_VIDEO_HOST}/embed/{video_id}/"
+        dbg(f"🌐 Step 3: Visiting embed: {embed_url}")
 
-        # 3. باز کردن embed (کوکی session)
         try:
             await _cffi_get(s, embed_url, url)
-        except Exception:
-            pass
+            dbg("✅ Embed visited (cookies set)")
+        except Exception as e:
+            dbg(f"⚠️ Embed visit failed (non-fatal): {e}")
 
-        # 4. API videofile
+        dbg("📦 Step 4: Calling API...")
         api_url = f"{_VIDEO_HOST}/api/videofile.php?video_id={video_id}"
+        dbg(f"API URL: {api_url}")
         try:
             r = await _cffi_get(s, api_url, embed_url, ajax=True)
-            data = json.loads(r.text)
+            api_text = r.text
+            dbg(f"✅ API response ({len(api_text)} chars):\n{api_text[:500]}")
+            data = json.loads(api_text)
         except Exception as e:
+            dbg(f"❌ API failed: {e}")
+            logger.warning("API videofile failed: %s", e)
             return [], f"API videofile failed: {str(e)[:80]}"
 
         if not isinstance(data, list):
             data = [data]
 
+        dbg(f"📊 API data items: {len(data)}")
+
         qualities: List[dict] = []
         seen = set()
 
-        for item in data:
+        for i, item in enumerate(data):
             if not isinstance(item, dict):
+                dbg(f"  item[{i}]: not a dict, skipping")
                 continue
             raw = item.get("video_url") or ""
             fmt = item.get("format") or ""
+            dbg(f"  item[{i}]: format={fmt}, raw_video_url (first 120)={raw[:120]}")
             if not raw:
+                dbg(f"  item[{i}]: no video_url, skipping")
                 continue
 
             non_ascii = {c for c in raw if ord(c) >= 128}
             if non_ascii:
-                logger.info(
-                    "video_url non-ASCII chars: %s",
-                    [(c, unicodedata.name(c, "?")) for c in non_ascii],
-                )
+                names = [(c, unicodedata.name(c, "?")) for c in non_ascii]
+                logger.info("video_url non-ASCII chars: %s", names)
+                dbg(f"  non-ASCII chars: {names}")
+            else:
+                logger.info("video_url (all ASCII): %s", raw[:120])
+                dbg(f"  all ASCII")
             path = _decode_video_url(raw)
             if not path:
+                logger.warning("decode failed for raw (first 100): %s", raw[:100])
+                dbg(f"❌ decode FAILED (raw={raw[:100]})")
                 continue
 
             full = path if path.startswith("http") else _VIDEO_HOST + path
+            dbg(f"  decoded path: {full[:100]}")
             if full in seen:
+                dbg(f"  duplicate, skipping")
                 continue
             seen.add(full)
 
             if not _is_allowed_host(full):
                 logger.warning("Blocked decoded host: %s", full[:60])
+                dbg(f"❌ host not allowed: {full[:60]}")
                 continue
 
             label, height = _quality_from_format(fmt)
+            dbg(f"✅ quality: {label} (height={height})")
             qualities.append(
                 {
                     "label": label,
@@ -316,10 +348,12 @@ async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
             )
 
         if not qualities:
+            dbg("❌ No qualities extracted at all")
             return [], "لینک ویدیو پیدا نشد (decode ناموفق؟)"
 
         qualities.sort(key=lambda q: q.get("height", 0), reverse=True)
         logger.info("Extracted %d qualities for: %s", len(qualities), title[:60])
+        dbg(f"✅ Total qualities: {len(qualities)}")
         return qualities, title
 
 
