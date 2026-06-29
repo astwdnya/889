@@ -3137,7 +3137,7 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 7: decode token و تست api.php"""
+    """مرحله 8: تست ترکیب‌های مختلف decode"""
     import re
     import json
     import base64
@@ -3154,16 +3154,7 @@ async def debug_hentaihaven(event):
 
     lines = []
 
-    if not _check_impersonation_support():
-        await event.reply("❌ curl_cffi required")
-        return
-
-    await event.reply("🔍 Step 1: Fetching player.php...")
-
     from curl_cffi.requests import AsyncSession
-
-    def reverse_str(s):
-        return s[::-1]
 
     async with AsyncSession() as session:
         try:
@@ -3179,119 +3170,179 @@ async def debug_hentaihaven(event):
             headers={"Referer": page_url},
             timeout=15,
         )
-        player_html = player_resp.text
 
         token_m = re.search(
             r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
-            player_html,
+            player_resp.text,
             re.IGNORECASE,
         )
         if not token_m:
-            await event.reply("❌ x-secure-token not found")
+            await event.reply("❌ token not found")
             return
 
         raw_token = token_m.group(1)
-        lines.append(f"🔑 Raw token ({len(raw_token)} chars): {raw_token[:80]}...")
 
-        try:
-            val = raw_token.replace("sha512-", "")
-            lines.append(f"\n📝 After remove sha512- ({len(val)}): {val[:60]}...")
+        def safe_b64decode(s):
+            s = s.strip()
+            missing = len(s) % 4
+            if missing:
+                s += "=" * (4 - missing)
+            return base64.b64decode(s)
 
-            val = reverse_str(val)
-            lines.append(f"📝 After reverse1 ({len(val)}): {val[:60]}...")
-            val = base64.b64decode(val).decode("utf-8", errors="replace")
-            lines.append(f"📝 After atob1 ({len(val)}): {val[:60]}...")
+        def reverse_str(s):
+            return s[::-1]
 
-            val = reverse_str(val)
-            lines.append(f"📝 After reverse2 ({len(val)}): {val[:60]}...")
-            val = base64.b64decode(val).decode("utf-8", errors="replace")
-            lines.append(f"📝 After atob2 ({len(val)}): {val[:60]}...")
+        val = raw_token.replace("sha512-", "")
+        lines.append(f"🔑 Token without sha512- ({len(val)} chars)")
 
-            val = reverse_str(val)
-            lines.append(f"📝 After reverse3 ({len(val)}): {val[:60]}...")
-            val = base64.b64decode(val).decode("utf-8", errors="replace")
-            lines.append(f"📝 After atob3 ({len(val)}): {val[:60]}...")
+        combos = [
+            (
+                "rev-atob-rev-atob-rev-atob",
+                [
+                    ("reverse", lambda s: reverse_str(s)),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    ("reverse", lambda s: reverse_str(s)),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    ("reverse", lambda s: reverse_str(s)),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                ],
+            ),
+            (
+                "atob-rev-atob-rev-atob-rev",
+                [
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    ("reverse", lambda s: reverse_str(s)),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    ("reverse", lambda s: reverse_str(s)),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    ("reverse", lambda s: reverse_str(s)),
+                ],
+            ),
+            (
+                "atob-atob-atob",
+                [
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                ],
+            ),
+            (
+                "atob-once",
+                [
+                    (
+                        "atob",
+                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
+                    ),
+                ],
+            ),
+            (
+                "atob-only",
+                [
+                    (
+                        "atob-raw",
+                        lambda s: safe_b64decode(s).decode("latin-1", errors="replace"),
+                    ),
+                ],
+            ),
+        ]
 
-            config = json.loads(val)
-            lines.append(f"\n✅ DECODED CONFIG:")
-            lines.append(json.dumps(config, indent=2, ensure_ascii=False)[:1000])
-
-            en_val = config.get("en", "")
-            iv_val = config.get("iv", "")
-            uri_val = config.get("uri", "")
-
-            lines.append(f"\n🔐 en ({len(en_val)}): {en_val[:80]}...")
-            lines.append(f"🔐 iv ({len(iv_val)}): {iv_val[:80]}...")
-            lines.append(f"🌐 uri: {uri_val}")
-
-        except Exception as e:
-            lines.append(f"\n❌ Decode error: {e}")
-            try:
-                val2 = raw_token.replace("sha512-", "")
-                val2 = base64.b64decode(val2).decode("utf-8", errors="replace")
-                lines.append(f"\n📝 Direct atob: {val2[:200]}...")
-            except Exception as e2:
-                lines.append(f"❌ Direct atob also failed: {e2}")
-
-            result = "\n".join(lines)
-            for i in range(0, len(result), 4000):
-                await event.reply(result[i : i + 4000])
-            return
-
-        if en_val and iv_val:
-            await event.reply("🔍 Step 3: Testing api.php...")
-
-            api_url = (
-                f"{uri_val}api.php"
-                if uri_val
-                else "https://hentaihaven.xxx/wp-content/plugins/player-logic/api.php"
-            )
-
-            resp = await session.post(
-                api_url,
-                data={
-                    "action": "zarat_get_data_player_ajax",
-                    "a": en_val,
-                    "b": iv_val,
-                },
-                impersonate="chrome",
-                headers={
-                    "Referer": player_url,
-                    "Origin": "https://hentaihaven.xxx",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-                timeout=15,
-            )
-
-            lines.append(f"\n🎯 api.php response:")
-            lines.append(f"  status: {resp.status_code}")
-            lines.append(f"  content-type: {resp.headers.get('content-type', '?')}")
-            lines.append(f"  length: {len(resp.text)}")
-
-            if resp.text:
-                lines.append(f"\n📦 Response body:")
-                lines.append(resp.text[:2000])
-
+        for combo_name, steps in combos:
+            lines.append(f"\n{'=' * 40}")
+            lines.append(f"🧪 Trying: {combo_name}")
+            current = val
+            success = True
+            for step_name, step_fn in steps:
                 try:
-                    api_data = json.loads(resp.text)
-                    lines.append(f"\n✅ Parsed JSON keys: {list(api_data.keys())}")
+                    current = step_fn(current)
+                    lines.append(f"  {step_name} → ({len(current)}): {current[:80]}...")
+                except Exception as e:
+                    lines.append(f"  {step_name} → ❌ {e}")
+                    success = False
+                    break
 
-                    def find_urls(obj, prefix=""):
-                        if isinstance(obj, str):
-                            if "http" in obj or ".mp4" in obj or ".m3u8" in obj:
-                                lines.append(f"  🎥 {prefix}: {obj[:150]}")
-                        elif isinstance(obj, dict):
-                            for k, v in obj.items():
-                                find_urls(v, f"{prefix}.{k}")
-                        elif isinstance(obj, list):
-                            for i, v in enumerate(obj):
-                                find_urls(v, f"{prefix}[{i}]")
+            if success:
+                try:
+                    parsed = json.loads(current)
+                    lines.append(f"  ✅ JSON PARSED! keys: {list(parsed.keys())}")
+                    lines.append(
+                        f"  {json.dumps(parsed, indent=2, ensure_ascii=False)[:500]}"
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    json_m = re.search(r"\{[^{}]+\}", current)
+                    if json_m:
+                        lines.append(f"  📦 Found JSON-like: {json_m.group()[:200]}")
+                    elif current.strip().startswith("{"):
+                        lines.append(f"  📦 Starts with {{ but not valid JSON")
 
-                    find_urls(api_data)
-                except json.JSONDecodeError:
-                    lines.append("  (not valid JSON)")
-        else:
-            lines.append("\n❌ en or iv is empty")
+        await event.reply("🔍 Looking for _r function definition...")
+
+        js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
+        js, _, _ = await _fetch_page(js_url, referer=player_url)
+
+        if js:
+            r_patterns = [
+                r"function\s+_r\s*\([^)]*\)\s*\{[^}]+\}",
+                r"const\s+_r\s*=\s*[^;]+;",
+                r"var\s+_r\s*=\s*[^;]+;",
+                r"let\s+_r\s*=\s*[^;]+;",
+                r"_r\s*=\s*function\s*\([^)]*\)\s*\{[^}]+\}",
+                r"_r\s*=\s*\([^)]*\)\s*=>\s*[^;,]+",
+            ]
+            for pat in r_patterns:
+                matches = re.findall(pat, js)
+                if matches:
+                    lines.append(f"\n🔧 _r definition found ({pat[:30]}):")
+                    for m in matches[:3]:
+                        lines.append(f"  {m[:300]}")
+
+            i0_idx = js.find("function I0")
+            if i0_idx < 0:
+                i0_idx = js.find("I0=")
+            if i0_idx >= 0:
+                start = max(0, i0_idx - 50)
+                end = min(len(js), i0_idx + 500)
+                lines.append(f"\n🎯 I0 function full context:")
+                lines.append(js[start:end])
+
+            if i0_idx >= 0:
+                nearby = js[max(0, i0_idx - 2000) : i0_idx + 500]
+                r_nearby = re.findall(r"function\s+_r\s*\([^)]*\)\s*\{[^}]+\}", nearby)
+                if not r_nearby:
+                    r_nearby = re.findall(r"_r\s*[=:]\s*[^;,]+[;,]", nearby)
+                if r_nearby:
+                    lines.append(f"\n🔧 _r near I0:")
+                    for r in r_nearby[:3]:
+                        lines.append(f"  {r[:300]}")
+                else:
+                    lines.append(f"\n📝 Code near I0 (looking for transform pattern):")
+                    lines.append(nearby[-800:])
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
