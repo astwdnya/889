@@ -228,6 +228,51 @@ def _find_videotxxx_id(html: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _fallback_extract(
+    html: str, page_url: str, dbg: Callable[[str], None]
+) -> List[dict]:
+    """جستجوی مستقیم در HTML صفحه pornzog برای لینک ویدیو."""
+    dbg("🔍 Fallback: searching HTML for direct video sources...")
+
+    patterns = [
+        r'https?://[^"\'\\\s<>]*?\.m3u8[^"\'\\\s<>]*',
+        r'https?://[^"\'\\\s<>]*?\.mp4[^"\'\\\s<>]*',
+        r'https?://[^"\'\\\s<>]*?videotxxx\.com[^"\'\\\s<>]*',
+        r'https?://[^"\'\\\s<>]*?txxx\.com[^"\'\\\s<>]*',
+        r'https?://[^"\'\\\s<>]*?ahcdn\.com[^"\'\\\s<>]*',
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.I):
+            raw_url = html_lib.unescape(m.group(0).strip())
+            if not _is_allowed_host(raw_url):
+                continue
+            dbg(f"  found candidate: {raw_url[:100]}")
+            if ".m3u8" in raw_url:
+                return [
+                    {
+                        "label": "📡 دانلود (HLS)",
+                        "url": raw_url,
+                        "method": "m3u8",
+                        "page_url": page_url,
+                        "height": 0,
+                    }
+                ]
+            if ".mp4" in raw_url:
+                return [
+                    {
+                        "label": "🎬 دانلود (MP4)",
+                        "url": raw_url,
+                        "method": "direct",
+                        "page_url": page_url,
+                        "height": 0,
+                    }
+                ]
+
+    dbg("❌ Fallback: no direct source found")
+    return []
+
+
 async def extract_pornzog_qualities(
     url: str,
     debug_cb: Optional[Callable[[str], None]] = None,
@@ -290,7 +335,14 @@ async def extract_pornzog_qualities(
             logger.warning("API videofile failed: %s", e)
             return [], f"API videofile failed: {str(e)[:80]}"
 
-        if not isinstance(data, list):
+        if isinstance(data, dict) and data.get("error") == 1:
+            dbg(f"⚠️ API error: {data.get('msg', 'unknown')}")
+            dbg("🔄 Falling back to direct page search...")
+            qualities = _fallback_extract(html, url, dbg)
+            if qualities:
+                return qualities, title
+            data = []
+        elif not isinstance(data, list):
             data = [data]
 
         dbg(f"📊 API data items: {len(data)}")
