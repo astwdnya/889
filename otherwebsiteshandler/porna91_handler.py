@@ -93,6 +93,7 @@ def _cleanup_file(filepath: str) -> None:
 def _check_playwright() -> bool:
     try:
         import playwright  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -124,12 +125,15 @@ async def _extract_m3u8_via_browser(url: str) -> Tuple[Optional[str], str]:
     title = "Untitled"
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,  # روی سرور با xvfb-run اجرا شود
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--mute-audio"],
-            ignore_default_args=["--enable-automation"],
-        )
+        browser = None
         try:
+            browser = await p.chromium.launch(
+                headless=False,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--mute-audio"],
+                ignore_default_args=["--enable-automation"],
+                handle_sigint=False,
+                handle_sigterm=False,
+            )
             context = await browser.new_context(
                 user_agent=_USER_AGENT,
                 viewport={"width": 1280, "height": 800},
@@ -148,7 +152,6 @@ async def _extract_m3u8_via_browser(url: str) -> Tuple[Optional[str], str]:
             await page.goto(url, wait_until="load", timeout=40000)
             await page.wait_for_timeout(2500)
 
-            # عنوان
             try:
                 title = (await page.title()) or "Untitled"
                 title = re.sub(r"\s*[-|].*在线观看.*$", "", title).strip()
@@ -156,7 +159,6 @@ async def _extract_m3u8_via_browser(url: str) -> Tuple[Optional[str], str]:
             except Exception:
                 pass
 
-            # کلیک روی مرکز پلیر برای فعال‌سازی (در صورت نیاز)
             if not found:
                 try:
                     cont = await page.query_selector(
@@ -172,13 +174,16 @@ async def _extract_m3u8_via_browser(url: str) -> Tuple[Optional[str], str]:
                 except Exception:
                     pass
 
-            # صبر برای رهگیری m3u8 (تا 25 ثانیه)
             for _ in range(25):
                 if found:
                     break
                 await page.wait_for_timeout(1000)
         finally:
-            await browser.close()
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     if found:
         return found[0], title
@@ -191,13 +196,19 @@ async def extract_91porna_qualities(url: str) -> Tuple[List[dict], str]:
         return [], "Invalid URL"
 
     if not _check_playwright():
-        return [], "playwright لازمه: pip install playwright && playwright install chromium"
+        return (
+            [],
+            "playwright لازمه: pip install playwright && playwright install chromium",
+        )
 
-    try:
-        m3u8_url, title = await _extract_m3u8_via_browser(url)
-    except Exception as e:
-        logger.exception("Playwright extraction failed")
-        return [], f"Browser extraction failed: {str(e)[:120]}"
+    async with _SEMAPHORE:
+        try:
+            m3u8_url, title = await _extract_m3u8_via_browser(url)
+        except Exception as e:
+            logger.exception("Playwright extraction failed")
+            return [], f"Browser extraction failed: {str(e)[:120]}"
+        finally:
+            await asyncio.sleep(1.5)
 
     if not m3u8_url:
         return [], "m3u8 not found (پلیر لود نشد یا توکن گرفته نشد)"
@@ -235,24 +246,37 @@ async def _download_with_ytdlp(
             "--progress",
             "--newline",
             "--no-check-certificates",
-            "--concurrent-fragments", "16",
-            "--retries", "10",
-            "--fragment-retries", "10",
-            "--retry-sleep", "fragment:exp=1:30",
-            "--buffer-size", "16K",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", f"Referer:{_SITE_REFERER}",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "--merge-output-format", "mp4",
-            "-o", filepath,
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "fragment:exp=1:30",
+            "--buffer-size",
+            "16K",
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            f"Referer:{_SITE_REFERER}",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            filepath,
         ]
         if has_aria2c:
-            cmd.extend([
-                "--downloader", "aria2c",
-                "--downloader-args",
-                "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
-                "--min-split-size=1M --console-log-level=warn",
-            ])
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
         cmd.append(url)
 
         process = await asyncio.create_subprocess_exec(
