@@ -56,10 +56,12 @@ _SITE_DOMAIN = "usersporn.com"
 _SITE_URL = "https://usersporn.com"
 _SITE_REFERER = f"{_SITE_URL}/"
 
-_ALLOWED_HOSTS = frozenset({
-    "usersporn.com",
-    "www.usersporn.com",
-})
+_ALLOWED_HOSTS = frozenset(
+    {
+        "usersporn.com",
+        "www.usersporn.com",
+    }
+)
 
 # CDN دامنه‌ها - خیلی گسترده چون نمیدونیم دقیقاً از چه CDN ای استفاده میکنه
 _ALLOWED_HOST_SUFFIXES = (
@@ -101,9 +103,8 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 def _is_allowed_host(url: str) -> bool:
     try:
         host = urlparse(url).hostname or ""
-        return (
-            host in _ALLOWED_HOSTS
-            or any(host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
+        return host in _ALLOWED_HOSTS or any(
+            host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES
         )
     except Exception:
         return False
@@ -148,7 +149,8 @@ def is_usersporn_url(url: str) -> bool:
 def cleanup_expired_sessions() -> int:
     now = time.time()
     expired = [
-        sid for sid, data in usersporn_sessions.items()
+        sid
+        for sid, data in usersporn_sessions.items()
         if now - data.get("created_at", 0) > SESSION_TTL
     ]
     for sid in expired:
@@ -211,6 +213,7 @@ def _format_progress(
 def _check_impersonation_support() -> bool:
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -238,9 +241,7 @@ def _find_output_file(filepath: str) -> Optional[str]:
 async def _get_session(timeout: Optional[ClientTimeout] = None):
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar(unsafe=True)
-    session = aiohttp.ClientSession(
-        timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
-    )
+    session = aiohttp.ClientSession(timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar)
     try:
         yield session
     finally:
@@ -272,12 +273,14 @@ async def _fetch_with_cookies(
                 # مرحله 1: صفحه اصلی برای کوکی
                 try:
                     async with session.get(
-                        _SITE_REFERER, allow_redirects=True,
+                        _SITE_REFERER,
+                        allow_redirects=True,
                     ) as home_resp:
                         await home_resp.read()
                         logger.debug(
                             "Homepage status: %d, cookies: %d",
-                            home_resp.status, len(list(jar)),
+                            home_resp.status,
+                            len(list(jar)),
                         )
                 except Exception as e:
                     logger.debug("Homepage fetch failed: %s", e)
@@ -296,13 +299,17 @@ async def _fetch_with_cookies(
                         content = await resp.text(errors="replace")
                         logger.debug(
                             "Fetched %d bytes from %s (final: %s)",
-                            len(content), url[:60], final_url[:60],
+                            len(content),
+                            url[:60],
+                            final_url[:60],
                         )
                         return content, 200, final_url
                     last_error = f"HTTP {resp.status}"
                     logger.debug(
                         "Got status %d from %s (final: %s)",
-                        resp.status, url[:60], final_url[:60],
+                        resp.status,
+                        url[:60],
+                        final_url[:60],
                     )
                     if 400 <= resp.status < 500 and resp.status != 403:
                         return None, resp.status, final_url
@@ -313,7 +320,10 @@ async def _fetch_with_cookies(
             last_error = str(e)[:120]
             logger.warning(
                 "Attempt %d/%d failed for %s: %s",
-                attempt, max_retries, url, last_error,
+                attempt,
+                max_retries,
+                url,
+                last_error,
             )
 
         if attempt < max_retries:
@@ -341,7 +351,9 @@ async def _fetch_with_curl_cffi(
             # صفحه اصلی برای کوکی
             try:
                 await session.get(
-                    _SITE_REFERER, impersonate="chrome", timeout=15,
+                    _SITE_REFERER,
+                    impersonate="chrome",
+                    timeout=15,
                 )
             except Exception:
                 pass
@@ -357,7 +369,7 @@ async def _fetch_with_curl_cffi(
                 timeout=30,
             )
 
-            final_url = str(resp.url) if hasattr(resp, 'url') else url
+            final_url = str(resp.url) if hasattr(resp, "url") else url
             if resp.status_code == 200:
                 return resp.text, 200, final_url
             return None, resp.status_code, final_url
@@ -460,9 +472,7 @@ async def _try_ytdlp_extract(
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=60
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -503,11 +513,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             height = data.get("height")
             label = f"🎥 {ext.upper()} {height}p" if height else f"🎥 {ext.upper()}"
             is_m3u8 = ext in ("m3u8", "m3u8_native") or ".m3u8" in direct_url
-            qualities.append({
-                "label": label,
-                "url": direct_url,
-                "method": "m3u8" if is_m3u8 else "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": direct_url,
+                    "method": "m3u8" if is_m3u8 else "direct",
+                }
+            )
         return qualities
 
     for fmt in formats:
@@ -527,24 +539,28 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             continue
 
         is_m3u8 = (
-            protocol in ("m3u8", "m3u8_native")
-            or ".m3u8" in fmt_url
-            or ext == "m3u8"
+            protocol in ("m3u8", "m3u8_native") or ".m3u8" in fmt_url or ext == "m3u8"
         )
 
         size_str = f" ({filesize / 1024 / 1024:.0f}MB)" if filesize else ""
         if height:
-            label = f"📡 M3U8 {height}p{size_str}" if is_m3u8 else f"🎥 {ext.upper()} {height}p{size_str}"
+            label = (
+                f"📡 M3U8 {height}p{size_str}"
+                if is_m3u8
+                else f"🎥 {ext.upper()} {height}p{size_str}"
+            )
         elif format_note:
             label = f"🎥 {format_note}{size_str}"
         else:
             label = f"🎥 {ext.upper()}{size_str}"
 
-        qualities.append({
-            "label": label,
-            "url": fmt_url,
-            "method": "m3u8" if is_m3u8 else "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": fmt_url,
+                "method": "m3u8" if is_m3u8 else "direct",
+            }
+        )
 
     return qualities
 
@@ -552,9 +568,7 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
 # ─── HTML parsing ───────────────────────────────────────────
 
 
-def _parse_html_for_qualities(
-    html: str, page_url: str
-) -> Tuple[List[dict], str]:
+def _parse_html_for_qualities(html: str, page_url: str) -> Tuple[List[dict], str]:
     """پارس HTML و استخراج تمام کیفیت‌ها."""
     title = _extract_title(html)
     qualities: List[dict] = []
@@ -579,12 +593,14 @@ def _extract_title(html: str) -> str:
     # og:title
     m = re.search(
         r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-        html, re.IGNORECASE,
+        html,
+        re.IGNORECASE,
     )
     if not m:
         m = re.search(
             r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']',
-            html, re.IGNORECASE,
+            html,
+            re.IGNORECASE,
         )
     if m:
         return m.group(1).strip()
@@ -602,27 +618,23 @@ def _extract_title(html: str) -> str:
     return "Untitled"
 
 
-def _extract_from_video_tag(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    for m in re.finditer(
-        r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
+def _extract_from_video_tag(html: str, page_url: str, qualities: List[dict]) -> None:
+    for m in re.finditer(r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
         video_url = _normalize_url(m.group(1), page_url)
         if not video_url or not _is_video_cdn_url(video_url):
             continue
         if any(q["url"] == video_url for q in qualities):
             continue
-        qualities.append({
-            "label": "🎥 MP4 (video tag)",
-            "url": video_url,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": "🎥 MP4 (video tag)",
+                "url": video_url,
+                "method": "direct",
+            }
+        )
 
 
-def _extract_from_source_tags(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_source_tags(html: str, page_url: str, qualities: List[dict]) -> None:
     for m in re.finditer(
         r'<source[^>]+src=["\']([^"\']+)["\']([^>]*)', html, re.IGNORECASE
     ):
@@ -650,17 +662,20 @@ def _extract_from_source_tags(
             q_label = f"{url_res.group(1)}p" if url_res else "Default"
 
         if is_m3u8:
-            qualities.append({"label": f"📡 M3U8 {q_label}", "url": src, "method": "m3u8"})
+            qualities.append(
+                {"label": f"📡 M3U8 {q_label}", "url": src, "method": "m3u8"}
+            )
         else:
-            qualities.append({"label": f"🎥 MP4 {q_label}", "url": src, "method": "direct"})
+            qualities.append(
+                {"label": f"🎥 MP4 {q_label}", "url": src, "method": "direct"}
+            )
 
 
-def _extract_from_json_ld(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_json_ld(html: str, page_url: str, qualities: List[dict]) -> None:
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
+        html,
+        re.DOTALL | re.IGNORECASE,
     ):
         try:
             data = json.loads(m.group(1))
@@ -678,16 +693,16 @@ def _extract_from_json_ld(
                 continue
             if any(q["url"] == video_url for q in qualities):
                 continue
-            qualities.append({
-                "label": "🎥 MP4 (structured data)",
-                "url": video_url,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": "🎥 MP4 (structured data)",
+                    "url": video_url,
+                    "method": "direct",
+                }
+            )
 
 
-def _extract_kvs_flashvars(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_kvs_flashvars(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از KVS flashvars - تمام الگوهای ممکن."""
 
     # ── الگوی 1: flashvars[key] = 'value' ──
@@ -772,16 +787,22 @@ def _extract_kvs_flashvars(
         qualities.append({"label": label, "url": video_url, "method": "direct"})
 
 
-def _extract_kvs_from_dict(
-    data: dict, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_kvs_from_dict(data: dict, page_url: str, qualities: List[dict]) -> None:
     url_keys = [
-        "video_url", "video_alt_url", "video_alt_url2",
-        "video_url1", "video_url2", "video_url3",
+        "video_url",
+        "video_alt_url",
+        "video_alt_url2",
+        "video_url1",
+        "video_url2",
+        "video_url3",
     ]
     text_keys = [
-        "video_url_text", "video_alt_url_text", "video_alt_url2_text",
-        "video_url1_text", "video_url2_text", "video_url3_text",
+        "video_url_text",
+        "video_alt_url_text",
+        "video_alt_url2_text",
+        "video_url1_text",
+        "video_url2_text",
+        "video_url3_text",
     ]
 
     for i, url_key in enumerate(url_keys):
@@ -806,16 +827,17 @@ def _extract_kvs_from_dict(
         qualities.append({"label": label, "url": video_url, "method": "direct"})
 
 
-def _extract_from_js_vars(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_js_vars(html: str, page_url: str, qualities: List[dict]) -> None:
     js_patterns = [
         (r"""(?:var\s+)?video_url\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
         (r"""(?:var\s+)?video[_]?[Ff]ile\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
         (r"""(?:var\s+)?video(?:Url|_src|Src|_url)\s*[:=]\s*['"]([^'"]+)['"]""", None),
         (r"""file\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
         (r"""['"]?(\d{3,4})['"]?\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", "numbered"),
-        (r"""video_url\s*[:=]\s*decodeURIComponent\s*\(\s*['"]([^'"]+)['"]""", "encoded"),
+        (
+            r"""video_url\s*[:=]\s*decodeURIComponent\s*\(\s*['"]([^'"]+)['"]""",
+            "encoded",
+        ),
     ]
 
     for pattern, ptype in js_patterns:
@@ -858,15 +880,11 @@ def _extract_from_player_config(
             _extract_urls_from_dict(config, page_url, qualities)
 
 
-def _extract_all_mp4_links(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_all_mp4_links(html: str, page_url: str, qualities: List[dict]) -> None:
     """
     آخرین تلاش: هر لینک MP4 ای که توی HTML هست رو بگیر.
     """
-    for m in re.finditer(
-        r"""['"]([^'"]*\.mp4(?:\?[^'"]*)?)['"]\s*""", html
-    ):
+    for m in re.finditer(r"""['"]([^'"]*\.mp4(?:\?[^'"]*)?)['"]\s*""", html):
         raw_url = m.group(1)
         video_url = _normalize_url(raw_url, page_url)
         if not video_url:
@@ -886,13 +904,9 @@ def _extract_all_mp4_links(
         qualities.append({"label": label, "url": video_url, "method": "direct"})
 
 
-def _extract_all_m3u8_links(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_all_m3u8_links(html: str, page_url: str, qualities: List[dict]) -> None:
     """هر لینک M3U8 ای که توی HTML هست رو بگیر."""
-    for m in re.finditer(
-        r"""['"]([^'"]*\.m3u8(?:\?[^'"]*)?)['"]\s*""", html
-    ):
+    for m in re.finditer(r"""['"]([^'"]*\.m3u8(?:\?[^'"]*)?)['"]\s*""", html):
         raw_url = m.group(1)
         m3u8_url = _normalize_url(raw_url, page_url)
         if not m3u8_url or not m3u8_url.startswith("http"):
@@ -923,10 +937,13 @@ def _extract_urls_from_dict(
                 label = f"📡 M3U8 {url_res.group(1)}p" if url_res else "📡 M3U8 Stream"
             else:
                 label = f"🎥 MP4 {url_res.group(1)}p" if url_res else f"🎥 MP4 ({key})"
-            qualities.append({
-                "label": label, "url": video_url,
-                "method": "m3u8" if is_m3u8 else "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": video_url,
+                    "method": "m3u8" if is_m3u8 else "direct",
+                }
+            )
         elif isinstance(value, dict):
             _extract_urls_from_dict(value, page_url, qualities, depth + 1)
         elif isinstance(value, list):
@@ -958,7 +975,9 @@ async def extract_usersporn_qualities(url: str) -> Tuple[List[dict], str]:
     qualities, title = await _extract_with_ytdlp(url)
     if qualities:
         qualities.sort(key=_quality_sort_key, reverse=True)
-        logger.info("Extracted %d qualities (yt-dlp) for: %s", len(qualities), title[:60])
+        logger.info(
+            "Extracted %d qualities (yt-dlp) for: %s", len(qualities), title[:60]
+        )
         return qualities, title
 
     # ── روش 2: aiohttp + cookie ──
@@ -968,7 +987,9 @@ async def extract_usersporn_qualities(url: str) -> Tuple[List[dict], str]:
         qualities, title = _parse_html_for_qualities(html, final_url or url)
         if qualities:
             qualities.sort(key=_quality_sort_key, reverse=True)
-            logger.info("Extracted %d qualities (aiohttp) for: %s", len(qualities), title[:60])
+            logger.info(
+                "Extracted %d qualities (aiohttp) for: %s", len(qualities), title[:60]
+            )
             return qualities, title
         else:
             logger.debug("aiohttp got HTML but no qualities found")
@@ -981,7 +1002,11 @@ async def extract_usersporn_qualities(url: str) -> Tuple[List[dict], str]:
             qualities, title = _parse_html_for_qualities(html, final_url or url)
             if qualities:
                 qualities.sort(key=_quality_sort_key, reverse=True)
-                logger.info("Extracted %d qualities (curl_cffi) for: %s", len(qualities), title[:60])
+                logger.info(
+                    "Extracted %d qualities (curl_cffi) for: %s",
+                    len(qualities),
+                    title[:60],
+                )
                 return qualities, title
             else:
                 logger.debug("curl_cffi got HTML but no qualities found")
@@ -1007,7 +1032,9 @@ async def extract_usersporn_qualities(url: str) -> Tuple[List[dict], str]:
 
 
 async def _download_with_curl_cffi(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     try:
         from curl_cffi.requests import AsyncSession
@@ -1018,20 +1045,27 @@ async def _download_with_curl_cffi(
         await progress_cb("📥 **شروع دانلود (curl_cffi)...**")
         async with AsyncSession() as session:
             resp = await session.get(
-                url, impersonate="chrome",
+                url,
+                impersonate="chrome",
                 headers={
                     "Referer": _SITE_REFERER,
                     "Origin": _SITE_URL,
                     "Accept": "*/*",
                 },
-                allow_redirects=True, timeout=600, stream=True,
+                allow_redirects=True,
+                timeout=600,
+                stream=True,
             )
             if resp.status_code != 200:
                 return False, f"HTTP {resp.status_code}", 0
 
             content_length = int(resp.headers.get("Content-Length", 0))
             if content_length > MAX_DOWNLOAD_SIZE:
-                return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                return (
+                    False,
+                    f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                    0,
+                )
 
             downloaded = 0
             start_time = time.time()
@@ -1049,7 +1083,11 @@ async def _download_with_curl_cffi(
                     now = time.time()
                     if now - last_update >= 2.0:
                         last_update = now
-                        await progress_cb(_format_progress(downloaded, content_length, start_time, now))
+                        await progress_cb(
+                            _format_progress(
+                                downloaded, content_length, start_time, now
+                            )
+                        )
 
         if not os.path.exists(filepath):
             return False, "File not created", 0
@@ -1065,28 +1103,67 @@ async def _download_with_curl_cffi(
 
 
 async def _download_with_ytdlp(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp not installed", 0
 
-    await progress_cb("📥 **شروع دانلود (yt-dlp)...**")
+    has_aria2c = shutil.which("aria2c") is not None
+    mode = "aria2c" if has_aria2c else "concurrent x16"
+    await progress_cb(f"📥 **شروع دانلود (yt-dlp · {mode})...**")
+
     try:
         cmd = [
-            "yt-dlp", "--no-warnings", "--progress", "--newline",
-            "--no-check-certificates", "-f", "best",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", f"Referer:{_SITE_REFERER}",
-            "--add-header", f"Origin:{_SITE_URL}",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "-o", filepath,
+            "yt-dlp",
+            "--no-warnings",
+            "--progress",
+            "--newline",
+            "--no-check-certificates",
+            "-f",
+            "best",
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "fragment:exp=1:30",
+            "--buffer-size",
+            "16K",
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            f"Referer:{_SITE_REFERER}",
+            "--add-header",
+            f"Origin:{_SITE_URL}",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "-o",
+            filepath,
         ]
+
+        if has_aria2c:
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
+
         if _check_impersonation_support():
             cmd.extend(["--impersonate", "chrome"])
         cmd.append(url)
 
         process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         last_update = 0.0
         while True:
@@ -1127,7 +1204,9 @@ async def _download_with_ytdlp(
 
 
 async def _download_with_aiohttp(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     headers = {**_DEFAULT_HEADERS, "Referer": _SITE_REFERER, "Origin": _SITE_URL}
     error = ""
@@ -1135,7 +1214,9 @@ async def _download_with_aiohttp(
         try:
             timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
             async with _get_session(timeout) as session:
-                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                async with session.get(
+                    url, headers=headers, allow_redirects=True
+                ) as resp:
                     if resp.status != 200:
                         error = f"HTTP {resp.status}"
                         if resp.status != 403 and 400 <= resp.status < 500:
@@ -1144,7 +1225,11 @@ async def _download_with_aiohttp(
                     else:
                         content_length = int(resp.headers.get("Content-Length", 0))
                         if content_length > MAX_DOWNLOAD_SIZE:
-                            return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                            return (
+                                False,
+                                f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                                0,
+                            )
 
                         downloaded = 0
                         start_time = time.time()
@@ -1159,7 +1244,11 @@ async def _download_with_aiohttp(
                                 now = time.time()
                                 if now - last_update >= 2.0:
                                     last_update = now
-                                    await progress_cb(_format_progress(downloaded, content_length, start_time, now))
+                                    await progress_cb(
+                                        _format_progress(
+                                            downloaded, content_length, start_time, now
+                                        )
+                                    )
                         return True, "", os.path.getsize(filepath)
 
         except asyncio.CancelledError:
@@ -1180,7 +1269,9 @@ async def _download_with_aiohttp(
 
 
 async def download_usersporn_direct(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     """دانلود لینک مستقیم MP4."""
     if not _is_video_cdn_url(url):
@@ -1188,7 +1279,9 @@ async def download_usersporn_direct(
 
     if _check_impersonation_support():
         logger.info("Trying download with curl_cffi: %s", url[:80])
-        success, error, size = await _download_with_curl_cffi(url, filepath, progress_cb)
+        success, error, size = await _download_with_curl_cffi(
+            url, filepath, progress_cb
+        )
         if success:
             return True, "", size
         logger.info("curl_cffi download failed: %s", error)
@@ -1212,7 +1305,9 @@ async def download_usersporn_direct(
 
 
 async def download_usersporn_m3u8(
-    m3u8_url: str, filepath: str, progress_cb: ProgressCallback,
+    m3u8_url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     """دانلود M3U8 stream."""
     if not _is_video_cdn_url(m3u8_url):

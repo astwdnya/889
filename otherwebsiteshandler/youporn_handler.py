@@ -33,10 +33,12 @@ _SITE_DOMAIN = "youporn.com"
 _SITE_URL = "https://www.youporn.com"
 _SITE_REFERER = f"{_SITE_URL}/"
 
-_ALLOWED_HOSTS = frozenset({
-    "youporn.com",
-    "www.youporn.com",
-})
+_ALLOWED_HOSTS = frozenset(
+    {
+        "youporn.com",
+        "www.youporn.com",
+    }
+)
 
 _ALLOWED_HOST_SUFFIXES = (
     ".youporn.com",
@@ -60,9 +62,8 @@ def is_youporn_url(url: str) -> bool:
 def _is_allowed_host(url: str) -> bool:
     try:
         host = urlparse(url).hostname or ""
-        return (
-            host in _ALLOWED_HOSTS
-            or any(host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
+        return host in _ALLOWED_HOSTS or any(
+            host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES
         )
     except Exception:
         return False
@@ -79,6 +80,7 @@ def _cleanup_file(filepath: str) -> None:
 def _check_impersonation_support() -> bool:
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -113,8 +115,12 @@ async def _ytdlp_dump(url: str) -> Optional[dict]:
         return None
 
     cmd = [
-        "yt-dlp", "--no-warnings", "--no-download",
-        "--dump-json", "--no-check-certificates", "--no-playlist",
+        "yt-dlp",
+        "--no-warnings",
+        "--no-download",
+        "--dump-json",
+        "--no-check-certificates",
+        "--no-playlist",
     ]
     if _check_impersonation_support():
         cmd.extend(["--impersonate", "chrome"])
@@ -127,9 +133,7 @@ async def _ytdlp_dump(url: str) -> Optional[dict]:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=60
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -137,9 +141,7 @@ async def _ytdlp_dump(url: str) -> Optional[dict]:
             return None
 
         if process.returncode != 0:
-            logger.debug(
-                "yt-dlp failed: %s", stderr.decode(errors="replace")[:200]
-            )
+            logger.debug("yt-dlp failed: %s", stderr.decode(errors="replace")[:200])
             return None
 
         raw = stdout.decode(errors="replace").strip()
@@ -185,12 +187,14 @@ def _parse_formats(data: dict) -> List[dict]:
         # direct mp4 ترجیح داده میشه (is_m3u8=False اول)
         entries.sort(key=lambda e: (e["is_m3u8"], -e["tbr"]))
         best = entries[0]
-        qualities.append({
-            "label": f"🎥 {height}p",
-            "url": best["url"],
-            "method": "m3u8" if best["is_m3u8"] else "direct",
-            "format_id": best["format_id"],
-        })
+        qualities.append(
+            {
+                "label": f"🎥 {height}p",
+                "url": best["url"],
+                "method": "m3u8" if best["is_m3u8"] else "direct",
+                "format_id": best["format_id"],
+            }
+        )
 
     qualities.sort(key=_quality_sort_key, reverse=True)
     return qualities
@@ -219,12 +223,14 @@ async def extract_youporn_qualities(url: str) -> Tuple[List[dict], str]:
     # fallback: لینک مستقیم تکی
     direct = data.get("url")
     if direct:
-        return [{
-            "label": "🎥 Video",
-            "url": direct,
-            "method": "m3u8" if ".m3u8" in direct else "direct",
-            "format_id": data.get("format_id", ""),
-        }], title
+        return [
+            {
+                "label": "🎥 Video",
+                "url": direct,
+                "method": "m3u8" if ".m3u8" in direct else "direct",
+                "format_id": data.get("format_id", ""),
+            }
+        ], title
 
     return [], "no video formats found"
 
@@ -233,23 +239,58 @@ async def extract_youporn_qualities(url: str) -> Tuple[List[dict], str]:
 
 
 async def _download_with_ytdlp(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
     format_id: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp not installed", 0
 
-    await progress_cb("📥 **شروع دانلود (yt-dlp)...**")
+    has_aria2c = shutil.which("aria2c") is not None
+    mode = "aria2c" if has_aria2c else "concurrent x16"
+    await progress_cb(f"📥 **شروع دانلود (yt-dlp · {mode})...**")
+
     try:
         cmd = [
-            "yt-dlp", "--no-warnings", "--progress", "--newline",
+            "yt-dlp",
+            "--no-warnings",
+            "--progress",
+            "--newline",
             "--no-check-certificates",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", f"Referer:{_SITE_REFERER}",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "--merge-output-format", "mp4",
-            "-o", filepath,
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "fragment:exp=1:30",
+            "--buffer-size",
+            "16K",
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            f"Referer:{_SITE_REFERER}",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            filepath,
         ]
+
+        if has_aria2c:
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
+
         if _check_impersonation_support():
             cmd.extend(["--impersonate", "chrome"])
         if format_id:
@@ -266,9 +307,7 @@ async def _download_with_ytdlp(
         last_update = 0.0
         while True:
             try:
-                line = await asyncio.wait_for(
-                    process.stdout.readline(), timeout=180
-                )
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=180)
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
@@ -311,7 +350,9 @@ async def _download_with_ytdlp(
 
 
 async def download_youporn_direct(
-    url: str, filepath: str, progress_cb: ProgressCallback,
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
     format_id: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
     """دانلود ویدیوی YouPorn (direct mp4 یا HLS) با yt-dlp."""
@@ -319,7 +360,10 @@ async def download_youporn_direct(
         return False, "URL host not allowed", 0
 
     success, error, size = await _download_with_ytdlp(
-        url, filepath, progress_cb, format_id=format_id,
+        url,
+        filepath,
+        progress_cb,
+        format_id=format_id,
     )
     if success:
         return True, "", size
@@ -328,7 +372,9 @@ async def download_youporn_direct(
 
 
 async def download_youporn_m3u8(
-    m3u8_url: str, filepath: str, progress_cb: ProgressCallback,
+    m3u8_url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
     format_id: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
     """دانلود HLS stream از YouPorn با yt-dlp."""
@@ -336,7 +382,10 @@ async def download_youporn_m3u8(
         return False, "URL host not allowed", 0
 
     success, error, size = await _download_with_ytdlp(
-        m3u8_url, filepath, progress_cb, format_id=format_id,
+        m3u8_url,
+        filepath,
+        progress_cb,
+        format_id=format_id,
     )
     if success:
         return True, "", size

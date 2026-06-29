@@ -53,10 +53,12 @@ SESSION_TTL = 30 * 60
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
 
-_ALLOWED_HOSTS = frozenset({
-    "teensexvideos.xxx",
-    "www.teensexvideos.xxx",
-})
+_ALLOWED_HOSTS = frozenset(
+    {
+        "teensexvideos.xxx",
+        "www.teensexvideos.xxx",
+    }
+)
 
 _ALLOWED_HOST_SUFFIXES = (
     ".teensexvideos.xxx",
@@ -92,9 +94,8 @@ def _is_allowed_host(url: str) -> bool:
     """بررسی اینکه URL به دامنه‌های مجاز اشاره میکنه."""
     try:
         host = urlparse(url).hostname or ""
-        return (
-            host in _ALLOWED_HOSTS
-            or any(host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
+        return host in _ALLOWED_HOSTS or any(
+            host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES
         )
     except Exception:
         return False
@@ -135,7 +136,8 @@ def cleanup_expired_sessions() -> int:
     """پاکسازی session های منقضی شده."""
     now = time.time()
     expired = [
-        sid for sid, data in teensexvideos_sessions.items()
+        sid
+        for sid, data in teensexvideos_sessions.items()
         if now - data.get("created_at", 0) > SESSION_TTL
     ]
     for sid in expired:
@@ -204,6 +206,7 @@ def _check_impersonation_support() -> bool:
     """بررسی اینکه curl_cffi نصبه."""
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -233,9 +236,7 @@ async def _get_session(timeout: Optional[ClientTimeout] = None):
     """ساخت و مدیریت aiohttp session."""
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar(unsafe=True)
-    session = aiohttp.ClientSession(
-        timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
-    )
+    session = aiohttp.ClientSession(timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar)
     try:
         yield session
     finally:
@@ -268,7 +269,10 @@ async def _fetch_with_retry(
             last_error = str(e)[:120]
             logger.warning(
                 "Attempt %d/%d failed for %s: %s",
-                attempt, max_retries, url, last_error,
+                attempt,
+                max_retries,
+                url,
+                last_error,
             )
         if attempt < max_retries:
             await asyncio.sleep(RETRY_DELAY * attempt)
@@ -338,9 +342,7 @@ async def _try_ytdlp_extract(
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=60
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
@@ -382,11 +384,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             height = data.get("height")
             label = f"🎥 {ext.upper()} {height}p" if height else f"🎥 {ext.upper()}"
             is_m3u8 = ext in ("m3u8", "m3u8_native") or ".m3u8" in direct_url
-            qualities.append({
-                "label": label,
-                "url": direct_url,
-                "method": "m3u8" if is_m3u8 else "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": direct_url,
+                    "method": "m3u8" if is_m3u8 else "direct",
+                }
+            )
         return qualities
 
     for fmt in formats:
@@ -406,9 +410,7 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             continue
 
         is_m3u8 = (
-            protocol in ("m3u8", "m3u8_native")
-            or ".m3u8" in fmt_url
-            or ext == "m3u8"
+            protocol in ("m3u8", "m3u8_native") or ".m3u8" in fmt_url or ext == "m3u8"
         )
 
         size_str = f" ({filesize / 1024 / 1024:.0f}MB)" if filesize else ""
@@ -422,11 +424,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
         else:
             label = f"🎥 {ext.upper()}{size_str}"
 
-        qualities.append({
-            "label": label,
-            "url": fmt_url,
-            "method": "m3u8" if is_m3u8 else "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": fmt_url,
+                "method": "m3u8" if is_m3u8 else "direct",
+            }
+        )
 
     return qualities
 
@@ -511,7 +515,8 @@ async def extract_teensexvideos_qualities(url: str) -> Tuple[List[dict], str]:
         qualities.sort(key=_quality_sort_key, reverse=True)
         logger.info(
             "Extracted %d qualities (yt-dlp) for: %s",
-            len(qualities), title[:60],
+            len(qualities),
+            title[:60],
         )
         return qualities, title
 
@@ -522,7 +527,8 @@ async def extract_teensexvideos_qualities(url: str) -> Tuple[List[dict], str]:
         qualities.sort(key=_quality_sort_key, reverse=True)
         logger.info(
             "Extracted %d qualities (curl_cffi) for: %s",
-            len(qualities), title[:60],
+            len(qualities),
+            title[:60],
         )
         return qualities, title
 
@@ -565,12 +571,14 @@ def _extract_title(html: str) -> str:
     # og:title
     m = re.search(
         r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-        html, re.IGNORECASE,
+        html,
+        re.IGNORECASE,
     )
     if not m:
         m = re.search(
             r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']',
-            html, re.IGNORECASE,
+            html,
+            re.IGNORECASE,
         )
     if m:
         return m.group(1).strip()
@@ -579,9 +587,7 @@ def _extract_title(html: str) -> str:
     m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
     if m:
         title = m.group(1).strip()
-        title = re.sub(
-            r"\s*[-|]\s*[Tt]een\s*[Ss]ex\s*[Vv]ideos.*$", "", title
-        ).strip()
+        title = re.sub(r"\s*[-|]\s*[Tt]een\s*[Ss]ex\s*[Vv]ideos.*$", "", title).strip()
         return title or "Untitled"
 
     # h1
@@ -592,28 +598,24 @@ def _extract_title(html: str) -> str:
     return "Untitled"
 
 
-def _extract_from_video_tag(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_video_tag(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از تگ <video>."""
-    for m in re.finditer(
-        r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
+    for m in re.finditer(r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
         video_url = _normalize_url(m.group(1), page_url)
         if not video_url or not _is_video_cdn_url(video_url):
             continue
         if any(q["url"] == video_url for q in qualities):
             continue
-        qualities.append({
-            "label": "🎥 MP4 (video tag)",
-            "url": video_url,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": "🎥 MP4 (video tag)",
+                "url": video_url,
+                "method": "direct",
+            }
+        )
 
 
-def _extract_from_source_tags(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_source_tags(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از تگ‌های <source>."""
     for m in re.finditer(
         r'<source[^>]+src=["\']([^"\']+)["\']([^>]*)', html, re.IGNORECASE
@@ -642,26 +644,29 @@ def _extract_from_source_tags(
             q_label = f"{url_res.group(1)}p" if url_res else "Default"
 
         if is_m3u8:
-            qualities.append({
-                "label": f"📡 M3U8 {q_label}",
-                "url": src,
-                "method": "m3u8",
-            })
+            qualities.append(
+                {
+                    "label": f"📡 M3U8 {q_label}",
+                    "url": src,
+                    "method": "m3u8",
+                }
+            )
         else:
-            qualities.append({
-                "label": f"🎥 MP4 {q_label}",
-                "url": src,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": f"🎥 MP4 {q_label}",
+                    "url": src,
+                    "method": "direct",
+                }
+            )
 
 
-def _extract_from_json_ld(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_json_ld(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از JSON-LD structured data."""
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
+        html,
+        re.DOTALL | re.IGNORECASE,
     ):
         try:
             data = json.loads(m.group(1))
@@ -679,16 +684,16 @@ def _extract_from_json_ld(
                 continue
             if any(q["url"] == video_url for q in qualities):
                 continue
-            qualities.append({
-                "label": "🎥 MP4 (structured data)",
-                "url": video_url,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": "🎥 MP4 (structured data)",
+                    "url": video_url,
+                    "method": "direct",
+                }
+            )
 
 
-def _extract_from_js_vars(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_from_js_vars(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج لینک ویدیو از متغیرهای JavaScript."""
     js_patterns = [
         (r"""(?:var\s+)?video_url\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
@@ -697,7 +702,10 @@ def _extract_from_js_vars(
         (r"""file\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
         (r"""src\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
         (r"""['"]?(\d{3,4})['"]?\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", "numbered"),
-        (r"""video_url\s*[:=]\s*decodeURIComponent\s*\(\s*['"]([^'"]+)['"]""", "encoded"),
+        (
+            r"""video_url\s*[:=]\s*decodeURIComponent\s*\(\s*['"]([^'"]+)['"]""",
+            "encoded",
+        ),
         # الگوهای خاص KVS player (رایج در این نوع سایت‌ها)
         (r"""var\s+video_url\s*=\s*'([^']+)'""", None),
         (r"""video_alt_url\s*[:=]\s*['"]([^'"]+)['"]""", None),
@@ -724,19 +732,19 @@ def _extract_from_js_vars(
                 continue
             if any(q["url"] == video_url for q in qualities):
                 continue
-            qualities.append({
-                "label": label,
-                "url": video_url,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": video_url,
+                    "method": "direct",
+                }
+            )
 
     # استخراج از الگوی KVS player flashvars
     _extract_kvs_flashvars(html, page_url, qualities)
 
 
-def _extract_kvs_flashvars(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_kvs_flashvars(html: str, page_url: str, qualities: List[dict]) -> None:
     """
     استخراج از KVS (Kernel Video Sharing) player flashvars.
     خیلی از سایت‌های مشابه از KVS استفاده میکنن.
@@ -756,8 +764,10 @@ def _extract_kvs_flashvars(
     for pattern in kvs_patterns:
         if "_text" in pattern:
             for m in re.finditer(pattern, html):
-                key = "alt2" if "alt_url2" in pattern else (
-                    "alt" if "alt_url" in pattern else "main"
+                key = (
+                    "alt2"
+                    if "alt_url2" in pattern
+                    else ("alt" if "alt_url" in pattern else "main")
                 )
                 quality_labels[key] = m.group(1).strip()
 
@@ -767,8 +777,10 @@ def _extract_kvs_flashvars(
             continue
         for m in re.finditer(pattern, html):
             raw_url = m.group(1)
-            key = "alt2" if "alt_url2" in pattern else (
-                "alt" if "alt_url" in pattern else "main"
+            key = (
+                "alt2"
+                if "alt_url2" in pattern
+                else ("alt" if "alt_url" in pattern else "main")
             )
 
             video_url = _normalize_url(raw_url, page_url)
@@ -789,11 +801,13 @@ def _extract_kvs_flashvars(
                 url_res = re.search(r"(\d{3,4})p", video_url)
                 label = f"🎥 MP4 {url_res.group(1)}p" if url_res else "🎥 MP4"
 
-            qualities.append({
-                "label": label,
-                "url": video_url,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": video_url,
+                    "method": "direct",
+                }
+            )
 
 
 def _extract_from_player_config(
@@ -831,28 +845,22 @@ def _extract_urls_from_dict(
             is_m3u8 = ".m3u8" in video_url
             url_res = re.search(r"(\d{3,4})p", video_url)
             if is_m3u8:
-                label = (
-                    f"📡 M3U8 {url_res.group(1)}p"
-                    if url_res else "📡 M3U8 Stream"
-                )
+                label = f"📡 M3U8 {url_res.group(1)}p" if url_res else "📡 M3U8 Stream"
             else:
-                label = (
-                    f"🎥 MP4 {url_res.group(1)}p"
-                    if url_res else f"🎥 MP4 ({key})"
-                )
-            qualities.append({
-                "label": label,
-                "url": video_url,
-                "method": "m3u8" if is_m3u8 else "direct",
-            })
+                label = f"🎥 MP4 {url_res.group(1)}p" if url_res else f"🎥 MP4 ({key})"
+            qualities.append(
+                {
+                    "label": label,
+                    "url": video_url,
+                    "method": "m3u8" if is_m3u8 else "direct",
+                }
+            )
         elif isinstance(value, dict):
             _extract_urls_from_dict(value, page_url, qualities, depth + 1)
         elif isinstance(value, list):
             for item in value:
                 if isinstance(item, dict):
-                    _extract_urls_from_dict(
-                        item, page_url, qualities, depth + 1
-                    )
+                    _extract_urls_from_dict(item, page_url, qualities, depth + 1)
 
 
 # ─── Download: curl_cffi ───────────────────────────────────
@@ -950,7 +958,9 @@ async def _download_with_ytdlp(
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp not installed", 0
 
-    await progress_cb("📥 **شروع دانلود (yt-dlp)...**")
+    has_aria2c = shutil.which("aria2c") is not None
+    mode = "aria2c" if has_aria2c else "concurrent x16"
+    await progress_cb(f"📥 **شروع دانلود (yt-dlp · {mode})...**")
 
     try:
         cmd = [
@@ -959,13 +969,40 @@ async def _download_with_ytdlp(
             "--progress",
             "--newline",
             "--no-check-certificates",
-            "-f", "best",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", "Referer:https://www.teensexvideos.xxx/",
-            "--add-header", "Origin:https://www.teensexvideos.xxx",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "-o", filepath,
+            "-f",
+            "best",
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "fragment:exp=1:30",
+            "--buffer-size",
+            "16K",
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            "Referer:https://www.teensexvideos.xxx/",
+            "--add-header",
+            "Origin:https://www.teensexvideos.xxx",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "-o",
+            filepath,
         ]
+
+        if has_aria2c:
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
 
         if _check_impersonation_support():
             cmd.extend(["--impersonate", "chrome"])
@@ -981,9 +1018,7 @@ async def _download_with_ytdlp(
         last_update = 0.0
         while True:
             try:
-                line = await asyncio.wait_for(
-                    process.stdout.readline(), timeout=120
-                )
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=120)
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
@@ -1052,9 +1087,7 @@ async def _download_with_aiohttp(
                             _cleanup_file(filepath)
                             return False, error, 0
                     else:
-                        content_length = int(
-                            resp.headers.get("Content-Length", 0)
-                        )
+                        content_length = int(resp.headers.get("Content-Length", 0))
                         if content_length > MAX_DOWNLOAD_SIZE:
                             return (
                                 False,
@@ -1067,9 +1100,7 @@ async def _download_with_aiohttp(
                         last_update = 0.0
 
                         async with aiofiles.open(filepath, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(
-                                1024 * 1024
-                            ):
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
                                 await f.write(chunk)
                                 downloaded += len(chunk)
 
@@ -1142,9 +1173,7 @@ async def download_teensexvideos_direct(
     # ── روش 2: yt-dlp ──
     if shutil.which("yt-dlp"):
         logger.info("Trying download with yt-dlp: %s", url[:80])
-        success, error, size = await _download_with_ytdlp(
-            url, filepath, progress_cb
-        )
+        success, error, size = await _download_with_ytdlp(url, filepath, progress_cb)
         if success:
             return True, "", size
         logger.info("yt-dlp download failed: %s", error)
@@ -1152,9 +1181,7 @@ async def download_teensexvideos_direct(
 
     # ── روش 3: aiohttp ──
     logger.info("Trying download with aiohttp: %s", url[:80])
-    success, error, size = await _download_with_aiohttp(
-        url, filepath, progress_cb
-    )
+    success, error, size = await _download_with_aiohttp(url, filepath, progress_cb)
     if success:
         return True, "", size
 
@@ -1179,9 +1206,7 @@ async def download_teensexvideos_m3u8(
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp is not installed", 0
 
-    success, error, size = await _download_with_ytdlp(
-        m3u8_url, filepath, progress_cb
-    )
+    success, error, size = await _download_with_ytdlp(m3u8_url, filepath, progress_cb)
     if success:
         return True, "", size
 

@@ -257,7 +257,10 @@ async def _download_with_ytdlp(
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp not installed", 0
 
-    await progress_cb("📥 **شروع دانلود (yt-dlp)...**")
+    has_aria2c = shutil.which("aria2c") is not None
+    mode = "aria2c" if has_aria2c else "concurrent x16"
+    await progress_cb(f"📥 **شروع دانلود (yt-dlp · {mode})...**")
+
     try:
         cmd = [
             "yt-dlp",
@@ -265,6 +268,16 @@ async def _download_with_ytdlp(
             "--progress",
             "--newline",
             "--no-check-certificates",
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "fragment:exp=1:30",
+            "--buffer-size",
+            "16K",
             "--max-filesize",
             str(MAX_DOWNLOAD_SIZE),
             "--add-header",
@@ -276,6 +289,18 @@ async def _download_with_ytdlp(
             "-o",
             filepath,
         ]
+
+        if has_aria2c:
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
+
         if _check_impersonation_support():
             cmd.extend(["--impersonate", "chrome"])
         cmd.append(url)
