@@ -86,11 +86,11 @@ from otherwebsiteshandler.TeenSexVideos_handler import (
     teensexvideos_sessions,
 )
 from otherwebsiteshandler.userporn_handler import (
-    is_userporn_url,
-    extract_userporn_qualities,
-    download_userporn_direct,
-    download_userporn_m3u8,
-    userporn_sessions,
+    is_usersporn_url,
+    extract_usersporn_qualities,
+    download_usersporn_direct,
+    download_usersporn_m3u8,
+    usersporn_sessions,
 )
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
@@ -3439,11 +3439,11 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
-    if is_userporn_url(target_url):
-        logger.info(f"[URL] UserPorn detected | url={target_url[:120]}")
+    if is_usersporn_url(target_url):
+        logger.info(f"[URL] UsersPorn detected | url={target_url[:120]}")
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
-            await process_userporn_request(event, target_url, status_msg)
+            await process_usersporn_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -3474,7 +3474,7 @@ async def generic_url_handler(event):
         or is_xvideos_url(target_url)
         or is_xgroovy_url(target_url)
         or is_teensexvideos_url(target_url)
-        or is_userporn_url(target_url)
+        or is_usersporn_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -5897,16 +5897,16 @@ process_xgroovy_request, xgroovy_quality_callback, xgroovy_cancel_callback = (
 )
 
 (
-    process_userporn_request,
-    userporn_quality_callback,
-    userporn_cancel_callback,
+    process_usersporn_request,
+    usersporn_quality_callback,
+    usersporn_cancel_callback,
 ) = _make_site_handler(
     "up",
-    extract_userporn_qualities,
-    download_userporn_direct,
-    download_userporn_m3u8,
-    userporn_sessions,
-    "UserPorn",
+    extract_usersporn_qualities,
+    download_usersporn_direct,
+    download_usersporn_m3u8,
+    usersporn_sessions,
+    "UsersPorn",
 )
 
 
@@ -6057,10 +6057,10 @@ async def main():
         teensexvideos_cancel_callback, events.CallbackQuery(pattern=r"tsv_cancel_.+")
     )
     client.add_event_handler(
-        userporn_quality_callback, events.CallbackQuery(pattern=r"up_q_.+")
+        usersporn_quality_callback, events.CallbackQuery(pattern=r"up_q_.+")
     )
     client.add_event_handler(
-        userporn_cancel_callback, events.CallbackQuery(pattern=r"up_cancel_.+")
+        usersporn_cancel_callback, events.CallbackQuery(pattern=r"up_cancel_.+")
     )
 
     # ===== Command handlers =====
