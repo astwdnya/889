@@ -3137,19 +3137,14 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 3: تست yt-dlp روی player.php و api.php"""
+    """مرحله 4: بررسی player.js و تست api.php با پارامترهای مختلف"""
     import re
-    import asyncio
     import json
-    import aiohttp
-    import shutil
     from otherwebsiteshandler.hentaihaven_handler import (
         _fetch_page,
         _check_impersonation_support,
-        _USER_AGENT,
     )
 
-    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
     player_url = (
         "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
         "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
@@ -3159,153 +3154,147 @@ async def debug_hentaihaven(event):
 
     lines = []
 
-    # ── تست 1: yt-dlp روی player.php ──
-    await event.reply("🔍 Test 1: yt-dlp on player.php...")
-    if shutil.which("yt-dlp"):
-        for method in ["basic", "impersonate"]:
-            cmd = [
-                "yt-dlp",
-                "--no-warnings",
-                "--no-download",
-                "--dump-json",
-                "--no-check-certificates",
-                "--no-playlist",
-            ]
-            if method == "impersonate" and _check_impersonation_support():
-                cmd.extend(["--impersonate", "chrome"])
-            cmd.append(player_url)
+    # ── بخش 1: جستجو در player.js برای الگوی api call ──
+    await event.reply("🔍 Analyzing player.js...")
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                lines.append(f"yt-dlp ({method}): TIMEOUT")
-                continue
+    js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
+    js_content, _, _ = await _fetch_page(js_url, referer=player_url)
 
-            if proc.returncode == 0:
-                raw = stdout.decode(errors="replace")[:500]
-                lines.append(f"✅ yt-dlp ({method}) SUCCESS:\n{raw}")
-            else:
-                err = stderr.decode(errors="replace")[:200]
-                lines.append(f"❌ yt-dlp ({method}): {err}")
+    if js_content:
+        api_refs = [m.start() for m in re.finditer(r"api\.php", js_content)]
+        lines.append(
+            f"📜 player.js: {len(js_content)} bytes, api.php refs: {len(api_refs)}"
+        )
 
-    # ── تست 2: api.php با POST ──
-    await event.reply("🔍 Test 2: api.php POST...")
+        for idx in api_refs[:5]:
+            start = max(0, idx - 150)
+            end = min(len(js_content), idx + 200)
+            snippet = js_content[start:end]
+            lines.append(f"\n--- api.php context (pos {idx}) ---\n{snippet}")
 
-    test_payloads = [
-        {
-            "method": "POST-json",
-            "data": json.dumps({"data": data_param}),
-            "ct": "application/json",
-        },
-        {
-            "method": "POST-form",
-            "data": f"data={data_param}",
-            "ct": "application/x-www-form-urlencoded",
-        },
-        {"method": "GET", "data": None, "ct": None},
-    ]
+        fetch_patterns = [
+            (r"fetch\s*\([^)]{0,500}\)", "fetch()"),
+            (r"\.post\s*\([^)]{0,500}\)", ".post()"),
+            (r"\.get\s*\([^)]{0,500}\)", ".get()"),
+            (r"XMLHttpRequest", "XHR"),
+            (r"axios", "axios"),
+        ]
+        for pattern, name in fetch_patterns:
+            matches = list(re.finditer(pattern, js_content))
+            if matches:
+                lines.append(f"\n🌐 {name} calls: {len(matches)}")
+                for m in matches[:3]:
+                    lines.append(f"  {m.group()[:200]}")
 
-    for tp in test_payloads:
-        try:
-            headers = {
-                "User-Agent": _USER_AGENT,
-                "Referer": player_url,
-                "Origin": "https://hentaihaven.xxx",
-                "X-Requested-With": "XMLHttpRequest",
-            }
-            if tp["ct"]:
-                headers["Content-Type"] = tp["ct"]
+        data_patterns = [
+            r'["\']data["\']',
+            r"\.data\b",
+            r"formData",
+            r"FormData",
+            r"JSON\.stringify",
+            r"encodeURIComponent",
+        ]
+        for dp in data_patterns:
+            matches = list(re.finditer(dp, js_content))
+            if matches:
+                lines.append(f"\n📦 '{dp}' found {len(matches)} times")
+                for m in matches[:2]:
+                    start = max(0, m.start() - 80)
+                    end = min(len(js_content), m.end() + 80)
+                    lines.append(f"  ...{js_content[start:end]}...")
 
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                if tp["method"].startswith("POST"):
-                    async with session.post(
-                        api_url, data=tp["data"], headers=headers
-                    ) as resp:
-                        body = await resp.text(errors="replace")
-                        lines.append(
-                            f"\n🌐 api.php {tp['method']}: status={resp.status}, "
-                            f"len={len(body)}\n{body[:300]}"
-                        )
-                else:
-                    api_get_url = f"{api_url}?data={data_param}"
-                    async with session.get(api_get_url, headers=headers) as resp:
-                        body = await resp.text(errors="replace")
-                        lines.append(
-                            f"\n🌐 api.php GET: status={resp.status}, "
-                            f"len={len(body)}\n{body[:300]}"
-                        )
-        except Exception as e:
-            lines.append(f"\n❌ api.php {tp['method']}: {str(e)[:100]}")
+        video_patterns = [
+            r"sources?\b",
+            r"\.mp4",
+            r"\.m3u8",
+            r"hls",
+            r"video_url",
+            r"stream",
+        ]
+        for vp in video_patterns:
+            matches = list(re.finditer(vp, js_content, re.IGNORECASE))
+            if matches:
+                lines.append(f"\n🎥 '{vp}' found {len(matches)} times")
+                for m in matches[:2]:
+                    start = max(0, m.start() - 60)
+                    end = min(len(js_content), m.end() + 100)
+                    lines.append(f"  ...{js_content[start:end][:200]}...")
 
-    # ── تست 3: api.php با curl_cffi ──
+    # ── بخش 2: تست api.php با curl_cffi و پارامترهای مختلف ──
     if _check_impersonation_support():
-        await event.reply("🔍 Test 3: api.php with curl_cffi...")
+        await event.reply("🔍 Testing api.php with curl_cffi...")
         try:
             from curl_cffi.requests import AsyncSession
 
             async with AsyncSession() as session:
-                try:
-                    await session.get(
-                        player_url,
-                        impersonate="chrome",
-                        headers={"Referer": page_url},
-                        timeout=15,
-                    )
-                except Exception:
-                    pass
+                player_resp = await session.get(
+                    player_url,
+                    impersonate="chrome",
+                    headers={
+                        "Referer": "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
+                    },
+                    timeout=15,
+                )
+                lines.append(f"\n🔐 player.php cookies: {len(session.cookies)}")
+                for c in session.cookies:
+                    lines.append(f"  cookie: {c.name}={c.value[:50]}...")
 
-                for method in ["POST-json", "POST-form"]:
+                token_m = re.search(
+                    r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
+                    player_resp.text,
+                    re.IGNORECASE,
+                )
+                token = token_m.group(1) if token_m else ""
+                lines.append(f"\n🔑 x-secure-token: {token[:80]}...")
+
+                test_cases = [
+                    {"d": {"data": data_param}, "h": {}, "name": "json-data"},
+                    {
+                        "d": {"data": data_param, "action": "get_video"},
+                        "h": {},
+                        "name": "json-action",
+                    },
+                    {"d": {"hash": data_param}, "h": {}, "name": "json-hash"},
+                    {
+                        "d": {"data": data_param},
+                        "h": {"X-Secure-Token": token},
+                        "name": "json+token",
+                    },
+                    {
+                        "d": {"data": data_param, "token": token},
+                        "h": {},
+                        "name": "json-data+token",
+                    },
+                ]
+
+                for tc in test_cases:
                     try:
                         headers = {
                             "Referer": player_url,
                             "Origin": "https://hentaihaven.xxx",
                             "X-Requested-With": "XMLHttpRequest",
+                            "Accept": "application/json, */*",
+                            **tc["h"],
                         }
-                        if method == "POST-json":
-                            resp = await session.post(
-                                api_url,
-                                json={"data": data_param},
-                                impersonate="chrome",
-                                headers=headers,
-                                timeout=15,
-                            )
-                        else:
-                            resp = await session.post(
-                                api_url,
-                                data={"data": data_param},
-                                impersonate="chrome",
-                                headers=headers,
-                                timeout=15,
-                            )
-                        lines.append(
-                            f"\n🔐 curl_cffi api.php {method}: status={resp.status_code}, "
-                            f"len={len(resp.text)}\n{resp.text[:300]}"
+                        resp = await session.post(
+                            api_url,
+                            json=tc["d"],
+                            impersonate="chrome",
+                            headers=headers,
+                            timeout=15,
                         )
+                        body = resp.text
+                        lines.append(
+                            f"\n🧪 {tc['name']}: status={resp.status_code}, "
+                            f"len={len(body)}, ct={resp.headers.get('content-type', '?')}"
+                        )
+                        if body:
+                            lines.append(f"  body: {body[:300]}")
                     except Exception as e:
-                        lines.append(f"\n❌ curl_cffi {method}: {str(e)[:100]}")
+                        lines.append(f"\n❌ {tc['name']}: {str(e)[:100]}")
+
         except ImportError:
             lines.append("\n❌ curl_cffi not installed")
-
-    # ── تست 4: player.js محتوا ──
-    await event.reply("🔍 Test 4: Fetching player.js...")
-    js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
-    try:
-        html_js, status_js, _ = await _fetch_page(js_url, referer=player_url)
-        if html_js:
-            lines.append(f"\n📜 player.js ({len(html_js)} bytes):")
-            lines.append(html_js[:800])
-        else:
-            lines.append(f"\n❌ player.js: status {status_js}")
-    except Exception as e:
-        lines.append(f"\n❌ player.js error: {str(e)[:100]}")
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
