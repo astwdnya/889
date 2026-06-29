@@ -106,6 +106,12 @@ from otherwebsiteshandler.rat_handler import (
     download_rat_m3u8,
     rat_sessions,
 )
+from otherwebsiteshandler.youporn_handler import (
+    is_youporn_url,
+    extract_youporn_qualities,
+    download_youporn_direct,
+    download_youporn_m3u8,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3566,6 +3572,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_youporn_url(target_url):
+        logger.info(f"[URL] YouPorn detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_youporn_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3595,6 +3610,7 @@ async def generic_url_handler(event):
         or is_usersporn_url(target_url)
         or is_hentaihaven_url(target_url)
         or is_rat_url(target_url)
+        or is_youporn_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -6055,6 +6071,105 @@ process_xgroovy_request, xgroovy_quality_callback, xgroovy_cancel_callback = (
     "Rat",
 )
 
+# ─── YouPorn (custom handlers: passes format_id + page_url) ───
+
+youporn_sessions: dict = {}
+
+
+async def process_youporn_request(event, url: str, status_msg):
+    qualities, title = await extract_youporn_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"yp_{event.chat_id}_{event.id}_{int(time.time())}"
+    youporn_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو YouPorn"
+    text = f"🎬 **{title_display}**\n🌐 YouPorn\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = [
+        [Button.inline(q["label"], f"yp_q_{session_id}_{i}")]
+        for i, q in enumerate(qualities)
+    ]
+    buttons.append([Button.inline("❌ لغو", f"yp_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def youporn_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in youporn_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = youporn_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "YouPorn_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "YouPorn_video"
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+    try:
+        await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_youporn_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            format_id=chosen.get("format_id"),
+        )
+        if not success or not os.path.exists(filepath) or size < 1024:
+            await safe_edit(
+                status_msg, f"❌ دانلود ناموفق: `{error or 'Unknown error'}`"
+            )
+            return
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = (
+            f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        )
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+        )
+    except Exception as e:
+        logger.error(f"[YouPorn] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def youporn_cancel_callback(event):
+    youporn_sessions.pop("_".join(event.data.decode().split("_")[2:]), None)
+    await event.edit("❌ **لغو شد**", buttons=None)
+
 
 async def main():
     print("\n" + "=" * 60)
@@ -6219,6 +6334,12 @@ async def main():
     )
     client.add_event_handler(
         rat_cancel_callback, events.CallbackQuery(pattern=r"rat_cancel_.+")
+    )
+    client.add_event_handler(
+        youporn_quality_callback, events.CallbackQuery(pattern=r"yp_q_.+")
+    )
+    client.add_event_handler(
+        youporn_cancel_callback, events.CallbackQuery(pattern=r"yp_cancel_.+")
     )
 
     # ===== Command handlers =====
