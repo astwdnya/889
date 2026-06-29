@@ -3166,6 +3166,7 @@ async def debug_hentaihaven(event):
     lines = []
 
     from curl_cffi.requests import AsyncSession
+    from curl_cffi import CurlMime
 
     async with AsyncSession() as session:
         try:
@@ -3227,22 +3228,28 @@ async def debug_hentaihaven(event):
             lines.append(f"🔐 iv: {iv_val[:80]}...")
             lines.append(f"🌐 uri: {uri_val}")
 
-            if en_val and iv_val:
-                await event.reply("🔍 Calling api.php...")
-
+            if en_val:
+                # uri protocol-relative (//...) → https:
+                api_uri = uri_val
+                if api_uri.startswith("//"):
+                    api_uri = "https:" + api_uri
                 api_url = (
-                    f"{uri_val}api.php"
-                    if uri_val
+                    f"{api_uri}api.php"
+                    if api_uri
                     else "https://hentaihaven.xxx/wp-content/plugins/player-logic/api.php"
                 )
+                lines.append(f"🌐 API URL: {api_url}")
+
+                await event.reply("🔍 Calling api.php...")
+
+                multipart = CurlMime()
+                multipart.addpart(name="action", data=b"zarat_get_data_player_ajax")
+                multipart.addpart(name="a", data=en_val.encode())
+                multipart.addpart(name="b", data=iv_val.encode() if iv_val else b"")
 
                 resp = await session.post(
                     api_url,
-                    data={
-                        "action": "zarat_get_data_player_ajax",
-                        "a": en_val,
-                        "b": iv_val,
-                    },
+                    multipart=multipart,
                     impersonate="chrome",
                     headers={
                         "Referer": player_url,
