@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -69,18 +70,32 @@ _ALLOWED_HOST_SUFFIXES = (
     ".ahcdn.com",
 )
 
-# نگاشت کاراکترهای سیریلیک → لاتین مشابه (obfuscation KVS)
-_CYRILLIC_MAP = {
-    "М": "M", "А": "A", "С": "C", "Е": "E", "О": "O",
-    "Р": "P", "Т": "T", "Н": "H", "К": "K", "В": "B",
-    "Х": "X", "У": "y", "а": "a", "с": "c", "е": "e",
-    "о": "o", "р": "p", "х": "x", "у": "y", "к": "k",
+# نگاشت نام یونی‌کد حروف سیریلیک → لاتین مشابه ظاهری (obfuscation KVS)
+_CYRILLIC_NAME_MAP = {
+    "EM": "M",
+    "A": "A",
+    "ES": "C",
+    "IE": "E",
+    "O": "O",
+    "ER": "P",
+    "TE": "T",
+    "EN": "H",
+    "KA": "K",
+    "VE": "B",
+    "HA": "X",
+    "U": "Y",
+    "EL": "L",
+    "DE": "D",
+    "I": "I",
+    "BE": "B",
+    "GHE": "G",
+    "ZE": "3",
+    "EF": "F",
+    "SHA": "W",
 }
 
 # الگوی استخراج video_id از iframe videotxxx
-_VT_EMBED_RE = re.compile(
-    r"(?:videotxxx\.com|txxx\.com)/embed/(\d+)", re.I
-)
+_VT_EMBED_RE = re.compile(r"(?:videotxxx\.com|txxx\.com)/embed/(\d+)", re.I)
 
 pornzog_sessions: Dict[str, dict] = {}
 
@@ -111,7 +126,8 @@ def is_pornzog_url(url: str) -> bool:
 def cleanup_expired_sessions() -> int:
     now = time.time()
     expired = [
-        sid for sid, data in pornzog_sessions.items()
+        sid
+        for sid, data in pornzog_sessions.items()
         if now - data.get("created_at", 0) > SESSION_TTL
     ]
     for sid in expired:
@@ -127,26 +143,31 @@ def _cleanup_file(filepath: str) -> None:
         logger.warning("Failed to cleanup file %s: %s", filepath, e)
 
 
+def _cyrillic_to_latin(ch: str) -> str:
+    if ord(ch) < 128:
+        return ch
+    name = unicodedata.name(ch, "")
+    m = re.search(r"LETTER (\w+)$", name)
+    if m:
+        return _CYRILLIC_NAME_MAP.get(m.group(1), "")
+    return ""
+
+
 def _decode_video_url(raw: str) -> Optional[str]:
-    """
-    video_url رمزشده KVS رو decode می‌کنه:
-      - کاراکترهای سیریلیک → لاتین مشابه ظاهری
-      - حذف بقیه کاراکترهای غیر-ASCII
-      - ~ → = (padding)
-      - base64 decode
-    خروجی یه مسیر نسبی مثل /get_file/... هست.
-    """
     try:
-        mapped = "".join(
-            _CYRILLIC_MAP.get(c, c if ord(c) < 128 else "") for c in raw
-        )
+        mapped = "".join(_cyrillic_to_latin(c) for c in raw)
         mapped = mapped.replace("~", "=")
         pad = len(mapped) % 4
         if pad:
             mapped += "=" * (4 - pad)
         decoded = base64.b64decode(mapped).decode("utf-8", errors="replace")
         m = re.search(r"(/get_file/\S+|https?://\S+)", decoded)
-        return m.group(1) if m else None
+        if m:
+            return m.group(1)
+        if decoded.startswith("/"):
+            return decoded
+        logger.warning("decoded but no path: %s", decoded[:80])
+        return None
     except Exception as e:
         logger.warning("decode video_url failed: %s", e)
         return None
@@ -171,6 +192,7 @@ def _quality_from_format(fmt: str) -> Tuple[str, int]:
 def _check_impersonation_support() -> bool:
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -180,9 +202,7 @@ async def _cffi_get(session, url: str, referer: str, ajax: bool = False):
     headers = {"Referer": referer}
     if ajax:
         headers["X-Requested-With"] = "XMLHttpRequest"
-    return await session.get(
-        url, impersonate="chrome", headers=headers, timeout=25
-    )
+    return await session.get(url, impersonate="chrome", headers=headers, timeout=25)
 
 
 # ─── Extraction ─────────────────────────────────────────────
@@ -265,6 +285,12 @@ async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
             if not raw:
                 continue
 
+            non_ascii = {c for c in raw if ord(c) >= 128}
+            if non_ascii:
+                logger.info(
+                    "video_url non-ASCII chars: %s",
+                    [(c, unicodedata.name(c, "?")) for c in non_ascii],
+                )
             path = _decode_video_url(raw)
             if not path:
                 continue
@@ -365,8 +391,9 @@ async def download_pornzog_direct(
             raise
         except Exception as e:
             error = str(e)[:150]
-            logger.warning("Download attempt %d/%d failed: %s",
-                           attempt, MAX_RETRIES, error)
+            logger.warning(
+                "Download attempt %d/%d failed: %s", attempt, MAX_RETRIES, error
+            )
 
         if attempt < MAX_RETRIES:
             _cleanup_file(filepath)
@@ -407,9 +434,7 @@ async def _do_direct_download(
     timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
 
     async with _get_session(timeout) as session:
-        async with session.get(
-            url, headers=headers, allow_redirects=True
-        ) as resp:
+        async with session.get(url, headers=headers, allow_redirects=True) as resp:
             if resp.status != 200:
                 # body کوتاه ممکنه 'Wrong referer' باشه
                 body = await resp.content.read(64)
