@@ -811,6 +811,7 @@ async def download_with_controls(
 
     timeout = ClientTimeout(total=None, connect=30, sock_read=120)
     filepath = ""
+    orig_name = ""
     downloaded = 0
     total = 0
     last_update = 0.0
