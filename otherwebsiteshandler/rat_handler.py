@@ -228,14 +228,27 @@ async def _fetch_page(url: str) -> Tuple[Optional[str], int]:
 
 
 def _parse_flashvars(html: str) -> dict:
-    """استخراج بلاک flashvars به دیکشنری."""
-    m = re.search(r"flashvars\s*=\s*\{(.*?)\};", html, re.DOTALL)
-    if not m:
-        return {}
-    block = m.group(1)
+    """استخراج فیلدهای flashvars مستقیم از HTML (بدون قطع شدن بلاک)."""
     result = {}
-    for fm in re.finditer(r"""['"]?(\w+)['"]?\s*:\s*'([^']*)'""", block, re.DOTALL):
-        result[fm.group(1)] = fm.group(2)
+    wanted = [
+        "license_code",
+        "video_id",
+        "video_url",
+        "video_url_text",
+        "video_alt_url",
+        "video_alt_url_text",
+        "video_alt_url2",
+        "video_alt_url2_text",
+        "video_alt_url3",
+        "video_alt_url3_text",
+        "video_alt_url4",
+        "video_alt_url4_text",
+        "preview_url",
+    ]
+    for key in wanted:
+        m = re.search(r"\b" + re.escape(key) + r"\s*:\s*'([^']*)'", html)
+        if m:
+            result[key] = m.group(1)
     return result
 
 
