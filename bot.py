@@ -6366,8 +6366,44 @@ tnaflix_sessions: dict = {}
 
 pornzog_sessions: dict = {}
 
+
+async def process_pornzog_request(event, url: str, status_msg):
+    debug_lines: list[str] = []
+
+    def debug_cb(msg: str) -> None:
+        debug_lines.append(msg)
+
+    qualities, title = await extract_pornzog_qualities(url, debug_cb=debug_cb)
+    if not qualities:
+        debug_text = "\n".join(debug_lines[-30:])
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        try:
+            await event.client.send_message(
+                event.chat_id,
+                f"🔬 **Pornzog Debug Log:**\n```\n{debug_text[:3500]}\n```",
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            logger.warning("Failed to send debug msg: %s", e)
+        return
+    session_id = f"pz_{event.chat_id}_{event.id}_{int(time.time())}"
+    pornzog_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو Pornzog"
+    text = f"🎬 **{title_display}**\n🌐 Pornzog\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"pz_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"pz_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
 (
-    process_pornzog_request,
     pornzog_quality_callback,
     pornzog_cancel_callback,
 ) = _make_site_handler(
@@ -6377,7 +6413,7 @@ pornzog_sessions: dict = {}
     download_pornzog_m3u8,
     pornzog_sessions,
     "Pornzog",
-)
+)[1:]
 
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
