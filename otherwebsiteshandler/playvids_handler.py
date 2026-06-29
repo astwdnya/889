@@ -20,7 +20,7 @@ import re
 import shutil
 import time
 from typing import Awaitable, Callable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger("PlayvidsHandler")
 
@@ -127,6 +127,30 @@ def _extract_title(html: str) -> str:
     return "Untitled"
 
 
+def _parse_master_variants(master_body: str, master_url: str) -> List[dict]:
+    variants: List[dict] = []
+    lines = master_body.splitlines()
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line.startswith("#EXT-X-STREAM-INF"):
+            continue
+        uri = ""
+        for nxt in lines[i + 1 :]:
+            nxt = nxt.strip()
+            if nxt and not nxt.startswith("#"):
+                uri = nxt
+                break
+        if not uri:
+            continue
+        res = re.search(r"RESOLUTION=\d+x(\d+)", line)
+        bw = re.search(r"BANDWIDTH=(\d+)", line)
+        height = int(res.group(1)) if res else 0
+        bandwidth = int(bw.group(1)) if bw else 0
+        variant_url = _clean_url(urljoin(master_url, uri))
+        variants.append({"height": height, "bandwidth": bandwidth, "url": variant_url})
+    return variants
+
+
 # ─── HTTP (curl_cffi) ───────────────────────────────────────
 
 
@@ -181,7 +205,7 @@ def _find_media_url(html: str) -> Optional[str]:
 
 
 async def extract_playvids_qualities(url: str) -> Tuple[List[dict], str]:
-    """لینک ویدیو رو از playvids استخراج میکنه (از طریق صفحه embed)."""
+    """کیفیت‌های مختلف رو از playvids استخراج میکنه (از طریق صفحه embed)."""
     if not is_playvids_url(url):
         return [], "Invalid URL"
 
@@ -192,7 +216,6 @@ async def extract_playvids_qualities(url: str) -> Tuple[List[dict], str]:
     if not vid:
         return [], "Video ID پیدا نشد در URL"
 
-    # صفحه embed تمیزتره و لینک ویدیو رو مستقیم داره
     embed_url = f"{_SITE_URL}/embed/{vid}"
     logger.info("Fetching embed: %s", embed_url)
     html, status = await _fetch(embed_url, url)
@@ -204,7 +227,6 @@ async def extract_playvids_qualities(url: str) -> Tuple[List[dict], str]:
         media_url = _find_media_url(html)
         title = _extract_title(html)
 
-    # fallback: صفحه اصلی اگه embed چیزی نداد
     if not media_url:
         logger.info("Embed failed, trying main page")
         page_html, pstatus = await _fetch(url, _SITE_REFERER)
@@ -220,16 +242,63 @@ async def extract_playvids_qualities(url: str) -> Tuple[List[dict], str]:
         logger.warning("Media host not allowed: %s", media_url[:60])
         return [], "میزبان لینک مجاز نیست"
 
-    is_hls = ".m3u8" in media_url
-    qualities = [
-        {
-            "label": "📡 دانلود (HLS)" if is_hls else "🎬 دانلود (MP4)",
-            "url": media_url,
-            "method": "m3u8" if is_hls else "direct",
-            "page_url": url,
-        }
-    ]
-    logger.info("Extracted media for: %s", title[:60])
+    if ".m3u8" not in media_url:
+        return [
+            {
+                "label": "🎬 دانلود (MP4)",
+                "url": media_url,
+                "method": "direct",
+                "page_url": url,
+            }
+        ], title
+
+    logger.info("Fetching master playlist: %s", media_url[:80])
+    master_body, mstatus = await _fetch(media_url, embed_url)
+
+    qualities: List[dict] = []
+
+    if master_body and "#EXT-X-STREAM-INF" in master_body:
+        variants = _parse_master_variants(master_body, media_url)
+        variants.sort(key=lambda v: (v["height"], v["bandwidth"]), reverse=True)
+
+        seen = set()
+        for v in variants:
+            if not _is_allowed_host(v["url"]):
+                continue
+            if v["url"] in seen:
+                continue
+            seen.add(v["url"])
+
+            if v["height"]:
+                label = f"📡 {v['height']}p"
+            elif v["bandwidth"]:
+                label = f"📡 {round(v['bandwidth'] / 1000)} kbps"
+            else:
+                label = "📡 Auto"
+
+            qualities.append(
+                {
+                    "label": label,
+                    "url": v["url"],
+                    "method": "m3u8",
+                    "page_url": url,
+                    "height": v["height"],
+                }
+            )
+
+    if not qualities:
+        logger.info("No variants parsed, using master directly")
+        qualities = [
+            {
+                "label": "📡 دانلود (HLS - بهترین کیفیت)",
+                "url": media_url,
+                "method": "m3u8",
+                "page_url": url,
+                "height": 0,
+            }
+        ]
+
+    logger.info("Extracted %d qualities for: %s", len(qualities), title[:60])
     return qualities, title
 
 
@@ -324,7 +393,9 @@ async def _download_with_ytdlp(
         await process.wait()
         if process.returncode != 0:
             full_err = "\n".join(tail).lower()
-            if any(p in full_err for p in ("404", "403", "forbidden", "fragment not found")):
+            if any(
+                p in full_err for p in ("404", "403", "forbidden", "fragment not found")
+            ):
                 return False, "__EXPIRED__", 0
             err = "\n".join(tail[-5:]) or "yt-dlp failed"
             return False, err[:200], 0
