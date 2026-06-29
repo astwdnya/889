@@ -4,14 +4,15 @@ hentaihaven_handler.py
 استخراج لینک‌های دانلود از hentaihaven.xxx و ارسال ویدیو به کاربر.
 
 روش کار:
-  - سایت از iframe embed و multi-server استفاده میکنه
-  - yt-dlp به عنوان روش اصلی (با impersonation برای Cloudflare)
-  - curl_cffi/aiohttp برای پارس HTML و استخراج iframe/embed URLs
-  - لینک‌های MP4 و M3U8 از صفحه embed استخراج میشن
+  - سایت WordPress-based هست و از iframe embed استفاده میکنه
+  - ویدیو از player.php?data=... لود میشه
+  - yt-dlp روی iframe URL های واقعی اجرا میشه
+  - curl_cffi/aiohttp برای پارس HTML
   - کاربر با دکمه کیفیت انتخاب میکنه
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -64,7 +65,6 @@ _ALLOWED_HOSTS = frozenset({
 
 _ALLOWED_HOST_SUFFIXES = (
     ".hentaihaven.xxx",
-    # Streaming/CDN servers
     ".cdntrex.com",
     ".kvcdn.com",
     ".cdn13.com",
@@ -73,27 +73,42 @@ _ALLOWED_HOST_SUFFIXES = (
     ".gvideo.io",
     ".googleapis.com",
     ".googleusercontent.com",
-    ".phncdn.com",
-    ".mxdcontent.net",
-    ".xvcdn.com",
     ".fastly.net",
     ".cloudfront.net",
     ".akamaized.net",
     ".hwcdn.net",
-    # Common anime/hentai streaming CDNs
     ".streamtape.com",
+    ".stape.fun",
     ".doodstream.com",
-    ".vidstreaming.io",
+    ".dood.to",
+    ".dood.so",
+    ".dood.watch",
     ".mp4upload.com",
     ".sendvid.com",
     ".fembed.com",
     ".mixdrop.co",
+    ".mixdrop.to",
     ".upstream.to",
     ".streamsb.net",
     ".vidoza.net",
     ".filemoon.sx",
+    ".filemoon.to",
     ".voe.sx",
+    ".streamwish.to",
+    ".streamwish.com",
+    ".vidhide.com",
+    ".vidguard.to",
+    ".lulustream.com",
+    ".emturbovid.com",
+    ".turbovid.com",
 )
+
+# پسوندهای فایل‌هایی که نباید به عنوان ویدیو شناسایی بشن
+_SKIP_EXTENSIONS = frozenset({
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+    ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
+    ".json", ".xml", ".txt", ".html", ".htm", ".php",
+})
 
 _IMPERSONATE_TARGETS = [
     "chrome",
@@ -127,6 +142,10 @@ def _is_video_cdn_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
         path = parsed.path.lower()
+        # فیلتر فایل‌های غیر ویدیویی
+        for ext in _SKIP_EXTENSIONS:
+            if path.endswith(ext):
+                return False
         if parsed.scheme in ("http", "https") and (
             path.endswith(".mp4")
             or path.endswith(".m3u8")
@@ -137,10 +156,7 @@ def _is_video_cdn_url(url: str) -> bool:
             or "/media/" in path
             or "/hls/" in path
             or "/get_file/" in path
-            or "/videos/" in path
-            or "/embed/" in path
             or "/stream/" in path
-            or "/e/" in path
         ):
             return True
     except Exception:
@@ -148,8 +164,76 @@ def _is_video_cdn_url(url: str) -> bool:
     return False
 
 
+def _is_embed_url(url: str) -> bool:
+    """بررسی اینکه URL یه embed/player واقعی هست نه فایل JS/CSS."""
+    try:
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        host = parsed.hostname or ""
+
+        # فیلتر فایل‌های استاتیک
+        for ext in _SKIP_EXTENSIONS:
+            if path.endswith(ext) and "player" not in path:
+                return False
+
+        # فیلتر URL های WordPress غیر ویدیویی
+        skip_paths = [
+            "/wp-includes/",
+            "/wp-content/themes/",
+            "/wp-content/uploads/",
+            "/wp-admin/",
+            "/wp-json/",
+            "/feed/",
+            "jquery",
+            "recaptcha",
+            "google-analytics",
+            "googletagmanager",
+            "facebook",
+            "twitter",
+            "disqus",
+        ]
+        for skip in skip_paths:
+            if skip in path.lower() or skip in host.lower():
+                return False
+
+        # URL های مثبت (embed/player)
+        positive_patterns = [
+            "/embed/",
+            "/e/",
+            "/player",
+            "/watch/",
+            "/video/",
+            "/stream/",
+            "player.php",
+            "/play/",
+        ]
+        for pattern in positive_patterns:
+            if pattern in path.lower():
+                return True
+
+        # هاست‌های شناخته شده streaming
+        streaming_hosts = [
+            "streamtape", "doodstream", "dood.", "mp4upload",
+            "sendvid", "fembed", "mixdrop", "upstream",
+            "streamsb", "vidoza", "filemoon", "voe.",
+            "streamwish", "vidhide", "vidguard", "lulustream",
+            "turbovid", "emturbovid",
+        ]
+        for sh in streaming_hosts:
+            if sh in host:
+                return True
+
+        # اگه query parameter data داره (مثل player.php?data=...)
+        if parsed.query and "data=" in parsed.query:
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
+
 def is_hentaihaven_url(url: str) -> bool:
-    """بررسی اینکه URL مربوط به hentaihaven هست."""
     try:
         host = urlparse(url).hostname or ""
         return host in _ALLOWED_HOSTS or host.endswith(f".{_SITE_DOMAIN}")
@@ -174,7 +258,6 @@ def _cleanup_file(filepath: str) -> None:
     try:
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
-            logger.debug("Cleaned up file: %s", filepath)
     except OSError as e:
         logger.warning("Failed to cleanup file %s: %s", filepath, e)
 
@@ -196,10 +279,7 @@ def _quality_sort_key(q: dict) -> int:
 
 
 def _format_progress(
-    downloaded: int,
-    content_length: int,
-    start_time: float,
-    now: float,
+    downloaded: int, content_length: int, start_time: float, now: float,
 ) -> str:
     elapsed = now - start_time
     speed = downloaded / elapsed if elapsed > 0 else 0
@@ -214,10 +294,7 @@ def _format_progress(
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB"
             f"  •  ⚡ {speed / 1024 / 1024:.1f} MB/s\n📊 {pct:.1f}%"
         )
-    return (
-        f"📥 **Downloading...**\n"
-        f"💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
-    )
+    return f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
 
 
 def _check_impersonation_support() -> bool:
@@ -243,6 +320,43 @@ def _find_output_file(filepath: str) -> Optional[str]:
     return None
 
 
+def _is_valid_video_content(filepath: str) -> bool:
+    """بررسی اینکه فایل دانلود شده واقعاً ویدیو هست نه JS/HTML."""
+    try:
+        if not os.path.exists(filepath):
+            return False
+        size = os.path.getsize(filepath)
+        # فایل‌های کمتر از 100KB احتمالاً ویدیو نیستن
+        if size < 100 * 1024:
+            with open(filepath, "rb") as f:
+                header = f.read(min(512, size))
+            # بررسی magic bytes
+            # MP4: ftyp
+            if b"ftyp" in header[:12]:
+                return True
+            # WebM: 0x1A45DFA3
+            if header[:4] == b"\x1a\x45\xdf\xa3":
+                return True
+            # MPEG-TS: 0x47
+            if header[0:1] == b"\x47":
+                return True
+            # اگه متن/HTML/JS هست
+            try:
+                text = header.decode("utf-8", errors="ignore")
+                if any(kw in text.lower() for kw in [
+                    "<!doctype", "<html", "<script", "function(",
+                    "jquery", "var ", "const ", "undefined",
+                    "{", "/*", "//",
+                ]):
+                    logger.warning("Downloaded file is text/JS, not video")
+                    return False
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return True
+
+
 # ─── HTTP helpers ───────────────────────────────────────────
 
 
@@ -259,159 +373,82 @@ async def _get_session(timeout: Optional[ClientTimeout] = None):
         await session.close()
 
 
-async def _fetch_with_cookies(
+async def _fetch_page(
     url: str,
     referer: Optional[str] = None,
-    max_retries: int = MAX_RETRIES,
-    timeout: Optional[ClientTimeout] = None,
 ) -> Tuple[Optional[str], int, Optional[str]]:
     """
-    دریافت محتوای URL با cookie jar.
+    دریافت صفحه - اول curl_cffi بعد aiohttp.
 
     Returns:
         (content, status_code, final_url)
     """
-    last_error = ""
-    t = timeout or ClientTimeout(total=30, connect=10)
     ref = referer or _SITE_REFERER
 
-    for attempt in range(1, max_retries + 1):
+    # curl_cffi اول (برای Cloudflare)
+    if _check_impersonation_support():
         try:
-            jar = aiohttp.CookieJar(unsafe=True)
-            async with aiohttp.ClientSession(
-                timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
-            ) as session:
-                # صفحه اصلی برای کوکی
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession() as session:
+                # کوکی از صفحه اصلی
                 try:
-                    async with session.get(
-                        _SITE_REFERER, allow_redirects=True,
-                    ) as home_resp:
-                        await home_resp.read()
+                    await session.get(
+                        _SITE_REFERER, impersonate="chrome", timeout=15,
+                    )
                 except Exception:
                     pass
 
-                merged = {**_DEFAULT_HEADERS, "Referer": ref}
-                async with session.get(
-                    url, headers=merged, allow_redirects=True
-                ) as resp:
-                    final_url = str(resp.url)
-                    if resp.status == 200:
-                        content = await resp.text(errors="replace")
-                        return content, 200, final_url
-                    last_error = f"HTTP {resp.status}"
-                    if 400 <= resp.status < 500 and resp.status != 403:
-                        return None, resp.status, final_url
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            last_error = str(e)[:120]
-
-        if attempt < max_retries:
-            await asyncio.sleep(RETRY_DELAY * attempt)
-
-    return None, 0, None
-
-
-async def _fetch_with_curl_cffi(
-    url: str,
-    referer: Optional[str] = None,
-) -> Tuple[Optional[str], int, Optional[str]]:
-    """دریافت صفحه با curl_cffi."""
-    try:
-        from curl_cffi.requests import AsyncSession
-    except ImportError:
-        return None, 0, None
-
-    ref = referer or _SITE_REFERER
-    try:
-        async with AsyncSession() as session:
-            try:
-                await session.get(
-                    _SITE_REFERER, impersonate="chrome", timeout=15,
+                resp = await session.get(
+                    url,
+                    impersonate="chrome",
+                    headers={"Referer": ref, "Accept-Language": "en-US,en;q=0.9"},
+                    allow_redirects=True,
+                    timeout=30,
                 )
+                final_url = str(resp.url) if hasattr(resp, "url") else url
+                if resp.status_code == 200:
+                    return resp.text, 200, final_url
+                logger.debug("curl_cffi got status %d for %s", resp.status_code, url[:60])
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug("curl_cffi failed: %s", e)
+
+    # aiohttp fallback
+    try:
+        t = ClientTimeout(total=30, connect=10)
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(
+            timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
+        ) as session:
+            try:
+                async with session.get(_SITE_REFERER, allow_redirects=True) as hr:
+                    await hr.read()
             except Exception:
                 pass
 
-            resp = await session.get(
+            async with session.get(
                 url,
-                impersonate="chrome",
-                headers={"Referer": ref, "Accept-Language": "en-US,en;q=0.9"},
+                headers={**_DEFAULT_HEADERS, "Referer": ref},
                 allow_redirects=True,
-                timeout=30,
-            )
-            final_url = str(resp.url) if hasattr(resp, "url") else url
-            if resp.status_code == 200:
-                return resp.text, 200, final_url
-            return None, resp.status_code, final_url
-
+            ) as resp:
+                final_url = str(resp.url)
+                if resp.status == 200:
+                    return await resp.text(errors="replace"), 200, final_url
+                return None, resp.status, final_url
     except Exception as e:
-        logger.warning("curl_cffi fetch failed: %s", e)
+        logger.debug("aiohttp failed: %s", e)
         return None, 0, None
 
 
-async def _fetch_with_retry(
-    url: str,
-    headers: Optional[dict] = None,
-    max_retries: int = MAX_RETRIES,
-    timeout: Optional[ClientTimeout] = None,
-) -> Tuple[Optional[str], int]:
-    last_error = ""
-    for attempt in range(1, max_retries + 1):
-        try:
-            async with _get_session(timeout) as session:
-                merged = {**_DEFAULT_HEADERS, **(headers or {})}
-                async with session.get(
-                    url, headers=merged, allow_redirects=True
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.text(errors="replace"), 200
-                    last_error = f"HTTP {resp.status}"
-                    if 400 <= resp.status < 500:
-                        return None, resp.status
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            last_error = str(e)[:120]
-        if attempt < max_retries:
-            await asyncio.sleep(RETRY_DELAY * attempt)
-    return None, 0
+# ─── yt-dlp helpers ─────────────────────────────────────────
 
 
-# ─── yt-dlp extraction ─────────────────────────────────────
-
-
-async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
+async def _ytdlp_extract(url: str, use_impersonate: bool = True) -> Tuple[List[dict], str]:
     """استخراج با yt-dlp."""
     if not shutil.which("yt-dlp"):
         return [], "yt-dlp not installed"
 
-    has_imp = _check_impersonation_support()
-
-    attempts = []
-    # basic اول
-    attempts.append(("basic", None))
-    if has_imp:
-        for target in _IMPERSONATE_TARGETS:
-            attempts.append(("impersonate", target))
-    attempts.append(("extractor-args", None))
-
-    error = ""
-    for method, target in attempts:
-        qualities, title, error = await _try_ytdlp_extract(url, method, target)
-        if qualities:
-            return qualities, title
-        if "Unsupported URL" in error:
-            break
-
-    return [], error if error else "Extraction failed"
-
-
-async def _try_ytdlp_extract(
-    url: str,
-    method: str,
-    target: Optional[str],
-) -> Tuple[List[dict], str, str]:
     cmd = [
         "yt-dlp",
         "--no-warnings",
@@ -420,15 +457,8 @@ async def _try_ytdlp_extract(
         "--no-check-certificates",
         "--no-playlist",
     ]
-
-    if method == "impersonate" and target:
-        cmd.extend(["--impersonate", target])
-        logger.info("Trying yt-dlp with --impersonate %s", target)
-    elif method == "extractor-args":
-        cmd.extend(["--extractor-args", "generic:impersonate=chrome"])
-        logger.info("Trying yt-dlp with extractor-args")
-    else:
-        logger.info("Trying yt-dlp basic")
+    if use_impersonate and _check_impersonation_support():
+        cmd.extend(["--impersonate", "chrome"])
 
     cmd.append(url)
 
@@ -438,37 +468,32 @@ async def _try_ytdlp_extract(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=60
+                process.communicate(), timeout=45
             )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            return [], "", "yt-dlp timed out"
+            return [], "yt-dlp timed out"
 
         if process.returncode != 0:
-            err = stderr.decode(errors="replace")[:300]
-            logger.debug("yt-dlp failed (%s/%s): %s", method, target, err)
-            return [], "", err
+            err = stderr.decode(errors="replace")[:200]
+            logger.debug("yt-dlp failed for %s: %s", url[:60], err)
+            return [], err
 
         raw = stdout.decode(errors="replace").strip()
         if not raw:
-            return [], "", "Empty output"
+            return [], "Empty output"
 
-        first_line = raw.split("\n")[0]
-        data = json.loads(first_line)
-
+        data = json.loads(raw.split("\n")[0])
         title = data.get("title", "Untitled")
-        qualities = _parse_ytdlp_formats(data)
+        return _parse_ytdlp_formats(data), title
 
-        return qualities, title, ""
-
-    except json.JSONDecodeError as e:
-        return [], "", f"Invalid JSON: {e}"
+    except json.JSONDecodeError:
+        return [], "Invalid JSON"
     except Exception as e:
-        return [], "", str(e)[:150]
+        return [], str(e)[:150]
 
 
 def _parse_ytdlp_formats(data: dict) -> List[dict]:
@@ -484,8 +509,7 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             label = f"🎥 {ext.upper()} {height}p" if height else f"🎥 {ext.upper()}"
             is_m3u8 = ext in ("m3u8", "m3u8_native") or ".m3u8" in direct_url
             qualities.append({
-                "label": label,
-                "url": direct_url,
+                "label": label, "url": direct_url,
                 "method": "m3u8" if is_m3u8 else "direct",
             })
         return qualities
@@ -506,34 +530,335 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
         if vcodec == "none":
             continue
 
-        is_m3u8 = (
-            protocol in ("m3u8", "m3u8_native")
-            or ".m3u8" in fmt_url
-            or ext == "m3u8"
-        )
-
+        is_m3u8 = protocol in ("m3u8", "m3u8_native") or ".m3u8" in fmt_url or ext == "m3u8"
         size_str = f" ({filesize / 1024 / 1024:.0f}MB)" if filesize else ""
+
         if height:
-            label = (
-                f"📡 M3U8 {height}p{size_str}"
-                if is_m3u8
-                else f"🎥 {ext.upper()} {height}p{size_str}"
-            )
+            label = f"📡 M3U8 {height}p{size_str}" if is_m3u8 else f"🎥 {ext.upper()} {height}p{size_str}"
         elif format_note:
             label = f"🎥 {format_note}{size_str}"
         else:
             label = f"🎥 {ext.upper()}{size_str}"
 
         qualities.append({
-            "label": label,
-            "url": fmt_url,
+            "label": label, "url": fmt_url,
             "method": "m3u8" if is_m3u8 else "direct",
         })
 
     return qualities
 
 
-# ─── HTML parsing ───────────────────────────────────────────
+# ─── Iframe / embed extraction ──────────────────────────────
+
+
+def _find_video_iframes(html: str, page_url: str) -> List[str]:
+    """
+    پیدا کردن iframe/embed URL های واقعی ویدیو.
+    فیلتر سنگین برای حذف JS/CSS/تبلیغات.
+    """
+    candidates = []
+
+    # iframe src و data-src
+    for m in re.finditer(
+        r'<iframe[^>]+(?:src|data-src)\s*=\s*["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url:
+            candidates.append(url)
+
+    # embed src
+    for m in re.finditer(
+        r'<embed[^>]+src\s*=\s*["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url:
+            candidates.append(url)
+
+    # player.php?data=... (خاص HentaiHaven)
+    for m in re.finditer(
+        r'["\']([^"\']*player\.php\?[^"\']+)["\']',
+        html,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url:
+            candidates.append(url)
+
+    # data-video, data-embed, data-src attributes روی هر تگ
+    for m in re.finditer(
+        r'(?:data-video|data-embed|data-player|data-url)\s*=\s*["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url:
+            candidates.append(url)
+
+    # JS: loadPlayer("url") / changeServer("url") / setSource("url")
+    for m in re.finditer(
+        r"""(?:loadPlayer|changeServer|setSource|loadVideo|playVideo)\s*\(\s*['"]([^'"]+)['"]""",
+        html,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url:
+            candidates.append(url)
+
+    # فیلتر: فقط URL های embed/player واقعی
+    filtered = []
+    seen = set()
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        if _is_embed_url(url):
+            filtered.append(url)
+            logger.debug("Valid embed URL: %s", url[:80])
+        else:
+            logger.debug("Skipped non-embed URL: %s", url[:60])
+
+    return filtered
+
+
+async def _extract_from_embed(
+    embed_url: str, page_url: str, server_name: str = "",
+) -> List[dict]:
+    """
+    استخراج لینک ویدیو از یه embed URL.
+    اول yt-dlp، بعد HTML parsing.
+    """
+    qualities = []
+    label_prefix = f"[{server_name}] " if server_name else ""
+
+    # ── yt-dlp روی embed URL ──
+    ytdlp_qualities, _ = await _ytdlp_extract(embed_url)
+    if ytdlp_qualities:
+        for q in ytdlp_qualities:
+            q["label"] = f"{label_prefix}{q['label']}"
+            qualities.append(q)
+        return qualities
+
+    # ── HTML parsing embed page ──
+    html, status, final_url = await _fetch_page(embed_url, referer=page_url)
+    if not html:
+        return []
+
+    _extract_video_from_html(html, final_url or embed_url, qualities)
+
+    # label prefix اضافه کن
+    for q in qualities:
+        q["label"] = f"{label_prefix}{q['label']}"
+
+    return qualities
+
+
+def _extract_video_from_html(
+    html: str, page_url: str, qualities: List[dict]
+) -> None:
+    """استخراج تمام لینک‌های ویدیو از HTML."""
+    # video tag
+    for m in re.finditer(
+        r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
+    ):
+        _add_quality(m.group(1), page_url, qualities)
+
+    # source tags
+    for m in re.finditer(
+        r'<source[^>]+src=["\']([^"\']+)["\']([^>]*)', html, re.IGNORECASE
+    ):
+        src = m.group(1)
+        attrs = m.group(2)
+        label_m = re.search(r'label=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        extra_label = label_m.group(1) if label_m else None
+        _add_quality(src, page_url, qualities, extra_label=extra_label)
+
+    # JWPlayer / player sources JSON
+    for m in re.finditer(r"sources\s*:\s*(\[.+?\])", html, re.DOTALL):
+        raw = re.sub(r"'", '"', m.group(1))
+        raw = re.sub(r",\s*]", "]", raw)
+        raw = re.sub(r",\s*}", "}", raw)
+        try:
+            sources = json.loads(raw)
+            for src in sources:
+                if isinstance(src, dict):
+                    file_url = src.get("file") or src.get("src") or ""
+                    label_val = src.get("label", "")
+                    if file_url:
+                        _add_quality(file_url, page_url, qualities, extra_label=label_val)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # JS vars
+    js_patterns = [
+        r"""(?:var\s+)?(?:video_url|videoUrl|file|source|src)\s*[:=]\s*['"]([^'"]+\.(?:mp4|m3u8)[^'"]*)['"]""",
+        r"""file\s*:\s*['"]([^'"]+\.(?:mp4|m3u8)[^'"]*)['"]""",
+        r"""source\s*:\s*['"]([^'"]+\.(?:mp4|m3u8)[^'"]*)['"]""",
+    ]
+    for pattern in js_patterns:
+        for m in re.finditer(pattern, html):
+            _add_quality(m.group(1), page_url, qualities)
+
+    # هر لینک mp4/m3u8
+    for m in re.finditer(r"""['"]([^'"]*\.mp4(?:\?[^'"]*)?)['"]\s*""", html):
+        _add_quality(m.group(1), page_url, qualities)
+    for m in re.finditer(r"""['"]([^'"]*\.m3u8(?:\?[^'"]*)?)['"]\s*""", html):
+        _add_quality(m.group(1), page_url, qualities)
+
+
+def _add_quality(
+    raw_url: str,
+    page_url: str,
+    qualities: List[dict],
+    extra_label: Optional[str] = None,
+) -> None:
+    """اضافه کردن یه کیفیت به لیست با فیلتر و dedup."""
+    video_url = _normalize_url(raw_url, page_url)
+    if not video_url or not video_url.startswith("http"):
+        return
+
+    # فیلتر فایل‌های غیر ویدیویی
+    parsed = urlparse(video_url)
+    path = parsed.path.lower()
+    for ext in _SKIP_EXTENSIONS:
+        if path.endswith(ext):
+            return
+    if len(path) < 5:
+        return
+
+    if any(q["url"] == video_url for q in qualities):
+        return
+
+    is_m3u8 = ".m3u8" in video_url
+
+    if extra_label:
+        prefix = "📡 M3U8" if is_m3u8 else "🎥 MP4"
+        label = f"{prefix} {extra_label}"
+    else:
+        url_res = re.search(r"(\d{3,4})p", video_url)
+        if url_res:
+            prefix = "📡 M3U8" if is_m3u8 else "🎥 MP4"
+            label = f"{prefix} {url_res.group(1)}p"
+        else:
+            label = "📡 M3U8 Stream" if is_m3u8 else "🎥 MP4"
+
+    qualities.append({
+        "label": label,
+        "url": video_url,
+        "method": "m3u8" if is_m3u8 else "direct",
+    })
+
+
+def _extract_server_list(html: str, page_url: str) -> List[dict]:
+    """
+    استخراج لیست سرورها از تب‌ها/دکمه‌ها.
+    HentaiHaven معمولاً چند سرور داره.
+    """
+    servers = []
+    seen = set()
+
+    # الگوی تب سرور با data attribute
+    for m in re.finditer(
+        r'(?:data-src|data-url|data-video|data-embed|data-player)\s*=\s*["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url and url not in seen and _is_embed_url(url):
+            seen.add(url)
+            # سعی کن اسم سرور رو پیدا کن
+            # معمولاً در تگ parent یا sibling هست
+            servers.append({"url": url, "name": f"Server {len(servers) + 1}"})
+
+    # الگوی onclick
+    for m in re.finditer(
+        r"""onclick\s*=\s*["'][^"']*['"]([^"']+(?:embed|player|stream|/e/)[^"']*)['"]""",
+        html, re.IGNORECASE,
+    ):
+        url = _normalize_url(m.group(1), page_url)
+        if url and url not in seen and _is_embed_url(url):
+            seen.add(url)
+            servers.append({"url": url, "name": f"Server {len(servers) + 1}"})
+
+    return servers
+
+
+# ─── Main extraction ───────────────────────────────────────
+
+
+async def extract_hentaihaven_qualities(url: str) -> Tuple[List[dict], str]:
+    """
+    لینک‌های کیفیت مختلف رو از صفحه hentaihaven استخراج میکنه.
+
+    استراتژی:
+      1. صفحه اصلی رو بگیر (curl_cffi/aiohttp)
+      2. iframe/embed URL های واقعی رو فیلتر کن
+      3. هر embed رو با yt-dlp یا HTML parsing بررسی کن
+    """
+    if not is_hentaihaven_url(url):
+        return [], "Invalid URL"
+
+    cleanup_expired_sessions()
+
+    # ── مرحله 1: HTML صفحه اصلی ──
+    logger.info("Fetching page HTML for: %s", url)
+    html, status, final_url = await _fetch_page(url)
+
+    if not html:
+        logger.warning("Could not fetch page (status=%s): %s", status, url)
+        # آخرین تلاش: yt-dlp مستقیم
+        qualities, title = await _ytdlp_extract(url)
+        if qualities:
+            qualities.sort(key=_quality_sort_key, reverse=True)
+            return qualities, title
+        return [], f"Could not fetch page (HTTP {status})"
+
+    title = _extract_title(html)
+    qualities: List[dict] = []
+    page = final_url or url
+
+    # ── مرحله 2: استخراج مستقیم از صفحه ──
+    _extract_video_from_html(html, page, qualities)
+
+    # ── مرحله 3: پیدا کردن iframe/embed های واقعی ──
+    embed_urls = _find_video_iframes(html, page)
+    logger.info("Found %d valid embed URLs", len(embed_urls))
+
+    # سرورهای اضافی
+    servers = _extract_server_list(html, page)
+    for srv in servers:
+        if srv["url"] not in embed_urls:
+            embed_urls.append(srv["url"])
+
+    # ── مرحله 4: بررسی هر embed ──
+    for i, embed_url in enumerate(embed_urls[:8]):  # حداکثر 8
+        logger.info("Processing embed %d/%d: %s", i + 1, len(embed_urls), embed_url[:80])
+        server_name = f"Server {i + 1}" if len(embed_urls) > 1 else ""
+        embed_qualities = await _extract_from_embed(embed_url, page, server_name)
+        for q in embed_qualities:
+            if not any(eq["url"] == q["url"] for eq in qualities):
+                qualities.append(q)
+
+    if qualities:
+        qualities.sort(key=_quality_sort_key, reverse=True)
+        logger.info("Extracted %d qualities for: %s", len(qualities), title[:60])
+        return qualities, title
+
+    # ── آخرین تلاش: yt-dlp مستقیم روی URL اصلی ──
+    logger.info("No qualities from embeds, trying yt-dlp on main URL")
+    ytdlp_qualities, ytdlp_title = await _ytdlp_extract(url)
+    if ytdlp_qualities:
+        ytdlp_qualities.sort(key=_quality_sort_key, reverse=True)
+        return ytdlp_qualities, ytdlp_title or title
+
+    logger.warning("All extraction methods failed for: %s", url)
+
+    if not shutil.which("yt-dlp"):
+        return [], "yt-dlp is not installed. Install: pip install yt-dlp"
+    if not _check_impersonation_support():
+        return [], (
+            "Protection detected. Install impersonation support:\n"
+            "pip install curl_cffi"
+        )
+
+    return [], "Extraction failed - no video sources found in page"
 
 
 def _extract_title(html: str) -> str:
@@ -562,468 +887,6 @@ def _extract_title(html: str) -> str:
     return "Untitled"
 
 
-async def _extract_from_iframes(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    """
-    استخراج iframe/embed URLs و سعی در گرفتن لینک ویدیو از اونا.
-    HentaiHaven معمولاً ویدیو رو از iframe لود میکنه.
-    """
-    iframe_urls = []
-
-    # iframe src
-    for m in re.finditer(
-        r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
-        iframe_url = _normalize_url(m.group(1), page_url)
-        if iframe_url and iframe_url not in iframe_urls:
-            iframe_urls.append(iframe_url)
-
-    # data-src (lazy load)
-    for m in re.finditer(
-        r'<iframe[^>]+data-src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
-        iframe_url = _normalize_url(m.group(1), page_url)
-        if iframe_url and iframe_url not in iframe_urls:
-            iframe_urls.append(iframe_url)
-
-    # embed tags
-    for m in re.finditer(
-        r'<embed[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
-        embed_url = _normalize_url(m.group(1), page_url)
-        if embed_url and embed_url not in iframe_urls:
-            iframe_urls.append(embed_url)
-
-    # JS embed URLs
-    for m in re.finditer(
-        r"""(?:embedUrl|embed_url|iframe_src|player_url|src)\s*[:=]\s*['"]([^'"]+)['"]""",
-        html,
-    ):
-        embed_url = _normalize_url(m.group(1), page_url)
-        if embed_url and embed_url not in iframe_urls:
-            # فیلتر URL های نامربوط
-            parsed = urlparse(embed_url)
-            if parsed.path and len(parsed.path) > 3:
-                iframe_urls.append(embed_url)
-
-    logger.debug("Found %d iframe/embed URLs", len(iframe_urls))
-
-    # هر iframe رو بررسی کن
-    for iframe_url in iframe_urls[:5]:  # حداکثر 5 تا
-        logger.debug("Checking iframe: %s", iframe_url[:80])
-
-        # اول با yt-dlp سعی کن
-        iframe_qualities = await _extract_iframe_with_ytdlp(iframe_url)
-        if iframe_qualities:
-            for q in iframe_qualities:
-                if not any(eq["url"] == q["url"] for eq in qualities):
-                    qualities.append(q)
-            continue
-
-        # بعد HTML iframe رو بگیر و پارس کن
-        await _extract_iframe_html(iframe_url, page_url, qualities)
-
-
-async def _extract_iframe_with_ytdlp(url: str) -> List[dict]:
-    """استخراج لینک ویدیو از iframe URL با yt-dlp."""
-    if not shutil.which("yt-dlp"):
-        return []
-
-    cmd = [
-        "yt-dlp",
-        "--no-warnings",
-        "--no-download",
-        "--dump-json",
-        "--no-check-certificates",
-        "--no-playlist",
-    ]
-    if _check_impersonation_support():
-        cmd.extend(["--impersonate", "chrome"])
-    cmd.append(url)
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=30
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            return []
-
-        if process.returncode != 0:
-            return []
-
-        raw = stdout.decode(errors="replace").strip()
-        if not raw:
-            return []
-
-        data = json.loads(raw.split("\n")[0])
-        return _parse_ytdlp_formats(data)
-
-    except Exception:
-        return []
-
-
-async def _extract_iframe_html(
-    iframe_url: str, page_url: str, qualities: List[dict]
-) -> None:
-    """HTML iframe رو بگیر و لینک‌های ویدیو رو استخراج کن."""
-    # اول با curl_cffi
-    html = None
-    if _check_impersonation_support():
-        html, status, _ = await _fetch_with_curl_cffi(iframe_url, referer=page_url)
-
-    # بعد با aiohttp
-    if not html:
-        html, status, _ = await _fetch_with_cookies(
-            iframe_url, referer=page_url, max_retries=1
-        )
-
-    if not html:
-        return
-
-    # استخراج لینک‌های ویدیو از HTML iframe
-    _extract_from_video_tag(html, iframe_url, qualities)
-    _extract_from_source_tags(html, iframe_url, qualities)
-    _extract_from_js_vars(html, iframe_url, qualities)
-    _extract_all_mp4_links(html, iframe_url, qualities)
-    _extract_all_m3u8_links(html, iframe_url, qualities)
-    _extract_from_player_setup(html, iframe_url, qualities)
-
-
-def _extract_from_video_tag(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    for m in re.finditer(
-        r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
-        video_url = _normalize_url(m.group(1), page_url)
-        if not video_url or not _is_video_cdn_url(video_url):
-            continue
-        if any(q["url"] == video_url for q in qualities):
-            continue
-        qualities.append({
-            "label": "🎥 MP4 (video tag)",
-            "url": video_url,
-            "method": "direct",
-        })
-
-
-def _extract_from_source_tags(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    for m in re.finditer(
-        r'<source[^>]+src=["\']([^"\']+)["\']([^>]*)', html, re.IGNORECASE
-    ):
-        src = _normalize_url(m.group(1), page_url)
-        attrs = m.group(2)
-        if not src or not _is_video_cdn_url(src):
-            continue
-        if any(q["url"] == src for q in qualities):
-            continue
-
-        is_m3u8 = ".m3u8" in src or "application/x-mpegURL" in attrs
-
-        label_m = re.search(r'label=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
-        res_m = re.search(r'res=["\'](\d+)["\']', attrs, re.IGNORECASE)
-        size_m = re.search(r'size=["\'](\d+)["\']', attrs, re.IGNORECASE)
-
-        if label_m:
-            q_label = label_m.group(1)
-        elif res_m:
-            q_label = f"{res_m.group(1)}p"
-        elif size_m:
-            q_label = f"{size_m.group(1)}p"
-        else:
-            url_res = re.search(r"(\d{3,4})p", src)
-            q_label = f"{url_res.group(1)}p" if url_res else "Default"
-
-        if is_m3u8:
-            qualities.append({"label": f"📡 M3U8 {q_label}", "url": src, "method": "m3u8"})
-        else:
-            qualities.append({"label": f"🎥 MP4 {q_label}", "url": src, "method": "direct"})
-
-
-def _extract_from_js_vars(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    js_patterns = [
-        (r"""(?:var\s+)?video_url\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
-        (r"""(?:var\s+)?video[_]?[Ff]ile\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
-        (r"""(?:var\s+)?video(?:Url|_src|Src|_url)\s*[:=]\s*['"]([^'"]+)['"]""", None),
-        (r"""file\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
-        (r"""['"]?(\d{3,4})['"]?\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", "numbered"),
-        (r"""video_url\s*[:=]\s*decodeURIComponent\s*\(\s*['"]([^'"]+)['"]""", "encoded"),
-        # الگوهای خاص پلیرهای انیمه
-        (r"""sources\s*:\s*\[\s*\{\s*file\s*:\s*['"]([^'"]+)['"]""", None),
-        (r"""source\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
-        (r"""src\s*:\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
-    ]
-
-    for pattern, ptype in js_patterns:
-        for m in re.finditer(pattern, html):
-            if ptype == "numbered":
-                quality_num = m.group(1)
-                raw_url = m.group(2)
-                label = f"🎥 MP4 {quality_num}p"
-            elif ptype == "encoded":
-                raw_url = unquote(m.group(1))
-                url_res = re.search(r"(\d{3,4})p", raw_url)
-                label = f"🎥 MP4 {url_res.group(1)}p" if url_res else "🎥 MP4"
-            else:
-                raw_url = m.group(1)
-                url_res = re.search(r"(\d{3,4})p", raw_url)
-                label = f"🎥 MP4 {url_res.group(1)}p" if url_res else "🎥 MP4"
-
-            video_url = _normalize_url(raw_url, page_url)
-            if not video_url or not _is_video_cdn_url(video_url):
-                continue
-            if any(q["url"] == video_url for q in qualities):
-                continue
-            qualities.append({"label": label, "url": video_url, "method": "direct"})
-
-
-def _extract_from_player_setup(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    """
-    استخراج از JWPlayer/Plyr/VideoJS setup.
-    الگوهای رایج:
-      jwplayer().setup({sources: [{file: "..."}]})
-      player.source = {sources: [{src: "..."}]}
-      videojs().src({src: "..."})
-    """
-    # JWPlayer sources
-    for m in re.finditer(
-        r"sources\s*:\s*(\[.+?\])", html, re.DOTALL
-    ):
-        raw = m.group(1)
-        raw = re.sub(r"'", '"', raw)
-        # حذف trailing comma
-        raw = re.sub(r",\s*]", "]", raw)
-        raw = re.sub(r",\s*}", "}", raw)
-        try:
-            sources = json.loads(raw)
-            for src in sources:
-                if not isinstance(src, dict):
-                    continue
-                file_url = src.get("file") or src.get("src") or ""
-                if not file_url:
-                    continue
-                video_url = _normalize_url(file_url, page_url)
-                if not video_url or not _is_video_cdn_url(video_url):
-                    continue
-                if any(q["url"] == video_url for q in qualities):
-                    continue
-
-                is_m3u8 = ".m3u8" in video_url
-                label_val = src.get("label", "")
-                if label_val:
-                    prefix = "📡 M3U8" if is_m3u8 else "🎥 MP4"
-                    label = f"{prefix} {label_val}"
-                else:
-                    url_res = re.search(r"(\d{3,4})p", video_url)
-                    if url_res:
-                        prefix = "📡 M3U8" if is_m3u8 else "🎥 MP4"
-                        label = f"{prefix} {url_res.group(1)}p"
-                    else:
-                        label = "📡 M3U8 Stream" if is_m3u8 else "🎥 MP4"
-
-                qualities.append({
-                    "label": label,
-                    "url": video_url,
-                    "method": "m3u8" if is_m3u8 else "direct",
-                })
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # Plyr/VideoJS source
-    for m in re.finditer(
-        r"""(?:source|src)\s*[:=]\s*['"]([^'"]+(?:\.mp4|\.m3u8)[^'"]*)['"]""",
-        html,
-    ):
-        video_url = _normalize_url(m.group(1), page_url)
-        if not video_url or not _is_video_cdn_url(video_url):
-            continue
-        if any(q["url"] == video_url for q in qualities):
-            continue
-        is_m3u8 = ".m3u8" in video_url
-        url_res = re.search(r"(\d{3,4})p", video_url)
-        if url_res:
-            label = f"📡 M3U8 {url_res.group(1)}p" if is_m3u8 else f"🎥 MP4 {url_res.group(1)}p"
-        else:
-            label = "📡 M3U8 Stream" if is_m3u8 else "🎥 MP4"
-        qualities.append({
-            "label": label, "url": video_url,
-            "method": "m3u8" if is_m3u8 else "direct",
-        })
-
-
-def _extract_all_mp4_links(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    for m in re.finditer(r"""['"]([^'"]*\.mp4(?:\?[^'"]*)?)['"]\s*""", html):
-        raw_url = m.group(1)
-        video_url = _normalize_url(raw_url, page_url)
-        if not video_url or not video_url.startswith("http"):
-            continue
-        parsed = urlparse(video_url)
-        if len(parsed.path) < 5:
-            continue
-        if any(q["url"] == video_url for q in qualities):
-            continue
-        url_res = re.search(r"(\d{3,4})p", video_url)
-        label = f"🎥 MP4 {url_res.group(1)}p" if url_res else "🎥 MP4"
-        qualities.append({"label": label, "url": video_url, "method": "direct"})
-
-
-def _extract_all_m3u8_links(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
-    for m in re.finditer(r"""['"]([^'"]*\.m3u8(?:\?[^'"]*)?)['"]\s*""", html):
-        raw_url = m.group(1)
-        m3u8_url = _normalize_url(raw_url, page_url)
-        if not m3u8_url or not m3u8_url.startswith("http"):
-            continue
-        if any(q["url"] == m3u8_url for q in qualities):
-            continue
-        url_res = re.search(r"(\d{3,4})p", m3u8_url)
-        label = f"📡 M3U8 {url_res.group(1)}p" if url_res else "📡 M3U8 Stream"
-        qualities.append({"label": label, "url": m3u8_url, "method": "m3u8"})
-
-
-def _extract_server_tabs(html: str) -> List[dict]:
-    """
-    استخراج لیست سرورها از تب‌های صفحه.
-    HentaiHaven معمولاً چند سرور داره.
-    """
-    servers = []
-
-    # الگوی data-src یا data-url در تب‌ها
-    for m in re.finditer(
-        r'(?:data-src|data-url|data-video|data-embed)\s*=\s*["\']([^"\']+)["\']',
-        html, re.IGNORECASE,
-    ):
-        url = m.group(1).strip()
-        if url and url not in [s["url"] for s in servers]:
-            servers.append({"url": url, "name": f"Server {len(servers) + 1}"})
-
-    # الگوی onclick با URL
-    for m in re.finditer(
-        r"""onclick\s*=\s*["'][^"']*(?:load|change|switch)[^"']*\(\s*['"]([^'"]+)['"]""",
-        html, re.IGNORECASE,
-    ):
-        url = m.group(1).strip()
-        if url.startswith("http") and url not in [s["url"] for s in servers]:
-            servers.append({"url": url, "name": f"Server {len(servers) + 1}"})
-
-    return servers
-
-
-# ─── Main extraction ───────────────────────────────────────
-
-
-async def extract_hentaihaven_qualities(url: str) -> Tuple[List[dict], str]:
-    """
-    لینک‌های کیفیت مختلف رو از صفحه hentaihaven استخراج میکنه.
-
-    استراتژی:
-      1. yt-dlp مستقیم روی URL اصلی
-      2. HTML رو بگیر، iframe ها رو پیدا کن
-      3. هر iframe رو با yt-dlp یا HTML parsing بررسی کن
-    """
-    if not is_hentaihaven_url(url):
-        logger.warning("URL is not a valid hentaihaven URL: %s", url)
-        return [], "Invalid URL"
-
-    cleanup_expired_sessions()
-
-    # ── روش 1: yt-dlp مستقیم ──
-    logger.info("Attempting yt-dlp extraction for: %s", url)
-    qualities, title = await _extract_with_ytdlp(url)
-    if qualities:
-        qualities.sort(key=_quality_sort_key, reverse=True)
-        logger.info("Extracted %d qualities (yt-dlp) for: %s", len(qualities), title[:60])
-        return qualities, title
-
-    # ── روش 2: HTML parsing + iframe extraction ──
-    logger.info("yt-dlp failed, trying HTML parsing for: %s", url)
-
-    html = None
-    final_url = url
-
-    # اول curl_cffi
-    if _check_impersonation_support():
-        html, status, final_url_result = await _fetch_with_curl_cffi(url)
-        if final_url_result:
-            final_url = final_url_result
-
-    # بعد aiohttp
-    if not html:
-        html, status, final_url_result = await _fetch_with_cookies(url)
-        if final_url_result:
-            final_url = final_url_result
-
-    if not html:
-        logger.warning("Could not fetch page HTML for: %s", url)
-        return [], "Could not fetch page"
-
-    title = _extract_title(html)
-    qualities = []
-
-    # استخراج مستقیم از صفحه اصلی
-    _extract_from_video_tag(html, final_url, qualities)
-    _extract_from_source_tags(html, final_url, qualities)
-    _extract_from_js_vars(html, final_url, qualities)
-    _extract_from_player_setup(html, final_url, qualities)
-    _extract_all_mp4_links(html, final_url, qualities)
-    _extract_all_m3u8_links(html, final_url, qualities)
-
-    # استخراج از iframe ها (مهم‌ترین بخش برای HentaiHaven)
-    await _extract_from_iframes(html, final_url, qualities)
-
-    # سرورهای مختلف
-    servers = _extract_server_tabs(html)
-    for server in servers[:3]:  # حداکثر 3 سرور
-        server_url = _normalize_url(server["url"], final_url)
-        if not server_url:
-            continue
-        logger.debug("Checking server: %s", server_url[:80])
-        server_qualities = await _extract_iframe_with_ytdlp(server_url)
-        for q in server_qualities:
-            q["label"] = f"{q['label']} [{server['name']}]"
-            if not any(eq["url"] == q["url"] for eq in qualities):
-                qualities.append(q)
-
-    if qualities:
-        qualities.sort(key=_quality_sort_key, reverse=True)
-        logger.info("Extracted %d qualities (HTML) for: %s", len(qualities), title[:60])
-        return qualities, title
-
-    logger.warning("All extraction methods failed for: %s", url)
-
-    has_ytdlp = shutil.which("yt-dlp") is not None
-    has_curl_cffi = _check_impersonation_support()
-
-    if not has_ytdlp:
-        return [], "yt-dlp is not installed. Install: pip install yt-dlp"
-    if not has_curl_cffi:
-        return [], (
-            "Protection detected. Install impersonation support:\n"
-            "pip install curl_cffi\n"
-            "or: pip install yt-dlp[default,curl-cffi]"
-        )
-
-    return [], "Extraction failed - site may have updated its protection"
-
-
 # ─── Download helpers ───────────────────────────────────────
 
 
@@ -1036,15 +899,11 @@ async def _download_with_curl_cffi(
         return False, "curl_cffi not installed", 0
 
     try:
-        await progress_cb("📥 **شروع دانلود (curl_cffi)...**")
+        await progress_cb("📥 **شروع دانلود...**")
         async with AsyncSession() as session:
             resp = await session.get(
                 url, impersonate="chrome",
-                headers={
-                    "Referer": _SITE_REFERER,
-                    "Origin": _SITE_URL,
-                    "Accept": "*/*",
-                },
+                headers={"Referer": _SITE_REFERER, "Accept": "*/*"},
                 allow_redirects=True, timeout=600, stream=True,
             )
             if resp.status_code != 200:
@@ -1053,6 +912,12 @@ async def _download_with_curl_cffi(
             content_length = int(resp.headers.get("Content-Length", 0))
             if content_length > MAX_DOWNLOAD_SIZE:
                 return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+
+            # بررسی content-type
+            ct = resp.headers.get("Content-Type", "").lower()
+            if any(t in ct for t in ["text/html", "text/javascript", "application/javascript"]):
+                logger.warning("Content-Type is %s, not video", ct)
+                return False, "Response is not a video file", 0
 
             downloaded = 0
             start_time = time.time()
@@ -1074,10 +939,17 @@ async def _download_with_curl_cffi(
 
         if not os.path.exists(filepath):
             return False, "File not created", 0
+
+        # بررسی محتوای فایل
+        if not _is_valid_video_content(filepath):
+            _cleanup_file(filepath)
+            return False, "Downloaded file is not a valid video", 0
+
         size = os.path.getsize(filepath)
         if size == 0:
             _cleanup_file(filepath)
             return False, "Downloaded file is empty", 0
+
         return True, "", size
 
     except Exception as e:
@@ -1098,7 +970,6 @@ async def _download_with_ytdlp(
             "--no-check-certificates", "-f", "best",
             "--max-filesize", str(MAX_DOWNLOAD_SIZE),
             "--add-header", f"Referer:{_SITE_REFERER}",
-            "--add-header", f"Origin:{_SITE_URL}",
             "--add-header", f"User-Agent:{_USER_AGENT}",
             "-o", filepath,
         ]
@@ -1134,6 +1005,11 @@ async def _download_with_ytdlp(
         actual_path = _find_output_file(filepath)
         if not actual_path:
             return False, "Output file not found", 0
+
+        if not _is_valid_video_content(actual_path):
+            _cleanup_file(actual_path)
+            return False, "Downloaded file is not a valid video", 0
+
         size = os.path.getsize(actual_path)
         if size > MAX_DOWNLOAD_SIZE:
             _cleanup_file(actual_path)
@@ -1150,7 +1026,7 @@ async def _download_with_ytdlp(
 async def _download_with_aiohttp(
     url: str, filepath: str, progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
-    headers = {**_DEFAULT_HEADERS, "Referer": _SITE_REFERER, "Origin": _SITE_URL}
+    headers = {**_DEFAULT_HEADERS, "Referer": _SITE_REFERER}
     error = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -1160,38 +1036,51 @@ async def _download_with_aiohttp(
                     if resp.status != 200:
                         error = f"HTTP {resp.status}"
                         if resp.status != 403 and 400 <= resp.status < 500:
-                            _cleanup_file(filepath)
                             return False, error, 0
-                    else:
-                        content_length = int(resp.headers.get("Content-Length", 0))
-                        if content_length > MAX_DOWNLOAD_SIZE:
-                            return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
-                        downloaded = 0
-                        start_time = time.time()
-                        last_update = 0.0
-                        async with aiofiles.open(filepath, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                                await f.write(chunk)
-                                downloaded += len(chunk)
-                                if downloaded > MAX_DOWNLOAD_SIZE:
-                                    _cleanup_file(filepath)
-                                    return False, "Download exceeded size limit", 0
-                                now = time.time()
-                                if now - last_update >= 2.0:
-                                    last_update = now
-                                    await progress_cb(_format_progress(downloaded, content_length, start_time, now))
-                        return True, "", os.path.getsize(filepath)
+                        continue
+
+                    # بررسی content-type
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    if any(t in ct for t in ["text/html", "text/javascript", "application/javascript"]):
+                        return False, "Response is not a video file", 0
+
+                    content_length = int(resp.headers.get("Content-Length", 0))
+                    if content_length > MAX_DOWNLOAD_SIZE:
+                        return False, f"File too large", 0
+
+                    downloaded = 0
+                    start_time = time.time()
+                    last_update = 0.0
+                    async with aiofiles.open(filepath, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            if downloaded > MAX_DOWNLOAD_SIZE:
+                                _cleanup_file(filepath)
+                                return False, "Download exceeded size limit", 0
+                            now = time.time()
+                            if now - last_update >= 2.0:
+                                last_update = now
+                                await progress_cb(_format_progress(downloaded, content_length, start_time, now))
+
+                    if not _is_valid_video_content(filepath):
+                        _cleanup_file(filepath)
+                        return False, "Downloaded file is not a valid video", 0
+
+                    return True, "", os.path.getsize(filepath)
+
         except asyncio.CancelledError:
             _cleanup_file(filepath)
             raise
         except Exception as e:
             error = str(e)[:150]
+
         if attempt < MAX_RETRIES:
             _cleanup_file(filepath)
             await asyncio.sleep(RETRY_DELAY * attempt)
 
     _cleanup_file(filepath)
-    return False, f"Failed after {MAX_RETRIES} attempts: {error}", 0
+    return False, error, 0
 
 
 # ─── Download: Public API ──────────────────────────────────
@@ -1201,17 +1090,7 @@ async def download_hentaihaven_direct(
     url: str, filepath: str, progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     """دانلود لینک مستقیم MP4."""
-    if not _is_video_cdn_url(url):
-        return False, "URL host not allowed", 0
-
-    if _check_impersonation_support():
-        logger.info("Trying download with curl_cffi: %s", url[:80])
-        success, error, size = await _download_with_curl_cffi(url, filepath, progress_cb)
-        if success:
-            return True, "", size
-        logger.info("curl_cffi download failed: %s", error)
-        _cleanup_file(filepath)
-
+    # yt-dlp اول (بهترین برای streaming servers)
     if shutil.which("yt-dlp"):
         logger.info("Trying download with yt-dlp: %s", url[:80])
         success, error, size = await _download_with_ytdlp(url, filepath, progress_cb)
@@ -1220,6 +1099,16 @@ async def download_hentaihaven_direct(
         logger.info("yt-dlp download failed: %s", error)
         _cleanup_file(filepath)
 
+    # curl_cffi
+    if _check_impersonation_support():
+        logger.info("Trying download with curl_cffi: %s", url[:80])
+        success, error, size = await _download_with_curl_cffi(url, filepath, progress_cb)
+        if success:
+            return True, "", size
+        logger.info("curl_cffi download failed: %s", error)
+        _cleanup_file(filepath)
+
+    # aiohttp
     logger.info("Trying download with aiohttp: %s", url[:80])
     success, error, size = await _download_with_aiohttp(url, filepath, progress_cb)
     if success:
@@ -1233,8 +1122,6 @@ async def download_hentaihaven_m3u8(
     m3u8_url: str, filepath: str, progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
     """دانلود M3U8 stream."""
-    if not _is_video_cdn_url(m3u8_url):
-        return False, "URL host not allowed", 0
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp is not installed", 0
 
