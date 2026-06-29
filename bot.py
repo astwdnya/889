@@ -3137,212 +3137,90 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 8: تست ترکیب‌های مختلف decode"""
+    """مرحله 9: پیدا کردن b0 و A0"""
     import re
-    import json
-    import base64
-    from otherwebsiteshandler.hentaihaven_handler import (
-        _fetch_page,
-        _check_impersonation_support,
-    )
+    from otherwebsiteshandler.hentaihaven_handler import _fetch_page
 
-    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
     player_url = (
         "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
         "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
     )
+    js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
+
+    await event.reply("🔍 Finding b0 and A0...")
+
+    js, _, _ = await _fetch_page(js_url, referer=player_url)
+    if not js:
+        await event.reply("❌ Could not fetch player.js")
+        return
 
     lines = []
 
-    from curl_cffi.requests import AsyncSession
+    idx = js.find("_r=b0(A0)")
+    if idx < 0:
+        idx = js.find("_r = b0(A0)")
+    if idx >= 0:
+        start = max(0, idx - 2000)
+        end = min(len(js), idx + 500)
+        nearby = js[start:end]
+        lines.append(f"📍 _r=b0(A0) at pos {idx}")
+        lines.append(f"\n📝 2000 chars BEFORE _r=b0(A0):")
+        lines.append(nearby[:2000])
+    else:
+        lines.append("❌ _r=b0(A0) not found")
 
-    async with AsyncSession() as session:
-        try:
-            await session.get(
-                "https://hentaihaven.xxx/", impersonate="chrome", timeout=15
+    b0_patterns = [
+        r"function\s+b0\s*\([^)]*\)\s*\{[^}]+\}",
+        r"const\s+b0\s*=\s*[^;]+;",
+        r"var\s+b0\s*=\s*[^;]+;",
+        r"let\s+b0\s*=\s*[^;]+;",
+        r"b0\s*=\s*function\s*\([^)]*\)\s*\{[^}]+\}",
+        r"b0\s*=\s*\([^)]*\)\s*=>\s*\{[^}]+\}",
+        r",b0\s*=\s*function\s*\([^)]*\)\s*\{[^}]+\}",
+    ]
+    for pat in b0_patterns:
+        matches = list(re.finditer(pat, js))
+        if matches:
+            lines.append(f"\n🔧 b0 found ({pat[:30]}...):")
+            for m in matches[:3]:
+                lines.append(f"  pos {m.start()}: {m.group()[:400]}")
+
+    a0_patterns = [
+        r"const\s+A0\s*=\s*[^;]+;",
+        r"var\s+A0\s*=\s*[^;]+;",
+        r"let\s+A0\s*=\s*[^;]+;",
+        r",A0\s*=\s*[^;,]+[;,]",
+        r"A0\s*=\s*\d+",
+        r'A0\s*=\s*["\'][^"\']+["\']',
+        r"A0\s*=\s*0x[0-9a-fA-F]+",
+    ]
+    for pat in a0_patterns:
+        matches = list(re.finditer(pat, js))
+        if matches:
+            lines.append(f"\n🔢 A0 found ({pat[:30]}...):")
+            for m in matches[:3]:
+                start = max(0, m.start() - 50)
+                end = min(len(js), m.end() + 50)
+                lines.append(f"  pos {m.start()}: ...{js[start:end][:300]}...")
+
+    if not any(re.findall(pat, js) for pat in b0_patterns):
+        lines.append("\n🔍 b0 not found as standalone, searching broader...")
+        if idx >= 0:
+            broad = js[max(0, idx - 5000) : idx + 200]
+            funcs = re.findall(
+                r"(?:function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:function|\([^)]*\)\s*=>))[^{]*\{[^}]{0,300}\}",
+                broad,
             )
-        except Exception:
-            pass
+            lines.append(f"\n📝 Functions near _r ({len(funcs)}):")
+            for f in funcs[-10:]:
+                lines.append(f"  {f[:300]}")
 
-        player_resp = await session.get(
-            player_url,
-            impersonate="chrome",
-            headers={"Referer": page_url},
-            timeout=15,
-        )
-
-        token_m = re.search(
-            r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
-            player_resp.text,
-            re.IGNORECASE,
-        )
-        if not token_m:
-            await event.reply("❌ token not found")
-            return
-
-        raw_token = token_m.group(1)
-
-        def safe_b64decode(s):
-            s = s.strip()
-            missing = len(s) % 4
-            if missing:
-                s += "=" * (4 - missing)
-            return base64.b64decode(s)
-
-        def reverse_str(s):
-            return s[::-1]
-
-        val = raw_token.replace("sha512-", "")
-        lines.append(f"🔑 Token without sha512- ({len(val)} chars)")
-
-        combos = [
-            (
-                "rev-atob-rev-atob-rev-atob",
-                [
-                    ("reverse", lambda s: reverse_str(s)),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    ("reverse", lambda s: reverse_str(s)),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    ("reverse", lambda s: reverse_str(s)),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                ],
-            ),
-            (
-                "atob-rev-atob-rev-atob-rev",
-                [
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    ("reverse", lambda s: reverse_str(s)),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    ("reverse", lambda s: reverse_str(s)),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    ("reverse", lambda s: reverse_str(s)),
-                ],
-            ),
-            (
-                "atob-atob-atob",
-                [
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                ],
-            ),
-            (
-                "atob-once",
-                [
-                    (
-                        "atob",
-                        lambda s: safe_b64decode(s).decode("utf-8", errors="replace"),
-                    ),
-                ],
-            ),
-            (
-                "atob-only",
-                [
-                    (
-                        "atob-raw",
-                        lambda s: safe_b64decode(s).decode("latin-1", errors="replace"),
-                    ),
-                ],
-            ),
-        ]
-
-        for combo_name, steps in combos:
-            lines.append(f"\n{'=' * 40}")
-            lines.append(f"🧪 Trying: {combo_name}")
-            current = val
-            success = True
-            for step_name, step_fn in steps:
-                try:
-                    current = step_fn(current)
-                    lines.append(f"  {step_name} → ({len(current)}): {current[:80]}...")
-                except Exception as e:
-                    lines.append(f"  {step_name} → ❌ {e}")
-                    success = False
-                    break
-
-            if success:
-                try:
-                    parsed = json.loads(current)
-                    lines.append(f"  ✅ JSON PARSED! keys: {list(parsed.keys())}")
-                    lines.append(
-                        f"  {json.dumps(parsed, indent=2, ensure_ascii=False)[:500]}"
-                    )
-                except (json.JSONDecodeError, ValueError):
-                    json_m = re.search(r"\{[^{}]+\}", current)
-                    if json_m:
-                        lines.append(f"  📦 Found JSON-like: {json_m.group()[:200]}")
-                    elif current.strip().startswith("{"):
-                        lines.append(f"  📦 Starts with {{ but not valid JSON")
-
-        await event.reply("🔍 Looking for _r function definition...")
-
-        js_url = "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js?v=1782293140"
-        js, _, _ = await _fetch_page(js_url, referer=player_url)
-
-        if js:
-            r_patterns = [
-                r"function\s+_r\s*\([^)]*\)\s*\{[^}]+\}",
-                r"const\s+_r\s*=\s*[^;]+;",
-                r"var\s+_r\s*=\s*[^;]+;",
-                r"let\s+_r\s*=\s*[^;]+;",
-                r"_r\s*=\s*function\s*\([^)]*\)\s*\{[^}]+\}",
-                r"_r\s*=\s*\([^)]*\)\s*=>\s*[^;,]+",
-            ]
-            for pat in r_patterns:
-                matches = re.findall(pat, js)
-                if matches:
-                    lines.append(f"\n🔧 _r definition found ({pat[:30]}):")
-                    for m in matches[:3]:
-                        lines.append(f"  {m[:300]}")
-
-            i0_idx = js.find("function I0")
-            if i0_idx < 0:
-                i0_idx = js.find("I0=")
-            if i0_idx >= 0:
-                start = max(0, i0_idx - 50)
-                end = min(len(js), i0_idx + 500)
-                lines.append(f"\n🎯 I0 function full context:")
-                lines.append(js[start:end])
-
-            if i0_idx >= 0:
-                nearby = js[max(0, i0_idx - 2000) : i0_idx + 500]
-                r_nearby = re.findall(r"function\s+_r\s*\([^)]*\)\s*\{[^}]+\}", nearby)
-                if not r_nearby:
-                    r_nearby = re.findall(r"_r\s*[=:]\s*[^;,]+[;,]", nearby)
-                if r_nearby:
-                    lines.append(f"\n🔧 _r near I0:")
-                    for r in r_nearby[:3]:
-                        lines.append(f"  {r[:300]}")
-                else:
-                    lines.append(f"\n📝 Code near I0 (looking for transform pattern):")
-                    lines.append(nearby[-800:])
+            assigns = re.findall(
+                r"(?:const|let|var)\s+[A-Za-z0-9_]+\s*=\s*[^;]{1,200};", broad
+            )
+            lines.append(f"\n📝 Assignments near _r ({len(assigns)}):")
+            for a in assigns[-15:]:
+                lines.append(f"  {a[:300]}")
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
