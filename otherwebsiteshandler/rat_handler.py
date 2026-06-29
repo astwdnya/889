@@ -57,6 +57,8 @@ _ALLOWED_HOST_SUFFIXES = (".rat.xxx",)
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 
+rat_sessions: dict = {}
+
 
 # ─── Utility ────────────────────────────────────────────────
 
