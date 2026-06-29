@@ -126,6 +126,13 @@ from otherwebsiteshandler.tube8_handler import (
     download_tube8_m3u8,
     tube8_sessions,
 )
+from otherwebsiteshandler.redtube_handler import (
+    is_redtube_url,
+    extract_redtube_qualities,
+    download_redtube_direct,
+    download_redtube_m3u8,
+    redtube_sessions,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3614,6 +3621,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_redtube_url(target_url):
+        logger.info(f"[URL] RedTube detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_redtube_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3646,6 +3662,7 @@ async def generic_url_handler(event):
         or is_youporn_url(target_url)
         or is_sexvid_url(target_url)
         or is_tube8_url(target_url)
+        or is_redtube_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -6132,6 +6149,19 @@ process_xgroovy_request, xgroovy_quality_callback, xgroovy_cancel_callback = (
     "Tube8",
 )
 
+(
+    process_redtube_request,
+    redtube_quality_callback,
+    redtube_cancel_callback,
+) = _make_site_handler(
+    "rt",
+    extract_redtube_qualities,
+    download_redtube_direct,
+    download_redtube_m3u8,
+    redtube_sessions,
+    "RedTube",
+)
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -6407,6 +6437,12 @@ async def main():
     )
     client.add_event_handler(
         tube8_cancel_callback, events.CallbackQuery(pattern=r"tb_cancel_.+")
+    )
+    client.add_event_handler(
+        redtube_quality_callback, events.CallbackQuery(pattern=r"rt_q_.+")
+    )
+    client.add_event_handler(
+        redtube_cancel_callback, events.CallbackQuery(pattern=r"rt_cancel_.+")
     )
     client.add_event_handler(
         youporn_quality_callback, events.CallbackQuery(pattern=r"yp_q_.+")
