@@ -139,6 +139,12 @@ from otherwebsiteshandler.hohoj_handler import (
     download_hohoj_direct,
     download_hohoj_m3u8,
 )
+from otherwebsiteshandler.porna91_handler import (
+    is_91porna_url,
+    extract_91porna_qualities,
+    download_91porna_direct,
+    download_91porna_m3u8,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -183,6 +189,16 @@ video_send_timers: Dict[str, asyncio.Task] = {}
 
 # نگه‌داری ویدیوهایی که منتظر فایل زیرنویس هستن
 subtitle_sessions: Dict[int, Dict] = {}  # key: chat_id
+
+
+def _escape_md(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("[", "\\[")
+        .replace("`", "\\`")
+    )
 
 
 # ====================== DISK UTILITIES ======================
@@ -3645,6 +3661,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_91porna_url(target_url):
+        logger.info(f"[URL] 91Porna detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_91porna_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3679,6 +3704,7 @@ async def generic_url_handler(event):
         or is_tube8_url(target_url)
         or is_redtube_url(target_url)
         or is_hohoj_url(target_url)
+        or is_91porna_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -4220,7 +4246,7 @@ async def process_y2mate_request(event, url: str, status_msg):
             fname = os.path.basename(filepath)
             yt_clean = yt_title
             caption_start = (
-                f"🎬 {yt_clean}"
+                f"🎬 {_escape_md(yt_clean)}"
                 if yt_clean
                 else ("🎵 Audio" if is_audio else f"📄 {fname}")
             )
@@ -5589,7 +5615,7 @@ async def y2mate_quality_callback(event):
                 yt_title if yt_title and "free download" not in yt_title.lower() else ""
             )
             caption_start = (
-                f"🎬 {clean_title}"
+                f"🎬 {_escape_md(clean_title)}"
                 if clean_title
                 else ("🎵 Audio" if is_audio else f"📄 {os.path.basename(filepath)}")
             )
@@ -5675,9 +5701,9 @@ async def y2mate_quality_callback(event):
                         )
                     extra = ""
                     if title:
-                        extra += f"\n🎬 **{title}**"
+                        extra += f"\n🎬 **{_escape_md(title)}**"
                     if desc:
-                        extra += f"\n📝 {desc}"
+                        extra += f"\n📝 {_escape_md(desc)}"
                     if extra:
                         new_caption = f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({source_url}){gh_line}{extra}"
                         try:
@@ -6193,6 +6219,21 @@ hohoj_sessions: dict = {}
     "Hohoj",
 )
 
+porna91_sessions: dict = {}
+
+(
+    process_91porna_request,
+    porna91_quality_callback,
+    porna91_cancel_callback,
+) = _make_site_handler(
+    "p91",
+    extract_91porna_qualities,
+    download_91porna_direct,
+    download_91porna_m3u8,
+    porna91_sessions,
+    "91Porna",
+)
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -6486,6 +6527,12 @@ async def main():
     )
     client.add_event_handler(
         hohoj_cancel_callback, events.CallbackQuery(pattern=r"hj_cancel_.+")
+    )
+    client.add_event_handler(
+        porna91_quality_callback, events.CallbackQuery(pattern=r"p91_q_.+")
+    )
+    client.add_event_handler(
+        porna91_cancel_callback, events.CallbackQuery(pattern=r"p91_cancel_.+")
     )
 
     # ===== Command handlers =====
