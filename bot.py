@@ -3137,55 +3137,85 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 12: محل ست شدن iv در JS + استخراج data تازه"""
+    """مرحله 13: زنجیره کامل با data تازه از watch page"""
     import re
+    import json
+    import base64
+    import codecs
     from curl_cffi.requests import AsyncSession
 
     page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
-    js_url = (
-        "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js"
-    )
+
+    def rot13(s):
+        return codecs.encode(s, "rot_13")
+
+    def safe_b64(s):
+        s = s.strip()
+        m = len(s) % 4
+        if m:
+            s += "=" * (4 - m)
+        return base64.b64decode(s).decode("utf-8")
 
     lines = []
     async with AsyncSession() as session:
         await session.get("https://hentaihaven.xxx/", impersonate="chrome", timeout=15)
 
-        # ── (الف) دنبال iv در JS ──
-        jr = await session.get(
-            js_url,
-            impersonate="chrome",
-            headers={"Referer": page_url},
-            timeout=15,
-        )
-        jtext = jr.text
-        lines.append(f"📄 player.js len={len(jtext)}")
-        for kw in ["iv", "config.iv", ".iv=", "config="]:
-            idx = 0
-            count = 0
-            while count < 3:
-                idx = jtext.find(kw, idx)
-                if idx == -1:
-                    break
-                lines.append(f"🔍 '{kw}': ...{jtext[max(0, idx - 80) : idx + 80]}...")
-                idx += len(kw)
-                count += 1
-
-        # ── (ب) data تازه از صفحه watch ──
+        # 1. data تازه از watch page
         pr = await session.get(
             page_url,
             impersonate="chrome",
             headers={"Referer": "https://hentaihaven.xxx/"},
             timeout=15,
         )
-        phtml = pr.text
-        lines.append(f"\n📄 watch page len={len(phtml)}")
+        m = re.search(r"player\.php\?data=([A-Za-z0-9+/=_-]+)", pr.text)
+        if not m:
+            await event.reply("❌ data not found in watch page")
+            return
+        data_param = m.group(1)
+        player_url = f"https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php?data={data_param}"
+        lines.append(f"🎬 fresh data len={len(data_param)}")
 
-        for m in re.finditer(r"player\.php\?data=([A-Za-z0-9+/=_-]+)", phtml):
-            lines.append(f"\n🎬 data found (len={len(m.group(1))}):")
-            lines.append(f"  {m.group(1)[:120]}...")
+        # 2. player.php → token
+        pl = await session.get(
+            player_url,
+            impersonate="chrome",
+            headers={"Referer": page_url},
+            timeout=15,
+        )
+        tm = re.search(
+            r'x-secure-token["\']?\s+content=["\']([^"\']+)["\']',
+            pl.text,
+            re.IGNORECASE,
+        )
+        if not tm:
+            await event.reply("❌ token not found")
+            return
 
-        for m in re.finditer(r'<iframe[^>]+src=["\']([^"\']+)["\']', phtml):
-            lines.append(f"  iframe: {m.group(1)[:120]}")
+        # 3. decode token
+        val = tm.group(1).replace("sha512-", "")
+        for _ in range(3):
+            val = safe_b64(rot13(val))
+        config = json.loads(val)
+        en, iv, uri = config.get("en", ""), config.get("iv", ""), config.get("uri", "")
+        if uri.startswith("//"):
+            uri = "https:" + uri
+        lines.append(f"🔐 en len={len(en)}, iv='{iv}'")
+
+        # 4. api.php با data تازه
+        api_url = f"{uri}api.php"
+        ar = await session.post(
+            api_url,
+            data={"action": "zarat_get_data_player_ajax", "a": en, "b": iv},
+            impersonate="chrome",
+            headers={
+                "Referer": player_url,
+                "Origin": "https://hentaihaven.xxx",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=15,
+        )
+        lines.append(f"\n🎯 api.php status={ar.status_code} len={len(ar.text)}")
+        lines.append(f"📦 Body:\n{ar.text[:2500]}")
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
