@@ -11,8 +11,8 @@ porna91_handler.py
 
 نکته‌ها:
   - لینک auth_key زمان‌داره → extract باید بلافاصله قبل از دانلود صدا زده بشه
-  - روی سرور لینوکس بدون نمایشگر، با xvfb-run اجرا کن:  xvfb-run -a python bot.py
-  - فقط یک استخراج همزمان (Semaphore) برای کنترل مصرف RAM
+  - هدلس (بدون نیاز به نمایشگر) — روی هر سروری کار می‌کنه
+  - فقط یک استخراج/دانلود همزمان (Semaphore) برای کنترل مصرف RAM
 """
 
 import asyncio
@@ -128,8 +128,14 @@ async def _extract_m3u8_via_browser(url: str) -> Tuple[Optional[str], str]:
         browser = None
         try:
             browser = await p.chromium.launch(
-                headless=False,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--mute-audio"],
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--mute-audio",
+                    "--disable-gpu",
+                    "--single-process",
+                ],
                 ignore_default_args=["--enable-automation"],
                 handle_sigint=False,
                 handle_sigterm=False,
