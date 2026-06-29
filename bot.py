@@ -145,6 +145,12 @@ from otherwebsiteshandler.porna91_handler import (
     download_91porna_direct,
     download_91porna_m3u8,
 )
+from otherwebsiteshandler.playvids_handler import (
+    is_playvids_url,
+    extract_playvids_qualities,
+    download_playvids_direct,
+    download_playvids_m3u8,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3679,6 +3685,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_playvids_url(target_url):
+        logger.info(f"[URL] Playvids detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_playvids_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -3714,6 +3729,7 @@ async def generic_url_handler(event):
         or is_redtube_url(target_url)
         or is_hohoj_url(target_url)
         or is_91porna_url(target_url)
+        or is_playvids_url(target_url)
         or is_pornhub_url(target_url)
         or is_ytdlp_site_url(target_url)
     ):
@@ -6255,6 +6271,21 @@ porna91_sessions: dict = {}
     "91Porna",
 )
 
+playvids_sessions: dict = {}
+
+(
+    process_playvids_request,
+    playvids_quality_callback,
+    playvids_cancel_callback,
+) = _make_site_handler(
+    "pv",
+    extract_playvids_qualities,
+    download_playvids_direct,
+    download_playvids_m3u8,
+    playvids_sessions,
+    "Playvids",
+)
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -6554,6 +6585,12 @@ async def main():
     )
     client.add_event_handler(
         porna91_cancel_callback, events.CallbackQuery(pattern=r"p91_cancel_.+")
+    )
+    client.add_event_handler(
+        playvids_quality_callback, events.CallbackQuery(pattern=r"pv_q_.+")
+    )
+    client.add_event_handler(
+        playvids_cancel_callback, events.CallbackQuery(pattern=r"pv_cancel_.+")
     )
 
     # ===== Command handlers =====
