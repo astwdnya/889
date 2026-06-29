@@ -3137,63 +3137,55 @@ async def github_cmd(event):
 
 
 async def debug_hentaihaven(event):
-    """مرحله 11: پیدا کردن پارامترهای واقعی api.php از فایل JS"""
+    """مرحله 12: محل ست شدن iv در JS + استخراج data تازه"""
     import re
     from curl_cffi.requests import AsyncSession
 
-    player_url = (
-        "https://hentaihaven.xxx/wp-content/plugins/player-logic/player.php"
-        "?data=VFV1N3VKbHIvVUlVUkoyamt1aHR2VSsxRS9HTFgwTlFhNGJ5a3JZbFJPTVI4V0luTWVwN3VyL2Z6ZG1VTXlmL29UZldMcFZnVTVKbHpHY29uUm5yNXpUNS9yOWJtS0FRa3RIZnBnZit0amc3dGFueExQTGJjcXAyMEpDdU5YWFBKcU02bTNHTnh5NjduQ3BUcW5ISFk5NUlsWEgvSEZnWFlGcDlib3AyanRiZWxsREFVbVg2U21leGZzUWhnVlRuMjFqWlUxZlRSdXlTak8zajBSVFY3ZnVtb25xdXZGQ2ZDbGJ5Uy83RE8rbz0"
+    page_url = "https://hentaihaven.xxx/watch/oyasumi-sex/episode-1/"
+    js_url = (
+        "https://hentaihaven.xxx/wp-content/plugins/player-logic/assets/js/player.js"
     )
 
     lines = []
     async with AsyncSession() as session:
         await session.get("https://hentaihaven.xxx/", impersonate="chrome", timeout=15)
 
+        # ── (الف) دنبال iv در JS ──
+        jr = await session.get(
+            js_url,
+            impersonate="chrome",
+            headers={"Referer": page_url},
+            timeout=15,
+        )
+        jtext = jr.text
+        lines.append(f"📄 player.js len={len(jtext)}")
+        for kw in ["iv", "config.iv", ".iv=", "config="]:
+            idx = 0
+            count = 0
+            while count < 3:
+                idx = jtext.find(kw, idx)
+                if idx == -1:
+                    break
+                lines.append(f"🔍 '{kw}': ...{jtext[max(0, idx - 80) : idx + 80]}...")
+                idx += len(kw)
+                count += 1
+
+        # ── (ب) data تازه از صفحه watch ──
         pr = await session.get(
-            player_url,
+            page_url,
             impersonate="chrome",
             headers={"Referer": "https://hentaihaven.xxx/"},
             timeout=15,
         )
-        html = pr.text
+        phtml = pr.text
+        lines.append(f"\n📄 watch page len={len(phtml)}")
 
-        js_files = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
-        lines.append(f"📜 JS files ({len(js_files)}):")
-        for j in js_files:
-            lines.append(f"  • {j}")
+        for m in re.finditer(r"player\.php\?data=([A-Za-z0-9+/=_-]+)", phtml):
+            lines.append(f"\n🎬 data found (len={len(m.group(1))}):")
+            lines.append(f"  {m.group(1)[:120]}...")
 
-        for js in js_files:
-            if js.startswith("//"):
-                js = "https:" + js
-            elif js.startswith("/"):
-                js = "https://hentaihaven.xxx" + js
-            if "player-logic" not in js and "player" not in js.lower():
-                continue
-            try:
-                jr = await session.get(
-                    js,
-                    impersonate="chrome",
-                    headers={"Referer": player_url},
-                    timeout=15,
-                )
-                jtext = jr.text
-                lines.append(f"\n📄 {js[:70]} (len={len(jtext)})")
-
-                for m in re.finditer(r'\.append\(\s*["\']([^"\']+)["\']', jtext):
-                    lines.append(f"  append: {m.group(1)}")
-                for m in re.finditer(
-                    r"(zarat_\w+|action\s*[:=]\s*[\"'][^\"']+)", jtext
-                ):
-                    lines.append(f"  action: {m.group(1)[:60]}")
-                idx = jtext.find("api.php")
-                if idx != -1:
-                    lines.append(f"  ...api.php context...")
-                    start = max(0, idx - 300)
-                    ctx = jtext[start : idx + 100]
-                    lines.append(f"  {ctx}")
-            except Exception as e:
-                lines.append(f"  ❌ {e}")
+        for m in re.finditer(r'<iframe[^>]+src=["\']([^"\']+)["\']', phtml):
+            lines.append(f"  iframe: {m.group(1)[:120]}")
 
     result = "\n".join(lines)
     for i in range(0, len(result), 4000):
