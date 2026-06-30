@@ -179,6 +179,11 @@ from otherwebsiteshandler.pornzog_handler import (
     download_pornzog_direct,
     download_pornzog_m3u8,
 )
+from otherwebsiteshandler.rule34_handler import (
+    is_rule34_url,
+    extract_rule34_post,
+    download_rule34,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3766,6 +3771,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_rule34_url(target_url):
+        logger.info(f"[URL] Rule34 detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج...")
+        try:
+            await process_rule34_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -6008,6 +6022,89 @@ async def xnxx_cancel_callback(event):
         await event.edit("❌ **لغو شد.**", buttons=None)
     except Exception:
         pass
+
+
+# ====================== RULE34 HANDLER ======================
+
+
+async def process_rule34_request(event, url: str, status_msg):
+    try:
+        post, error = await extract_rule34_post(url)
+        if not post:
+            await safe_edit(status_msg, f"❌ {error}")
+            return
+
+        file_url = post.get("file_url", "")
+        title = post.get("title", "Rule34 Post")
+        media_type = post.get("media_type", "image")
+        tags = post.get("tags", "")
+
+        if not file_url:
+            await safe_edit(status_msg, "❌ لینک فایل پیدا نشد")
+            return
+
+        logger.info(f"[RULE34] Post #{post['post_id']} | {media_type} | {title[:50]}")
+
+        ext_map = {
+            "video": ".mp4",
+            "gif": ".gif",
+            "image": ".jpg",
+        }
+        ext = ext_map.get(media_type, ".mp4")
+        filepath = os.path.join("output_files", f"rule34_{post['post_id']}{ext}")
+
+        os.makedirs("output_files", exist_ok=True)
+
+        await safe_edit(status_msg, f"📥 **در حال دانلود...**\n🎬 {title}")
+
+        async def progress_cb(text):
+            try:
+                await status_msg.edit(text)
+            except Exception:
+                pass
+
+        success, dl_error, size = await download_rule34(file_url, filepath, progress_cb)
+        if not success or not os.path.exists(filepath):
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: {dl_error or 'Unknown'}")
+            return
+
+        media_type_display = {"video": "🎬", "image": "🖼", "gif": "🎞"}.get(
+            media_type, "📄"
+        )
+        caption = (
+            f"{media_type_display} **{title[:80]}**\n"
+            f"🏷 `{tags[:200]}`\n"
+            f"📦 {human_readable_size(size)}"
+        )[:1024]
+
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+
+        if media_type == "video":
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=caption,
+                status_msg=status_msg,
+                supports_streaming=True,
+            )
+        else:
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=filepath,
+                caption=caption,
+                status_msg=status_msg,
+            )
+    except Exception as e:
+        logger.error(f"[RULE34] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
 
 
 # ====================== INLINE SEARCH ======================
