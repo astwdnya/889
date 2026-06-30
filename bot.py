@@ -32,6 +32,8 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
     DocumentAttributeAudio,
     InputMediaUploadedDocument,
+    InputTextMessageContent,
+    InlineQueryResultArticle,
 )
 from FastTelethon import upload_file as fast_upload_file
 from github import (
@@ -50,6 +52,7 @@ from xnxx_handler import (
     download_xnxx_m3u8,
     xnxx_sessions,
 )
+from searcher.xnxx_search import search_xnxx
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -6006,6 +6009,86 @@ async def xnxx_cancel_callback(event):
         pass
 
 
+# ====================== INLINE SEARCH ======================
+
+
+INLINE_CACHE_TIME = 60
+INLINE_RESULTS_LIMIT = 20
+
+
+async def xnxx_inline_handler(event):
+    try:
+        query = event.text.strip() if event.text else ""
+        logger.info(f"[INLINE] Query: '{query}' from {event.sender_id}")
+
+        if len(query) < 2:
+            await event.answer(
+                [],
+                switch_pm_text="🔍 جستجوی XNXX",
+                switch_pm_parameter="search",
+                cache_time=INLINE_CACHE_TIME,
+            )
+            return
+
+        results = await search_xnxx(query, page=0, limit=INLINE_RESULTS_LIMIT)
+        if not results:
+            await event.answer(
+                [],
+                switch_pm_text="❌ نتیجه‌ای یافت نشد",
+                switch_pm_parameter="search",
+                cache_time=INLINE_CACHE_TIME,
+            )
+            return
+
+        articles = []
+        for i, video in enumerate(results):
+            title = video.get("title", "Untitled")[:80]
+            duration = video.get("duration", "")
+            quality = video.get("quality", "")
+            views = video.get("views", "")
+            thumb = video.get("thumbnail", "")
+
+            desc_parts = []
+            if duration:
+                desc_parts.append(f"⏱ {duration}")
+            if quality:
+                desc_parts.append(f"🎚 {quality}")
+            if views:
+                desc_parts.append(f"👁 {views}")
+            description = " • ".join(desc_parts) if desc_parts else None
+
+            articles.append(
+                InlineQueryResultArticle(
+                    id=f"xnxx_{video.get('video_id', '')}_{i}",
+                    title=title,
+                    description=description,
+                    thumb_url=thumb,
+                    input_message_content=InputTextMessageContent(
+                        message=video.get("url", ""),
+                    ),
+                )
+            )
+
+        await event.answer(
+            articles,
+            cache_time=INLINE_CACHE_TIME,
+            gallery=False,
+        )
+        logger.info(f"[INLINE] Returned {len(articles)} results for '{query}'")
+
+    except Exception as e:
+        logger.error(f"[INLINE] Error: {e}", exc_info=True)
+        try:
+            await event.answer(
+                [],
+                switch_pm_text="❌ خطا در جستجو",
+                switch_pm_parameter="search",
+                cache_time=5,
+            )
+        except Exception:
+            pass
+
+
 # ====================== YT-DLP GENERIC HANDLER ======================
 
 
@@ -6921,6 +7004,9 @@ async def main():
     )
     client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
+
+    # Inline search handler
+    client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
 
     me = await client.get_me()
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
