@@ -53,7 +53,7 @@ from xnxx_handler import (
     download_xnxx_m3u8,
     xnxx_sessions,
 )
-from searcher.xnxx_search import search_xnxx
+from searcher.xnxx_search import search_xnxx, parse_inline_query
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -6019,10 +6019,10 @@ INLINE_RESULTS_LIMIT = 20
 
 async def xnxx_inline_handler(event):
     try:
-        query = event.text.strip() if event.text else ""
-        logger.info(f"[INLINE] Query: '{query}' from {event.sender_id}")
+        raw = event.text.strip() if event.text else ""
+        logger.info(f"[INLINE] Raw: '{raw}' from {event.sender_id}")
 
-        if len(query) < 3:
+        if len(raw) < 3:
             await event.answer(
                 [],
                 switch_pm_text="🔍 حداقل ۳ حرف تایپ کنید",
@@ -6031,7 +6031,16 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        results = await search_xnxx(query, page=0, limit=INLINE_RESULTS_LIMIT)
+        parsed = parse_inline_query(raw)
+        query = parsed["query"]
+        page = parsed["page"]
+        sort = parsed["sort"]
+
+        logger.info(f"[INLINE] Parsed: q='{query}' page={page} sort={sort}")
+
+        results = await search_xnxx(
+            query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+        )
         if not results:
             await event.answer(
                 [],
