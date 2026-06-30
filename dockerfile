@@ -49,6 +49,7 @@ COPY happyscribe_subtitle.py .
 COPY xnxx_handler.py .
 COPY ytdlp_handler.py .
 COPY otherwebsiteshandler/ otherwebsiteshandler/
+COPY searcher/ searcher/
 
 # ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
