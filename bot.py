@@ -203,7 +203,7 @@ from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
 
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = "7675664254:AAGzV0-hpFhq-1jmeAB3QQwpYWKy3phYOUo"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = 2040
 API_HASH = "b18441a1ff607e10a989891a5462e627"
 
