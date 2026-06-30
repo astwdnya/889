@@ -240,6 +240,12 @@ video_send_pending: Dict[str, Dict] = {}
 # تسک‌های تایمر batch ویدیو
 video_send_timers: Dict[str, asyncio.Task] = {}
 
+# اشتراک‌گذاری ویدیو با لینک (جهت کاربرای غیرمجاز)
+share_links: Dict[str, dict] = {}
+BOT_USERNAME: str = ""
+SPONSOR_CHAT_ID: str = ""  # آیدی کانال/گروه اسپانسر (مثلاً @channel یا -100123)
+SPONSOR_LINK: str = ""  # لینک دعوت اسپانسر
+
 # نگه‌داری ویدیوهایی که منتظر فایل زیرنویس هستن
 subtitle_sessions: Dict[int, Dict] = {}  # key: chat_id
 
@@ -2664,6 +2670,32 @@ async def admin_input_handler(event):
         return
     action = admin_pending_add.pop(event.sender_id)
     raw = event.raw_text.strip()
+
+    if action == "sponsor_set":
+        global SPONSOR_CHAT_ID, SPONSOR_LINK
+        txt = raw
+        # تشخیص لینک دعوت
+        if txt.startswith("https://t.me/+"):
+            SPONSOR_LINK = txt
+            SPONSOR_CHAT_ID = txt
+        elif txt.startswith("https://t.me/joinchat/"):
+            SPONSOR_LINK = txt
+            SPONSOR_CHAT_ID = txt
+        elif txt.startswith("-100"):
+            SPONSOR_CHAT_ID = txt
+            SPONSOR_LINK = txt
+        elif txt.startswith("@"):
+            SPONSOR_CHAT_ID = txt
+            SPONSOR_LINK = txt
+        else:
+            SPONSOR_CHAT_ID = txt
+            SPONSOR_LINK = txt
+        await event.reply(
+            f"✅ **Sponsor set!**\n📢 `{SPONSOR_CHAT_ID}`",
+            parse_mode="markdown",
+        )
+        raise events.StopPropagation
+
     if not raw.isdigit():
         await event.reply(
             "❌ Invalid ID! Please send a numeric ID only.", parse_mode="markdown"
@@ -3108,13 +3140,18 @@ async def admin_cmd(event):
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
+    sponsor_status = f"✅ `{SPONSOR_CHAT_ID}`" if SPONSOR_CHAT_ID else "❌ Not set"
     await event.reply(
-        f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\nChoose an action:",
+        f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\n"
+        f"**Sponsor:** {sponsor_status}\n"
+        f"Choose an action:",
         parse_mode="markdown",
         buttons=[
             [Button.inline("➕ Add User", "admin_add")],
             [Button.inline("➖ Remove User", "admin_remove")],
             [Button.inline("🔄 Refresh List", "admin_refresh")],
+            [Button.inline("📢 Set Sponsor", "admin_sponsor_set")],
+            [Button.inline("🚫 Remove Sponsor", "admin_sponsor_remove")],
         ],
     )
 
@@ -3149,15 +3186,20 @@ async def admin_refresh_callback(event):
     if event.sender_id != ADMIN_ID:
         return await event.answer("Unauthorized", alert=True)
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
+    sponsor_status = f"✅ `{SPONSOR_CHAT_ID}`" if SPONSOR_CHAT_ID else "❌ Not set"
     await event.answer("✅ Refreshed", alert=False)
     try:
         await event.edit(
-            f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\nChoose an action:",
+            f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\n"
+            f"**Sponsor:** {sponsor_status}\n"
+            f"Choose an action:",
             parse_mode="markdown",
             buttons=[
                 [Button.inline("➕ Add User", "admin_add")],
                 [Button.inline("➖ Remove User", "admin_remove")],
                 [Button.inline("🔄 Refresh List", "admin_refresh")],
+                [Button.inline("📢 Set Sponsor", "admin_sponsor_set")],
+                [Button.inline("🚫 Remove Sponsor", "admin_sponsor_remove")],
             ],
         )
     except Exception:
@@ -3171,6 +3213,120 @@ async def admin_cancel_callback(event):
     await event.answer("Cancelled", alert=False)
     try:
         await event.delete()
+    except Exception:
+        pass
+
+
+# ====================== SPONSOR HANDLERS ======================
+
+
+async def admin_sponsor_set_callback(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    admin_pending_add[event.sender_id] = "sponsor_set"
+    await event.answer("", alert=False)
+    await event.client.send_message(
+        event.chat_id,
+        "📢 لینک دعوت یا آیدی کانال/گروه اسپانسر رو بفرست:\n"
+        "مثلاً:\n"
+        "`@my_channel`\n"
+        "یا\n"
+        "`https://t.me/joinchat/xxx`\n"
+        "یا\n"
+        "`-1001234567890`",
+        parse_mode="markdown",
+        buttons=[[Button.inline("❌ Cancel", "admin_cancel")]],
+    )
+
+
+async def admin_sponsor_remove_callback(event):
+    global SPONSOR_CHAT_ID, SPONSOR_LINK
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    SPONSOR_CHAT_ID = ""
+    SPONSOR_LINK = ""
+    await event.answer("✅ Sponsor removed", alert=False)
+    await event.edit("🚫 **Sponsor removed.**", buttons=None)
+
+
+async def sponsor_join_check_callback(event):
+    """کاربر روی ✅ عضو شدم زده — چک میکنه عضو هست یا نه."""
+    data = event.data.decode()
+    # data = "sponsor_ok_{key}_{user_id}"
+    parts = data.split("_", 3)
+    if len(parts) < 4:
+        return await event.answer("❌ خطا", alert=True)
+    key = parts[2]
+    original_user_id = int(parts[3])
+    if event.sender_id != original_user_id:
+        return await event.answer("⛔ این دکمه مال شما نیست.", alert=True)
+    info = share_links.get(key)
+    if not info:
+        return await event.answer("❌ لینک منقضی شده.", alert=True)
+
+    if not SPONSOR_CHAT_ID:
+        await event.answer("", alert=False)
+        await _forward_share_videos(event, key, info)
+        return
+
+    user_id = event.sender_id
+    try:
+        resolver = await event.client.get_entity(SPONSOR_CHAT_ID)
+        await event.client.get_permissions(resolver, user_id)
+        is_member = True
+    except Exception:
+        is_member = False
+
+    if not is_member:
+        await event.answer("❌ شما هنوز عضو نشدید!", alert=True)
+        return
+
+    await event.answer("✅ عضویت تأیید شد!", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    await _forward_share_videos(event, key, info)
+
+
+async def _forward_share_videos(event, key: str, info: dict):
+    """فوروارد ویدیوها به کاربر و حذف بعد ۲۰ ثانیه."""
+    messages = info.get("messages", [])
+    if not messages:
+        await event.reply("❌ ویدیویی وجود نداره.")
+        return
+
+    forwarded_msgs = []
+    for m in messages:
+        chat_id = m["chat_id"]
+        msg_id = m["message_id"]
+        try:
+            msg = await event.client.get_messages(chat_id, ids=msg_id)
+            if msg:
+                fwd_list = await event.client.forward_messages(event.sender_id, msg)
+                fwd = fwd_list[0] if isinstance(fwd_list, list) else fwd_list
+                forwarded_msgs.append(fwd)
+        except Exception as e:
+            logger.error(f"[SHARE] Forward error: {e}")
+
+    if not forwarded_msgs:
+        return
+
+    await asyncio.sleep(20)
+
+    for fwd in forwarded_msgs:
+        try:
+            await fwd.delete()
+        except Exception:
+            pass
+
+    try:
+        await event.client.send_message(
+            event.sender_id,
+            "⏰ ویدیو بعد از ۲۰ ثانیه حذف شد.\n"
+            "💾 برای ذخیره، پیام رو به **Saved Messages** فوروارد کنید.",
+            parse_mode="markdown",
+        )
     except Exception:
         pass
 
@@ -3350,7 +3506,49 @@ async def debug_hentaihaven(event):
 
 
 async def start_cmd(event):
-    logger.info(f"[CMD] /start from user={event.sender_id}")
+    logger.info(
+        f"[CMD] /start from user={event.sender_id} | text={event.raw_text[:100]}"
+    )
+
+    # ===== Share link handling (برای کاربرای غیرمجاز) =====
+    parts = event.raw_text.split(maxsplit=1)
+    if len(parts) > 1:
+        param = parts[1].strip()
+        if param.startswith("share_"):
+            key = param[6:].strip()
+            info = share_links.get(key)
+            if not info:
+                return await event.reply("❌ این لینک منقضی شده یا معتبر نیست.")
+
+            # بررسی اسپانسر
+            if SPONSOR_CHAT_ID:
+                user_id = event.sender_id
+                is_member = False
+                try:
+                    resolver = await event.client.get_entity(SPONSOR_CHAT_ID)
+                    await event.client.get_permissions(resolver, user_id)
+                    is_member = True
+                except Exception:
+                    pass
+
+                if not is_member:
+                    sponsor_link_display = (
+                        SPONSOR_LINK if SPONSOR_LINK else SPONSOR_CHAT_ID
+                    )
+                    await event.reply(
+                        f"🔒 **لطفاً قبل از مشاهده ویدیو، عضو کانال اسپانسر شوید:**\n\n"
+                        f"📢 {sponsor_link_display}\n\n"
+                        f"بعد از عضویت، دکمه زیر رو بزنید ✅",
+                        parse_mode="markdown",
+                        buttons=[
+                            [Button.inline("✅ عضو شدم", f"sponsor_ok_{key}_{user_id}")]
+                        ],
+                    )
+                    return
+
+            await _forward_share_videos(event, key, info)
+            return
+
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     await event.reply(
@@ -4516,6 +4714,9 @@ async def _flush_video_send_batch(
     if count == 1:
         buttons.append([Button.inline("🔤 Burn Subtitle", f"subburn_{batch_key}")])
 
+    # دکمه اشتراک‌گذاری با لینک
+    buttons.append([Button.inline("🔗 Share Link", f"sharelink_{batch_key}")])
+
     if GITHUB_ENABLED:
         buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])
 
@@ -4808,6 +5009,44 @@ async def vsend_callback(event):
             f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
         )
         await event.edit(result_text, buttons=None)
+    except Exception:
+        pass
+
+
+# ====================== SHARE LINK ======================
+
+
+async def sharelink_callback(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    batch_key = event.data.decode().replace("sharelink_", "")
+    batch = video_send_pending.get(batch_key)
+    if not batch or not batch.get("files"):
+        return await event.answer("❌ Session expired.", alert=True)
+
+    files = batch["files"]
+    chat_id = batch["chat_id"]
+    messages = [{"chat_id": chat_id, "message_id": f["message_id"]} for f in files]
+
+    import uuid
+
+    key = uuid.uuid4().hex[:12]
+    share_links[key] = {
+        "messages": messages,
+        "chat_id": chat_id,
+    }
+
+    link = f"https://t.me/{BOT_USERNAME}?start=share_{key}"
+    await event.answer("✅ لینک ساخته شد!", alert=False)
+    count = len(messages)
+    try:
+        await event.edit(
+            f"🔗 **لینک اشتراک‌گذاری ({count} ویدیو):**\n`{link}`\n\n"
+            f"هر کاربری با این لینک استارت بزنه، ویدیو براش **فوروارد** میشه و بعد ۲۰ ثانیه حذف میشه.",
+            buttons=None,
+            parse_mode="markdown",
+        )
     except Exception:
         pass
 
@@ -6392,6 +6631,15 @@ PH_SORT_MAP = {"new": "mr", "top": "tr", "long": "lg", "best": "tr", "views": "t
 
 async def xnxx_inline_handler(event):
     try:
+        if event.sender_id not in AUTHORIZED_USERS:
+            await event.answer(
+                [],
+                switch_pm_text="⛔ Unauthorized",
+                switch_pm_parameter="search",
+                cache_time=60,
+            )
+            return
+
         raw = event.text.strip() if event.text else ""
         logger.info(f"[INLINE] Raw: '{raw}' from {event.sender_id}")
 
@@ -7222,6 +7470,16 @@ async def main():
         admin_cancel_callback, events.CallbackQuery(pattern=r"admin_cancel")
     )
     client.add_event_handler(
+        admin_sponsor_set_callback, events.CallbackQuery(pattern=r"admin_sponsor_set")
+    )
+    client.add_event_handler(
+        admin_sponsor_remove_callback,
+        events.CallbackQuery(pattern=r"admin_sponsor_remove"),
+    )
+    client.add_event_handler(
+        sponsor_join_check_callback, events.CallbackQuery(pattern=r"sponsor_ok_.+")
+    )
+    client.add_event_handler(
         pdfimg_del_callback, events.CallbackQuery(pattern=rb"pdfimg_del\|")
     )
     client.add_event_handler(
@@ -7241,6 +7499,9 @@ async def main():
     )
     client.add_event_handler(
         subburn_callback, events.CallbackQuery(pattern=r"subburn_(.+)")
+    )
+    client.add_event_handler(
+        sharelink_callback, events.CallbackQuery(pattern=r"sharelink_(.+)")
     )
     client.add_event_handler(
         subextr_callback, events.CallbackQuery(pattern=r"subextr_(.+)")
@@ -7460,6 +7721,8 @@ async def main():
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
 
     me = await client.get_me()
+    global BOT_USERNAME
+    BOT_USERNAME = me.username
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
     logger.info(
