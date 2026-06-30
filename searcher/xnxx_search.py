@@ -131,40 +131,50 @@ def parse_inline_query(raw_query: str) -> dict:
     فرمت‌ها:
       step sis          → سرچ عادی، صفحه 0
       step sis=2        → صفحه 2
-      step sis=new      → جدیدترین‌ها (?sort=uploaddate)
-      step sis=top      → بهترین امتیاز (?sort=rating)
-      step sis=long     → طولانی‌ترین‌ها (?sort=length)
-      step sis=views    → بیشترین بازدید (?sort=views)
-      step sis=month    → ماهانه (path based)
-      step sis=hits     → پربازدید (path based)
+      step sis=new      → جدیدترین‌ها (ماهانه - path based)
+      step sis=new=3    → جدیدترین‌ها صفحه 3
+      step sis=top      → بهترین امتیاز
+      step sis=long     → طولانی‌ترین
+      step sis=views    → بیشترین بازدید
+      step sis=month    → ماهانه
+      step sis=hits     → پربازدید
     """
     raw_query = raw_query.strip()
 
     result = {"query": raw_query, "page": 0, "sort": "relevance"}
 
-    m = re.match(r"^(.+?)=(\S+)$", raw_query)
-    if not m:
+    parts = raw_query.split("=")
+    if len(parts) < 2:
         return result
 
-    query_part = m.group(1).strip()
-    param = m.group(2).strip().lower()
+    result["query"] = parts[0].strip()
+    sort_val = parts[1].strip().lower() if len(parts) >= 2 else ""
+    page_val = parts[2].strip() if len(parts) >= 3 else ""
 
-    result["query"] = query_part
+    sort_map = {
+        "new": "month",
+        "top": "rating",
+        "long": "length",
+        "best": "rating",
+        "month": "month",
+        "hits": "hits",
+        "views": "views",
+        "rating": "rating",
+        "uploaddate": "uploaddate",
+        "length": "length",
+        "relevance": "relevance",
+    }
 
-    if param.isdigit():
-        result["page"] = int(param)
-    elif param == "new":
-        result["sort"] = "uploaddate"
-    elif param == "top":
-        result["sort"] = "rating"
-    elif param == "long":
-        result["sort"] = "length"
-    elif param in ("views", "hits"):
-        result["sort"] = param
-    elif param == "month":
-        result["sort"] = "month"
-    elif param == "best":
-        result["sort"] = "rating"
+    if sort_val.isdigit():
+        result["page"] = int(sort_val)
+    elif sort_val in sort_map:
+        result["sort"] = sort_map[sort_val]
+        if page_val.isdigit():
+            result["page"] = int(page_val)
+    elif sort_val:
+        is_page = sort_val.isdigit()
+        if is_page:
+            result["page"] = int(sort_val)
 
     return result
 
