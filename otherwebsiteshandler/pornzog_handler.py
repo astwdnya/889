@@ -60,22 +60,24 @@ DOWNLOAD_READ_TIMEOUT = 120
 _ALLOWED_HOSTS = frozenset({"pornzog.com", "www.pornzog.com"})
 
 # سایت‌های embed که pornzog ازشون استفاده میکنه + CDN ها
-_ALLOWED_EMBED_HOSTS = frozenset({
-    "privatehomeclips.com",
-    "www.privatehomeclips.com",
-    "txxx.com",
-    "www.txxx.com",
-    "voyeurhit.com",
-    "www.voyeurhit.com",
-    "hclips.com",
-    "www.hclips.com",
-    "hdzog.com",
-    "www.hdzog.com",
-    "tporn.xxx",
-    "www.tporn.xxx",
-    "upornia.com",
-    "www.upornia.com",
-})
+_ALLOWED_EMBED_HOSTS = frozenset(
+    {
+        "privatehomeclips.com",
+        "www.privatehomeclips.com",
+        "txxx.com",
+        "www.txxx.com",
+        "voyeurhit.com",
+        "www.voyeurhit.com",
+        "hclips.com",
+        "www.hclips.com",
+        "hdzog.com",
+        "www.hdzog.com",
+        "tporn.xxx",
+        "www.tporn.xxx",
+        "upornia.com",
+        "www.upornia.com",
+    }
+)
 
 _ALLOWED_CDN_SUFFIXES = (
     ".pornzog.com",
@@ -211,6 +213,7 @@ def _check_impersonation_support() -> bool:
     """بررسی اینکه curl_cffi نصبه."""
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -240,9 +243,7 @@ async def _get_session(timeout: Optional[ClientTimeout] = None):
     """ساخت aiohttp session."""
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar(unsafe=True)
-    session = aiohttp.ClientSession(
-        timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
-    )
+    session = aiohttp.ClientSession(timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar)
     try:
         yield session
     finally:
@@ -275,7 +276,10 @@ async def _fetch_with_retry(
             last_error = str(e)[:200]
             logger.warning(
                 "Attempt %d/%d failed for %s: %s",
-                attempt, max_retries, url, last_error,
+                attempt,
+                max_retries,
+                url,
+                last_error,
             )
         if attempt < max_retries:
             await asyncio.sleep(RETRY_DELAY * attempt)
@@ -293,9 +297,7 @@ def _extract_embed_urls(html: str) -> List[str]:
     urls = []
 
     # iframe src
-    for m in re.finditer(
-        r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
+    for m in re.finditer(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
         src = m.group(1).strip()
         if not src or "pornzog.com/embed" in src:
             # embed خود pornzog رو رد کن، اون هم redirect میکنه
@@ -431,11 +433,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             height = data.get("height")
             label = f"🎥 {ext.upper()} {height}p" if height else f"🎥 {ext.upper()}"
             is_m3u8 = ext in ("m3u8", "m3u8_native") or ".m3u8" in direct_url
-            qualities.append({
-                "label": label,
-                "url": direct_url,
-                "method": "m3u8" if is_m3u8 else "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": direct_url,
+                    "method": "m3u8" if is_m3u8 else "direct",
+                }
+            )
         return qualities
 
     for fmt in formats:
@@ -457,9 +461,7 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             continue
 
         is_m3u8 = (
-            protocol in ("m3u8", "m3u8_native")
-            or ".m3u8" in fmt_url
-            or ext == "m3u8"
+            protocol in ("m3u8", "m3u8_native") or ".m3u8" in fmt_url or ext == "m3u8"
         )
         size_str = f" ({filesize / 1024 / 1024:.0f}MB)" if filesize else ""
 
@@ -473,11 +475,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
         else:
             label = f"🎥 {ext.upper()}{size_str}"
 
-        qualities.append({
-            "label": label,
-            "url": fmt_url,
-            "method": "m3u8" if is_m3u8 else "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": fmt_url,
+                "method": "m3u8" if is_m3u8 else "direct",
+            }
+        )
 
     return qualities
 
@@ -560,12 +564,14 @@ def _extract_title_from_html(html: str) -> str:
     # og:title
     m = re.search(
         r'(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-        html, re.IGNORECASE,
+        html,
+        re.IGNORECASE,
     )
     if not m:
         m = re.search(
             r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']',
-            html, re.IGNORECASE,
+            html,
+            re.IGNORECASE,
         )
     if m:
         return m.group(1).strip()
@@ -585,37 +591,30 @@ def _extract_title_from_html(html: str) -> str:
     return "Untitled"
 
 
-def _extract_kvs_flashvars(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_kvs_flashvars(html: str, page_url: str, qualities: List[dict]) -> None:
     """
     استخراج از KVS flashvars.
     privatehomeclips و سایت‌های مشابه از این فرمت استفاده میکنن.
     """
     # فرمت 1: var flashvars = {...};
-    for m in re.finditer(
-        r"var\s+flashvars\s*=\s*(\{[^;]+?\});", html, re.DOTALL
-    ):
+    for m in re.finditer(r"var\s+flashvars\s*=\s*(\{[^;]+?\});", html, re.DOTALL):
         _parse_flashvars_block(m.group(1), page_url, qualities, html)
 
     # فرمت 2: var flashvars_XXXXX = {...};
-    for m in re.finditer(
-        r"var\s+flashvars_\w+\s*=\s*(\{[^;]+?\});", html, re.DOTALL
-    ):
+    for m in re.finditer(r"var\s+flashvars_\w+\s*=\s*(\{[^;]+?\});", html, re.DOTALL):
         _parse_flashvars_block(m.group(1), page_url, qualities, html)
 
     # فرمت 3: kt_player('...', '...', {...})
     for m in re.finditer(
         r"kt_player\s*\([^,]+,\s*['\"][^'\"]+['\"]\s*,\s*(\{.+?\})\s*\)",
-        html, re.DOTALL,
+        html,
+        re.DOTALL,
     ):
         _parse_flashvars_block(m.group(1), page_url, qualities, html)
 
     # فرمت 4: flashvars['key'] = 'value'
     fv_items = {}
-    for m in re.finditer(
-        r"flashvars\[(['\"])(\w+)\1\]\s*=\s*(['\"])([^'\"]*)\3", html
-    ):
+    for m in re.finditer(r"flashvars\[(['\"])(\w+)\1\]\s*=\s*(['\"])([^'\"]*)\3", html):
         fv_items[m.group(2)] = m.group(4)
 
     if fv_items:
@@ -641,8 +640,13 @@ def _parse_flashvars_block(
     # با regex استخراج کن
     extracted = {}
     for key in [
-        "video_url", "video_alt_url", "video_alt_url2", "video_alt_url3",
-        "video_url_text", "video_alt_url_text", "video_alt_url2_text",
+        "video_url",
+        "video_alt_url",
+        "video_alt_url2",
+        "video_alt_url3",
+        "video_url_text",
+        "video_alt_url_text",
+        "video_alt_url2_text",
         "license_code",
     ]:
         m = re.search(rf"""['"]{key}['"]\s*:\s*['"]([^'"]*?)['"]""", raw)
@@ -705,11 +709,13 @@ def _process_kvs_url_dict(
             else:
                 label = f"🎥 MP4 ({quality_name})"
 
-        qualities.append({
-            "label": label,
-            "url": video_url,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": video_url,
+                "method": "direct",
+            }
+        )
 
 
 def _decode_kvs_url(url: str, license_code: str) -> str:
@@ -744,22 +750,20 @@ def _decode_kvs_url(url: str, license_code: str) -> str:
     return url
 
 
-def _extract_video_source_tags(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_video_source_tags(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از <video> و <source> tags."""
     # video src
-    for m in re.finditer(
-        r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE
-    ):
+    for m in re.finditer(r'<video[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
         video_url = _normalize_url(m.group(1), page_url)
         if video_url and _is_video_cdn_url(video_url):
             if not any(q["url"] == video_url for q in qualities):
-                qualities.append({
-                    "label": "🎥 MP4 (video tag)",
-                    "url": video_url,
-                    "method": "direct",
-                })
+                qualities.append(
+                    {
+                        "label": "🎥 MP4 (video tag)",
+                        "url": video_url,
+                        "method": "direct",
+                    }
+                )
 
     # source tags
     for m in re.finditer(
@@ -786,16 +790,16 @@ def _extract_video_source_tags(
             q_label = f"{url_res.group(1)}p" if url_res else "Default"
 
         prefix = "📡 M3U8" if is_m3u8 else "🎥 MP4"
-        qualities.append({
-            "label": f"{prefix} {q_label}",
-            "url": src,
-            "method": "m3u8" if is_m3u8 else "direct",
-        })
+        qualities.append(
+            {
+                "label": f"{prefix} {q_label}",
+                "url": src,
+                "method": "m3u8" if is_m3u8 else "direct",
+            }
+        )
 
 
-def _extract_js_video_urls(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_js_video_urls(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج لینک ویدیو از متغیرهای JS."""
     patterns = [
         (r"""video_url\s*[:=]\s*['"]([^'"]+\.mp4[^'"]*)['"]""", None),
@@ -821,18 +825,21 @@ def _extract_js_video_urls(
                 continue
             if any(q["url"] == video_url for q in qualities):
                 continue
-            qualities.append({
-                "label": label, "url": video_url, "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": video_url,
+                    "method": "direct",
+                }
+            )
 
 
-def _extract_json_ld(
-    html: str, page_url: str, qualities: List[dict]
-) -> None:
+def _extract_json_ld(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از JSON-LD."""
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
+        html,
+        re.DOTALL | re.IGNORECASE,
     ):
         try:
             data = json.loads(m.group(1))
@@ -850,17 +857,22 @@ def _extract_json_ld(
                 continue
             if any(q["url"] == video_url for q in qualities):
                 continue
-            qualities.append({
-                "label": "🎥 MP4 (structured data)",
-                "url": video_url,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": "🎥 MP4 (structured data)",
+                    "url": video_url,
+                    "method": "direct",
+                }
+            )
 
 
 # ─── Main extraction ───────────────────────────────────────
 
 
-async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
+async def extract_pornzog_qualities(
+    url: str,
+    debug_cb: Optional[Callable[[str], None]] = None,
+) -> Tuple[List[dict], str]:
     """
     لینک‌های کیفیت مختلف رو از صفحه pornzog استخراج میکنه.
 
@@ -873,13 +885,21 @@ async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
         logger.warning("Not a valid pornzog URL: %s", url)
         return [], "Invalid URL"
 
+    if debug_cb:
+        debug_cb("🔍 Method 1: yt-dlp direct...")
+
     # ── روش 1: yt-dlp مستقیم (بهترین روش) ──
     logger.info("Method 1: yt-dlp direct for %s", url)
     qualities, title = await _extract_with_ytdlp(url)
     if qualities:
         qualities.sort(key=_quality_sort_key, reverse=True)
         logger.info("Extracted %d qualities via yt-dlp", len(qualities))
+        if debug_cb:
+            debug_cb(f"✅ Found {len(qualities)} qualities via yt-dlp")
         return qualities, title
+
+    if debug_cb:
+        debug_cb("🔍 Method 2: iframe extraction...")
 
     # ── روش 2: iframe استخراج + embed page پارس ──
     logger.info("Method 2: iframe extraction for %s", url)
@@ -895,16 +915,23 @@ async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
         title = _extract_title_from_html(page_html)
         embed_urls = _extract_embed_urls(page_html)
         logger.info("Found %d embed URLs", len(embed_urls))
+        if debug_cb:
+            debug_cb(f"🔍 Found {len(embed_urls)} embed URLs")
 
-        for embed_url in embed_urls:
+        for i, embed_url in enumerate(embed_urls):
+            if debug_cb:
+                debug_cb(
+                    f"🔍 Trying embed [{i + 1}/{len(embed_urls)}]: {embed_url[:60]}..."
+                )
+
             # اول yt-dlp روی embed URL
             eq, et = await _extract_with_ytdlp(embed_url)
             if eq:
                 eq.sort(key=_quality_sort_key, reverse=True)
                 final_title = et if et and et != "Untitled" else title
-                logger.info(
-                    "Extracted %d qualities from embed via yt-dlp", len(eq)
-                )
+                logger.info("Extracted %d qualities from embed via yt-dlp", len(eq))
+                if debug_cb:
+                    debug_cb(f"✅ Found {len(eq)} qualities via yt-dlp on embed")
                 return eq, final_title
 
             # بعد مستقیم embed page رو پارس کن
@@ -912,12 +939,14 @@ async def extract_pornzog_qualities(url: str) -> Tuple[List[dict], str]:
             if eq:
                 eq.sort(key=_quality_sort_key, reverse=True)
                 final_title = et if et and et != "Untitled" else title
-                logger.info(
-                    "Extracted %d qualities from embed page", len(eq)
-                )
+                logger.info("Extracted %d qualities from embed page", len(eq))
+                if debug_cb:
+                    debug_cb(f"✅ Found {len(eq)} qualities via embed page parsing")
                 return eq, final_title
 
     logger.warning("All extraction methods failed for: %s", url)
+    if debug_cb:
+        debug_cb("❌ All extraction methods failed")
 
     has_ytdlp = shutil.which("yt-dlp") is not None
     has_curl_cffi = _check_impersonation_support()
@@ -955,7 +984,9 @@ async def _download_with_curl_cffi(
                 impersonate="chrome",
                 headers={
                     "Referer": referer,
-                    "Origin": urlparse(referer).scheme + "://" + urlparse(referer).hostname,
+                    "Origin": urlparse(referer).scheme
+                    + "://"
+                    + urlparse(referer).hostname,
                     "Accept": "*/*",
                     "Accept-Language": "en-US,en;q=0.9",
                 },
@@ -1028,27 +1059,42 @@ async def _download_with_ytdlp(
     try:
         cmd = [
             "yt-dlp",
-            "--no-warnings", "--progress", "--newline",
+            "--no-warnings",
+            "--progress",
+            "--newline",
             "--no-check-certificates",
-            "-f", "best",
-            "--concurrent-fragments", "16",
-            "--retries", "10",
-            "--fragment-retries", "10",
-            "--retry-sleep", "fragment:exp=1:30",
-            "--buffer-size", "16K",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", f"Referer:{referer}",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "-o", filepath,
+            "-f",
+            "best",
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "fragment:exp=1:30",
+            "--buffer-size",
+            "16K",
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            f"Referer:{referer}",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "-o",
+            filepath,
         ]
 
         if has_aria2c:
-            cmd.extend([
-                "--downloader", "aria2c",
-                "--downloader-args",
-                "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
-                "--min-split-size=1M --console-log-level=warn",
-            ])
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
 
         if _check_impersonation_support():
             cmd.extend(["--impersonate", "chrome"])
@@ -1129,9 +1175,7 @@ async def _download_with_aiohttp(
                             _cleanup_file(filepath)
                             return False, error, 0
                     else:
-                        content_length = int(
-                            resp.headers.get("Content-Length", 0)
-                        )
+                        content_length = int(resp.headers.get("Content-Length", 0))
                         if content_length > MAX_DOWNLOAD_SIZE:
                             return (
                                 False,
@@ -1144,9 +1188,7 @@ async def _download_with_aiohttp(
                         last_update = 0.0
 
                         async with aiofiles.open(filepath, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(
-                                1024 * 1024
-                            ):
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
                                 await f.write(chunk)
                                 downloaded += len(chunk)
 
