@@ -134,7 +134,8 @@ def _ytdlp_base_cmd() -> List[str]:
         "yt-dlp",
         "--no-warnings",
         "--no-playlist",
-        "--user-agent", _USER_AGENT,
+        "--user-agent",
+        _USER_AGENT,
     ]
 
 
@@ -175,7 +176,8 @@ async def _run_ytdlp_json(url: str) -> Tuple[Optional[dict], str]:
                 await process.wait()
                 logger.warning(
                     "yt-dlp info timed out (attempt %d/%d)",
-                    attempt, MAX_RETRIES,
+                    attempt,
+                    MAX_RETRIES,
                 )
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY * attempt)
@@ -190,7 +192,10 @@ async def _run_ytdlp_json(url: str) -> Tuple[Optional[dict], str]:
                         break
                 logger.warning(
                     "yt-dlp info failed (attempt %d/%d, code %d): %s",
-                    attempt, MAX_RETRIES, process.returncode, err[:200],
+                    attempt,
+                    MAX_RETRIES,
+                    process.returncode,
+                    err[:200],
                 )
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(RETRY_DELAY * attempt)
@@ -212,7 +217,9 @@ async def _run_ytdlp_json(url: str) -> Tuple[Optional[dict], str]:
         except Exception as e:
             logger.warning(
                 "yt-dlp info error (attempt %d/%d): %s",
-                attempt, MAX_RETRIES, e,
+                attempt,
+                MAX_RETRIES,
+                e,
             )
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_DELAY * attempt)
@@ -311,12 +318,258 @@ async def extract_pornhub_qualities(url: str) -> Tuple[List[dict], str]:
 
     logger.info(
         "Extracted %d qualities for: %s (ffmpeg=%s)",
-        len(qualities), title[:60], has_ffmpeg,
+        len(qualities),
+        title[:60],
+        has_ffmpeg,
     )
     return qualities, title
 
 
-# ─── Download ───────────────────────────────────────────────
+# ─── Download: Multi-segment (fast) ────────────────────────
+
+import aiohttp
+import aiofiles
+from aiohttp import ClientTimeout
+
+
+async def _download_multi_segment(
+    direct_url: str,
+    filepath: str,
+    progress_cb: Optional[ProgressCallback],
+    num_segments: int = 16,
+) -> Tuple[bool, str, int]:
+    """
+    دانلود چند تیکه‌ای با چند connection همزمان.
+    هر تیکه یه Range request جدا میزنه → سرعت N برابر.
+    """
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Referer": "https://www.pornhub.com/",
+    }
+
+    try:
+        timeout = ClientTimeout(total=30, connect=15)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.head(direct_url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return False, f"HEAD failed: HTTP {resp.status}", 0
+
+                content_length = int(resp.headers.get("Content-Length", 0))
+                accept_ranges = resp.headers.get("Accept-Ranges", "")
+
+                if content_length == 0:
+                    return False, "Cannot determine file size", 0
+                if content_length > MAX_DOWNLOAD_SIZE:
+                    return False, f"File too large: {_format_size(content_length)}", 0
+                if accept_ranges.lower() != "bytes":
+                    return False, "Range not supported", 0
+
+        total_mb = content_length / 1024 / 1024
+        if progress_cb:
+            await progress_cb(
+                f"📥 **دانلود سریع ({num_segments} بخش)...**\n💾 حجم: {total_mb:.1f} MB"
+            )
+
+        segment_size = content_length // num_segments
+        segments = []
+        for i in range(num_segments):
+            start = i * segment_size
+            end = (
+                content_length - 1
+                if i == num_segments - 1
+                else (i + 1) * segment_size - 1
+            )
+            segments.append((i, start, end))
+
+        segment_files = [f"{filepath}.part{i}" for i in range(num_segments)]
+        downloaded_bytes = [0] * num_segments
+        start_time = time.time()
+        last_update = [0.0]
+        lock = asyncio.Lock()
+
+        async def _download_segment(seg_idx: int, byte_start: int, byte_end: int):
+            seg_file = segment_files[seg_idx]
+            seg_timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    async with aiohttp.ClientSession(
+                        timeout=seg_timeout, headers=headers
+                    ) as session:
+                        req_headers = {"Range": f"bytes={byte_start}-{byte_end}"}
+                        async with session.get(
+                            direct_url, headers=req_headers, allow_redirects=True
+                        ) as resp:
+                            if resp.status not in (200, 206):
+                                raise Exception(f"HTTP {resp.status}")
+
+                            async with aiofiles.open(seg_file, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(
+                                    1024 * 1024
+                                ):
+                                    if not chunk:
+                                        continue
+                                    await f.write(chunk)
+                                    downloaded_bytes[seg_idx] += len(chunk)
+
+                                    now = time.time()
+                                    async with lock:
+                                        if now - last_update[0] >= 2.0 and progress_cb:
+                                            last_update[0] = now
+                                            total_dl = sum(downloaded_bytes)
+                                            elapsed = now - start_time
+                                            speed = (
+                                                total_dl / elapsed if elapsed > 0 else 0
+                                            )
+                                            dl_mb = total_dl / 1024 / 1024
+                                            pct = total_dl / content_length * 100
+                                            filled = int(pct / 5)
+                                            bar = "█" * filled + "░" * (20 - filled)
+                                            speed_mb = min(speed / 1024 / 1024, 999)
+                                            eta_secs = (
+                                                int((content_length - total_dl) / speed)
+                                                if speed > 0
+                                                else 0
+                                            )
+                                            eta_m, eta_s = divmod(eta_secs, 60)
+
+                                            await progress_cb(
+                                                f"📥 **Downloading...**\n"
+                                                f"`[{bar}]`\n"
+                                                f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  "
+                                                f"⚡ {speed_mb:.1f} MB/s\n"
+                                                f"📊 {pct:.1f}%  •  "
+                                                f"⏱ ETA: {eta_m}:{eta_s:02d}"
+                                            )
+                    return
+                except asyncio.CancelledError:
+                    _cleanup_file(seg_file)
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "Segment %d attempt %d failed: %s", seg_idx, attempt + 1, e
+                    )
+                    _cleanup_file(seg_file)
+                    downloaded_bytes[seg_idx] = 0
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+
+            raise Exception(f"Segment {seg_idx} failed after {MAX_RETRIES} attempts")
+
+        try:
+            await asyncio.gather(
+                *[_download_segment(idx, start, end) for idx, start, end in segments]
+            )
+        except Exception as e:
+            for sf in segment_files:
+                _cleanup_file(sf)
+            return False, str(e)[:200], 0
+
+        if progress_cb:
+            await progress_cb("🔗 **ترکیب بخش‌ها...**")
+
+        try:
+            async with aiofiles.open(filepath, "wb") as outfile:
+                for sf in segment_files:
+                    if not os.path.exists(sf):
+                        raise FileNotFoundError(f"Missing segment: {sf}")
+                    async with aiofiles.open(sf, "rb") as infile:
+                        while True:
+                            chunk = await infile.read(4 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            await outfile.write(chunk)
+        finally:
+            for sf in segment_files:
+                _cleanup_file(sf)
+
+        final_size = os.path.getsize(filepath)
+        if final_size == 0:
+            _cleanup_file(filepath)
+            return False, "Merged file is empty", 0
+
+        elapsed = time.time() - start_time
+        avg_speed = final_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+        logger.info(
+            "Multi-segment download complete: %.1f MB in %.1fs (%.1f MB/s)",
+            final_size / 1024 / 1024,
+            elapsed,
+            avg_speed,
+        )
+        return True, "", final_size
+
+    except Exception as e:
+        logger.warning("Multi-segment download error: %s", e)
+        _cleanup_file(filepath)
+        return False, str(e)[:200], 0
+
+
+# ─── Get direct URL from yt-dlp ────────────────────────────
+
+
+async def _get_direct_url(url: str, format_id: str) -> Tuple[Optional[str], str]:
+    """
+    گرفتن لینک مستقیم دانلود از yt-dlp بدون دانلود.
+
+    Returns:
+        (direct_url, error)
+    """
+    if format_id in ("best", ""):
+        format_selector = "best"
+    else:
+        format_selector = f"{format_id}/best"
+
+    cmd = _ytdlp_base_cmd() + [
+        "--format",
+        format_selector,
+        "--get-url",
+        url,
+    ]
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=YTDLP_INFO_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY * attempt)
+                continue
+
+            if process.returncode == 0:
+                direct_url = stdout.decode(errors="replace").strip().splitlines()[0]
+                if direct_url.startswith("http"):
+                    return direct_url, ""
+                return None, "Invalid URL from yt-dlp"
+
+            err = _extract_ytdlp_error(stderr.decode(errors="replace"))
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY * attempt)
+                continue
+            return None, err
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_DELAY * attempt)
+            else:
+                return None, str(e)[:200]
+
+    return None, f"Failed after {MAX_RETRIES} attempts"
+
+
+# ─── Main download function (updated) ──────────────────────
 
 
 async def download_pornhub_video(
@@ -326,16 +579,12 @@ async def download_pornhub_video(
     progress_cb: Optional[ProgressCallback] = None,
 ) -> Tuple[bool, str, int]:
     """
-    دانلود ویدیو PornHub با yt-dlp.
+    دانلود ویدیو PornHub.
 
-    Args:
-        url: آدرس صفحه ویدیو
-        format_id: شناسه فرمت (مثلاً "720p" یا "hls-2232")
-        filepath: مسیر فایل خروجی
-        progress_cb: callback برای نمایش پیشرفت
-
-    Returns:
-        (success, error_message, file_size)
+    استراتژی:
+      1. لینک مستقیم رو با yt-dlp --get-url بگیر
+      2. اول multi-segment (16 connection) امتحان کن
+      3. اگه نشد، fallback به yt-dlp عادی
     """
     if not is_pornhub_url(url):
         return False, "URL host not allowed", 0
@@ -343,24 +592,63 @@ async def download_pornhub_video(
     if not _check_ytdlp():
         return False, "yt-dlp is not installed", 0
 
-    # ساخت format selector با fallback
+    # ── مرحله 1: گرفتن لینک مستقیم ──
+    is_hls = format_id.startswith("hls")
+
+    if not is_hls:
+        if progress_cb:
+            await progress_cb("🔍 **دریافت لینک دانلود...**")
+
+        direct_url, err = await _get_direct_url(url, format_id)
+
+        if direct_url:
+            logger.info("Trying multi-segment download (16 connections)")
+            success, error, size = await _download_multi_segment(
+                direct_url,
+                filepath,
+                progress_cb,
+                num_segments=16,
+            )
+            if success:
+                return True, "", size
+
+            logger.info("Multi-segment failed: %s, falling back to yt-dlp", error)
+            _cleanup_file(filepath)
+
+    # ── مرحله 3: Fallback به yt-dlp عادی ──
+    logger.info("Falling back to yt-dlp download")
+    return await _download_with_ytdlp(url, format_id, filepath, progress_cb)
+
+
+async def _download_with_ytdlp(
+    url: str,
+    format_id: str,
+    filepath: str,
+    progress_cb: Optional[ProgressCallback],
+) -> Tuple[bool, str, int]:
+    """دانلود با yt-dlp (fallback)."""
     if format_id in ("best", ""):
         format_selector = "best"
     else:
         format_selector = f"{format_id}/best"
 
     cmd = _ytdlp_base_cmd() + [
-        "--format", format_selector,
-        "--output", filepath,
-        "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-        "--retries", str(MAX_RETRIES),
-        "--fragment-retries", str(MAX_RETRIES),
+        "--format",
+        format_selector,
+        "--output",
+        filepath,
+        "--max-filesize",
+        str(MAX_DOWNLOAD_SIZE),
+        "--retries",
+        str(MAX_RETRIES),
+        "--fragment-retries",
+        str(MAX_RETRIES),
         "--progress",
         "--newline",
         url,
     ]
 
-    logger.info("Starting download: format=%s, output=%s", format_id, filepath)
+    error_msg = "Unknown error"
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -372,7 +660,6 @@ async def download_pornhub_video(
 
             last_update = 0.0
 
-            # خواندن stdout برای progress
             while True:
                 try:
                     line = await asyncio.wait_for(
@@ -380,10 +667,6 @@ async def download_pornhub_video(
                         timeout=120,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        "yt-dlp stdout timed out (attempt %d/%d)",
-                        attempt, MAX_RETRIES,
-                    )
                     process.kill()
                     await process.wait()
                     break
@@ -392,10 +675,6 @@ async def download_pornhub_video(
                     break
 
                 text = line.decode(errors="replace").strip()
-                if not text:
-                    continue
-
-                # پارس progress
                 if progress_cb and "[download]" in text:
                     now = time.time()
                     if now - last_update >= 2.0:
@@ -404,11 +683,11 @@ async def download_pornhub_video(
                         if msg:
                             await progress_cb(msg)
 
-            # خواندن stderr
             stderr_text = ""
             try:
                 stderr_data = await asyncio.wait_for(
-                    process.stderr.read(), timeout=10,
+                    process.stderr.read(),
+                    timeout=10,
                 )
                 stderr_text = stderr_data.decode(errors="replace").strip()
             except asyncio.TimeoutError:
@@ -420,10 +699,6 @@ async def download_pornhub_video(
                 actual_path = _find_output_file(filepath)
                 if actual_path is None:
                     if attempt < MAX_RETRIES:
-                        logger.warning(
-                            "Output file not found (attempt %d/%d)",
-                            attempt, MAX_RETRIES,
-                        )
                         await asyncio.sleep(RETRY_DELAY * attempt)
                         continue
                     return False, "Output file not found", 0
@@ -433,28 +708,22 @@ async def download_pornhub_video(
                     _cleanup_file(actual_path)
                     return False, f"File too small ({size} bytes)", 0
 
-                if size > MAX_DOWNLOAD_SIZE:
-                    _cleanup_file(actual_path)
-                    return False, "File exceeds size limit", 0
-
-                # rename اگه لازمه
                 if actual_path != filepath:
                     try:
                         os.rename(actual_path, filepath)
                     except OSError:
-                        filepath = actual_path
+                        pass
 
-                logger.info(
-                    "Download complete: %s (%s)",
-                    filepath, _format_size(size),
-                )
+                logger.info("yt-dlp download complete: %s", _format_size(size))
                 return True, "", size
 
-            # yt-dlp fail شد - استخراج ارور
             error_msg = _extract_ytdlp_error(stderr_text)
             logger.warning(
                 "yt-dlp failed (attempt %d/%d, code %d): %s",
-                attempt, MAX_RETRIES, process.returncode, error_msg,
+                attempt,
+                MAX_RETRIES,
+                process.returncode,
+                error_msg,
             )
 
             if attempt < MAX_RETRIES:
@@ -465,10 +734,7 @@ async def download_pornhub_video(
             _cleanup_file(filepath)
             raise
         except Exception as e:
-            logger.warning(
-                "Download error (attempt %d/%d): %s",
-                attempt, MAX_RETRIES, e,
-            )
+            error_msg = str(e)[:200]
             if attempt < MAX_RETRIES:
                 _cleanup_file(filepath)
                 await asyncio.sleep(RETRY_DELAY * attempt)
