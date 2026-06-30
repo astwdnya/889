@@ -4,20 +4,18 @@ pornhub_handler.py
 استخراج و دانلود ویدیو از PornHub.com
 
 ویژگی‌ها:
-  - استخراج کیفیت‌های مختلف از صفحه ویدیو
-  - دانلود با yt-dlp (چون PornHub رو خوب ساپورت می‌کنه)
-  - پشتیبانی از M3U8 و MP4 مستقیم
+  - استخراج کیفیت‌های مختلف با yt-dlp --dump-json
+  - دانلود مستقیم با format_id (بدون merge)
+  - پشتیبانی از M3U8 (HLS)
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import time
 from typing import Dict, List, Optional, Tuple
-
-import aiohttp
-from aiohttp import ClientTimeout
 
 logger = logging.getLogger("PornHubHandler")
 
@@ -26,156 +24,161 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# session های در حال انتظار: key = session_id
 pornhub_sessions: Dict[str, dict] = {}
+
+_PH_REFERER = "https://www.pornhub.com/"
 
 
 def is_pornhub_url(url: str) -> bool:
-    """چک می‌کنه که آیا URL از PornHub هست یا نه"""
     return "pornhub.com" in url.lower()
 
 
-async def extract_pornhub_qualities(url: str) -> Tuple[List[dict], str]:
-    """
-    استخراج کیفیت‌های مختلف از صفحه PornHub
-
-    Returns:
-        (qualities, title)
-        qualities: لیست dict با کلیدهای: label, url, method ('ytdlp')
-        title: عنوان ویدیو
-    """
-    headers = {
-        "User-Agent": _USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-
+async def _run_ytdlp_json(url: str) -> Tuple[Optional[dict], Optional[str]]:
+    """اجرای yt-dlp --dump-json و برگردوندن خروجی parse شده"""
     try:
-        timeout = ClientTimeout(total=30, connect=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    return [], f"HTTP {resp.status}"
-                html = await resp.text(errors="replace")
-    except Exception as e:
-        return [], str(e)[:120]
-
-    # عنوان ویدیو از meta tag
-    title = ""
-    title_m = re.search(
-        r'property=["\']og:title["\']\s+content=["\']([^"\']+)',
-        html,
-        re.IGNORECASE,
-    )
-    if not title_m:
-        title_m = re.search(
-            r'content=["\']([^"\']+)["\']\s+property=["\']og:title',
-            html,
-            re.IGNORECASE,
-        )
-    if not title_m:
-        title_m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
-
-    if title_m:
-        title = title_m.group(1).strip()
-        # پاک کردن "- Pornhub.com" از آخر
-        title = re.sub(
-            r"\s*[-|]\s*Pornhub\.com.*$", "", title, flags=re.IGNORECASE
-        ).strip()
-
-    qualities = []
-
-    # PornHub از yt-dlp خوب ساپورت میشه، پس از همون استفاده می‌کنیم
-    # کیفیت‌های مختلف رو به صورت گزینه می‌دیم
-
-    # استخراج duration برای نمایش
-    duration = ""
-    dur_m = re.search(
-        r'property=["\']og:duration["\']\s+content=["\']([^"\']+)',
-        html,
-        re.IGNORECASE,
-    )
-    if not dur_m:
-        dur_m = re.search(
-            r'content=["\']([^"\']+)["\']\s+property=["\']og:duration',
-            html,
-            re.IGNORECASE,
-        )
-    if dur_m:
-        duration = dur_m.group(1).strip()
-
-    # کیفیت‌های استاندارد PornHub
-    quality_options = [
-        {"label": "🎬 Best Quality (yt-dlp)", "format": "best", "method": "ytdlp"},
-        {"label": "📺 1080p (if available)", "format": "1080", "method": "ytdlp"},
-        {"label": "📺 720p (if available)", "format": "720", "method": "ytdlp"},
-        {"label": "📺 480p", "format": "480", "method": "ytdlp"},
-        {"label": "📺 360p", "format": "360", "method": "ytdlp"},
-        {"label": "📺 240p (small size)", "format": "240", "method": "ytdlp"},
-    ]
-
-    for opt in quality_options:
-        qualities.append(
-            {
-                "label": opt["label"] + (f" [{duration}]" if duration else ""),
-                "url": url,  # URL اصلی رو نگه می‌داریم
-                "format": opt["format"],
-                "method": opt["method"],
-            }
-        )
-
-    if not qualities:
-        return [], "No qualities found"
-
-    return qualities, title
-
-
-async def download_pornhub_ytdlp(
-    url: str,
-    quality_format: str,
-    output_folder: str,
-    progress_callback=None,
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    دانلود ویدیو از PornHub با yt-dlp
-
-    Args:
-        url: لینک ویدیو
-        quality_format: کیفیت مورد نظر (best, 1080, 720, 480, 360, 240)
-        output_folder: پوشه ذخیره
-        progress_callback: تابع callback برای نمایش پیشرفت
-
-    Returns:
-        (filepath, error_message)
-    """
-    try:
-        # ساخت format selector بر اساس کیفیت
-        if quality_format == "best":
-            format_selector = "bestvideo+bestaudio/best"
-        else:
-            # مثلاً برای 720: "bestvideo[height<=720]+bestaudio/best[height<=720]"
-            format_selector = f"bestvideo[height<={quality_format}]+bestaudio/best[height<={quality_format}]"
-
-        # نام فایل خروجی
-        output_template = os.path.join(output_folder, "%(title)s_%(height)sp.%(ext)s")
-
-        cmd = [
+        process = await asyncio.create_subprocess_exec(
             "yt-dlp",
-            "--no-check-certificate",
             "--no-warnings",
-            "--format",
-            format_selector,
-            "--merge-output-format",
-            "mp4",
-            "--output",
-            output_template,
+            "--no-check-certificate",
+            "--dump-json",
             "--no-playlist",
             "--user-agent",
             _USER_AGENT,
             url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace")[:200]
+            return None, err
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
+        return data, None
+    except Exception as e:
+        return None, str(e)[:200]
+
+
+async def extract_pornhub_qualities(url: str) -> Tuple[List[dict], str]:
+    """
+    استخراج کیفیت‌های مختلف با yt-dlp --dump-json
+
+    Returns:
+        (qualities, title)
+        qualities: لیست dict با کلیدهای: label, url, format_id, method, height
+        title: عنوان ویدیو
+    """
+    data, error = await _run_ytdlp_json(url)
+    if error or not data:
+        return [], error or "Failed to extract data"
+
+    title = data.get("title", "") or data.get("fulltitle", "") or "PornHub Video"
+    duration = int(data.get("duration", 0))
+    dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else ""
+
+    qualities = []
+    formats = data.get("formats", [])
+
+    if not formats:
+        return [], "No formats found"
+
+    seen_heights = set()
+
+    for fmt in formats:
+        height = fmt.get("height", 0)
+        ext = fmt.get("ext", "mp4")
+        protocol = fmt.get("protocol", "")
+        format_id = fmt.get("format_id", "")
+        vcodec = fmt.get("vcodec", "none")
+        filesize = fmt.get("filesize", 0) or fmt.get("filesize_approx", 0)
+
+        if vcodec == "none":
+            continue
+        if height == 0 and "hls" not in protocol:
+            continue
+        if height in seen_heights and protocol != "m3u8_native":
+            continue
+
+        is_hls = "m3u8" in protocol or "hls" in protocol
+
+        if not is_hls:
+            seen_heights.add(height)
+
+        if height:
+            label = f"{height}p"
+        else:
+            label = format_id
+
+        if is_hls:
+            label += " [HLS]"
+        if filesize:
+            size_mb = filesize / (1024 * 1024)
+            label += f" ({size_mb:.0f}MB)"
+
+        qualities.append(
+            {
+                "label": label,
+                "url": url,
+                "format_id": format_id,
+                "method": "ytdlp",
+                "height": height,
+                "is_hls": is_hls,
+                "ext": ext,
+            }
+        )
+
+    qualities.sort(key=lambda q: (q["is_hls"], -q["height"]))
+
+    if not qualities:
+        return [], "No video formats found"
+
+    return qualities, title
+
+
+async def download_pornhub_video(
+    url: str,
+    format_id: str,
+    output_folder: str,
+    progress_callback=None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    دانلود ویدیو از PornHub با format_id مشخص
+    """
+    session_tag = f"ph_{int(time.time())}"
+    output_path = os.path.join(output_folder, f"{session_tag}_%(title)s.%(ext)s")
+
+    try:
+        cmd = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-check-certificate",
+            "--format",
+            format_id,
+            "--concurrent-fragments",
+            "8",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--add-header",
+            f"Referer:{_PH_REFERER}",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "--merge-output-format",
+            "mp4",
+            "--remux-video",
+            "mp4",
+            "--output",
+            output_path,
+            "--no-playlist",
+            url,
         ]
 
-        logger.info(f"[PORNHUB] Running yt-dlp: {' '.join(cmd[:6])}...")
+        try:
+            cmd += ["--impersonate", "chrome"]
+        except Exception:
+            pass
+
+        logger.info(f"[PORNHUB] Starting download format={format_id}")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -183,82 +186,58 @@ async def download_pornhub_ytdlp(
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        last_progress = 0.0
-        output_lines = []
-
+        last_update = 0.0
         while True:
             line = await process.stdout.readline()
             if not line:
                 break
-
-            line_str = line.decode("utf-8", errors="replace").strip()
-            output_lines.append(line_str)
-
-            # پیدا کردن progress از output yt-dlp
-            if "[download]" in line_str and "%" in line_str:
-                match = re.search(r"(\d+\.?\d*)%", line_str)
+            text = line.decode(errors="replace").strip()
+            now = time.time()
+            if "[download]" in text and "%" in text and now - last_update >= 2.0:
+                last_update = now
+                match = re.search(r"(\d+\.?\d*)%", text)
                 if match and progress_callback:
                     try:
-                        progress = float(match.group(1))
-                        now = time.time()
-                        if now - last_progress >= 2.0:
-                            last_progress = now
-                            await progress_callback(
-                                f"📥 Downloading: {progress:.1f}%\n{line_str[:80]}"
-                            )
+                        pct = float(match.group(1))
+                        await progress_callback(
+                            f"📥 Downloading: {pct:.1f}%\n{text[:80]}"
+                        )
                     except Exception:
                         pass
 
         await process.wait()
 
         if process.returncode != 0:
-            error_output = "\n".join(output_lines[-10:])
-            logger.error(f"[PORNHUB] yt-dlp failed: {error_output}")
-            return None, f"Download failed: {error_output[:200]}"
+            rest = await process.stdout.read()
+            err = rest.decode(errors="replace")[:200]
+            return None, err or "yt-dlp failed"
 
-        # پیدا کردن فایل دانلود شده
-        # yt-dlp معمولاً در آخرین خط می‌گه کجا merge کرده
         downloaded_file = None
-        for line in reversed(output_lines):
-            if "Merging formats into" in line or "has already been downloaded" in line:
-                # استخراج نام فایل
-                match = re.search(r'"([^"]+)"', line)
-                if match:
-                    downloaded_file = match.group(1)
-                    break
-            elif line.startswith("[download] Destination:"):
-                match = re.search(r"\[download\] Destination:\s*(.+)", line)
-                if match:
-                    downloaded_file = match.group(1).strip()
+        for fname in os.listdir(output_folder):
+            if fname.startswith(session_tag):
+                fpath = os.path.join(output_folder, fname)
+                if os.path.isfile(fpath):
+                    downloaded_file = fpath
                     break
 
-        if not downloaded_file or not os.path.exists(downloaded_file):
-            # جستجو در پوشه output
+        if not downloaded_file:
             for fname in os.listdir(output_folder):
                 fpath = os.path.join(output_folder, fname)
                 if os.path.isfile(fpath) and fname.endswith((".mp4", ".mkv", ".webm")):
-                    # چک کنیم که فایل تازه ایجاد شده باشه (کمتر از 2 دقیقه)
                     if time.time() - os.path.getmtime(fpath) < 120:
                         downloaded_file = fpath
                         break
 
-        if not downloaded_file or not os.path.exists(downloaded_file):
+        if not downloaded_file:
             return None, "Downloaded file not found"
 
-        file_size = os.path.getsize(downloaded_file)
-        if file_size < 1024:
-            return None, f"File too small ({file_size} bytes)"
+        size = os.path.getsize(downloaded_file)
+        if size < 1024:
+            return None, f"File too small ({size} bytes)"
 
-        logger.info(
-            f"[PORNHUB] Download complete: {downloaded_file} ({file_size} bytes)"
-        )
+        logger.info(f"[PORNHUB] Done: {downloaded_file} ({size} bytes)")
         return downloaded_file, None
 
     except Exception as e:
-        logger.error(f"[PORNHUB] Download error: {e}", exc_info=True)
+        logger.error(f"[PORNHUB] Error: {e}", exc_info=True)
         return None, str(e)[:200]
-
-
-# Aliases برای سازگاری با ساختار bot
-download_pornhub_direct = download_pornhub_ytdlp
-download_pornhub_m3u8 = download_pornhub_ytdlp
