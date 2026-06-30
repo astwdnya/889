@@ -185,6 +185,12 @@ from otherwebsiteshandler.rule34_handler import (
     extract_rule34_post,
     download_rule34,
 )
+from otherwebsiteshandler.pornhub_handler import (
+    is_pornhub_url as is_pornhub_handler_url,
+    extract_pornhub_qualities,
+    download_pornhub_ytdlp,
+    pornhub_sessions,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -3619,6 +3625,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_pornhub_handler_url(target_url):
+        logger.info(f"[URL] PornHub detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_pornhub_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_xvideos_url(target_url):
         logger.info(f"[URL] XVideos detected | url={target_url[:120]}")
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
@@ -6025,6 +6040,124 @@ async def xnxx_cancel_callback(event):
         pass
 
 
+# ====================== PORNHUB HANDLER ======================
+
+
+async def process_pornhub_request(event, url: str, status_msg):
+    qualities, title = await extract_pornhub_qualities(url)
+    if not qualities:
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
+        return
+    session_id = f"pornhub_{event.chat_id}_{event.id}_{int(time.time())}"
+    pornhub_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو PornHub"
+    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"pornhub_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"pornhub_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def pornhub_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in pornhub_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = pornhub_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "pornhub_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "pornhub_video"
+
+    dl_id = f"pornhub_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    filepath = None
+    try:
+        filepath, error = await download_pornhub_ytdlp(
+            url, chosen["format"], OUTPUT_FOLDER, progress_cb
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not filepath or not os.path.exists(filepath):
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+
+        file_size = os.path.getsize(filepath)
+        ul_id = f"pornhub_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(file_size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[PORNHUB] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def pornhub_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("pornhub_cancel_", "")
+    pornhub_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ====================== RULE34 HANDLER ======================
 
 
@@ -6993,6 +7126,12 @@ async def main():
     )
     client.add_event_handler(
         xnxx_cancel_callback, events.CallbackQuery(pattern=r"xnxx_cancel_.+")
+    )
+    client.add_event_handler(
+        pornhub_quality_callback, events.CallbackQuery(pattern=r"pornhub_q_.+")
+    )
+    client.add_event_handler(
+        pornhub_cancel_callback, events.CallbackQuery(pattern=r"pornhub_cancel_.+")
     )
     client.add_event_handler(
         ytdlp_quality_callback, events.CallbackQuery(pattern=r"ytdlp_q_.+")
