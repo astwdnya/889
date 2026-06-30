@@ -3321,11 +3321,13 @@ async def _forward_share_videos(event, key: str, info: dict):
             pass
 
     try:
+        refresh_link = f"https://t.me/{BOT_USERNAME}?start=share_{key}"
         await event.client.send_message(
             event.sender_id,
             "⏰ ویدیو بعد از ۲۰ ثانیه حذف شد.\n"
             "💾 برای ذخیره، پیام رو به **Saved Messages** فوروارد کنید.",
             parse_mode="markdown",
+            buttons=[[Button.url("📥 دریافت مجدد فیلم‌ها", refresh_link)]],
         )
     except Exception:
         pass
