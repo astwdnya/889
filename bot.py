@@ -188,7 +188,7 @@ from otherwebsiteshandler.rule34_handler import (
 from otherwebsiteshandler.pornhub_handler import (
     is_pornhub_url as is_pornhub_handler_url,
     extract_pornhub_qualities,
-    download_pornhub_ytdlp,
+    download_pornhub_video,
     pornhub_sessions,
 )
 from y2mate import Y2MateSession
@@ -6106,8 +6106,8 @@ async def pornhub_quality_callback(event):
 
     filepath = None
     try:
-        filepath, error = await download_pornhub_ytdlp(
-            url, chosen["format"], OUTPUT_FOLDER, progress_cb
+        filepath, error = await download_pornhub_video(
+            url, chosen["format_id"], OUTPUT_FOLDER, progress_cb
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
