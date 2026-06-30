@@ -6019,12 +6019,12 @@ async def xnxx_inline_handler(event):
         query = event.text.strip() if event.text else ""
         logger.info(f"[INLINE] Query: '{query}' from {event.sender_id}")
 
-        if len(query) < 2:
+        if len(query) < 3:
             await event.answer(
                 [],
-                switch_pm_text="🔍 جستجوی XNXX",
+                switch_pm_text="🔍 حداقل ۳ حرف تایپ کنید",
                 switch_pm_parameter="search",
-                cache_time=INLINE_CACHE_TIME,
+                cache_time=5,
             )
             return
 
@@ -6034,43 +6034,47 @@ async def xnxx_inline_handler(event):
                 [],
                 switch_pm_text="❌ نتیجه‌ای یافت نشد",
                 switch_pm_parameter="search",
-                cache_time=INLINE_CACHE_TIME,
+                cache_time=30,
             )
             return
 
-        articles = []
+        inline_results = []
         builder = event.builder
         for i, video in enumerate(results):
-            title = video.get("title", "Untitled")[:80]
-            duration = video.get("duration", "")
+            title = video.get("title", "Untitled")[:128]
+            url = video.get("url", "")
+            thumb_url = video.get("thumbnail", "")
+            duration = video.get("duration", "?")
+            views = video.get("views", "?")
             quality = video.get("quality", "")
-            views = video.get("views", "")
-            thumb = video.get("thumbnail", "")
 
-            desc_parts = []
-            if duration:
-                desc_parts.append(f"⏱ {duration}")
-            if quality:
-                desc_parts.append(f"🎚 {quality}")
+            description = f"⏱ {duration}"
             if views:
-                desc_parts.append(f"👁 {views}")
-            description = " • ".join(desc_parts) if desc_parts else None
+                description += f" | 👁 {views}"
+            if quality:
+                description += f" | 🎚 {quality}"
 
-            articles.append(
-                builder.article(
-                    title=title,
-                    description=description,
-                    text=video.get("url", ""),
-                    thumb=thumb,
+            if thumb_url:
+                inline_results.append(
+                    builder.photo(
+                        file=thumb_url,
+                        text=url,
+                    )
                 )
-            )
+            else:
+                inline_results.append(
+                    builder.article(
+                        title=title,
+                        description=description,
+                        text=url,
+                    )
+                )
 
         await event.answer(
-            articles,
-            cache_time=INLINE_CACHE_TIME,
-            gallery=False,
+            inline_results,
+            cache_time=300,
         )
-        logger.info(f"[INLINE] Returned {len(articles)} results for '{query}'")
+        logger.info(f"[INLINE] Returned {len(inline_results)} results for '{query}'")
 
     except Exception as e:
         logger.error(f"[INLINE] Error: {e}", exc_info=True)
