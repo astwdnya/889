@@ -32,8 +32,6 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
     DocumentAttributeAudio,
     InputMediaUploadedDocument,
-    InputTextMessageContent,
-    InlineQueryResultArticle,
 )
 from FastTelethon import upload_file as fast_upload_file
 from github import (
@@ -6041,6 +6039,7 @@ async def xnxx_inline_handler(event):
             return
 
         articles = []
+        builder = event.builder
         for i, video in enumerate(results):
             title = video.get("title", "Untitled")[:80]
             duration = video.get("duration", "")
@@ -6058,14 +6057,11 @@ async def xnxx_inline_handler(event):
             description = " • ".join(desc_parts) if desc_parts else None
 
             articles.append(
-                InlineQueryResultArticle(
-                    id=f"xnxx_{video.get('video_id', '')}_{i}",
+                builder.article(
                     title=title,
                     description=description,
-                    thumb_url=thumb,
-                    input_message_content=InputTextMessageContent(
-                        message=video.get("url", ""),
-                    ),
+                    text=video.get("url", ""),
+                    thumb=thumb,
                 )
             )
 
