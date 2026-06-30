@@ -42,6 +42,7 @@ _RESULTS_PER_PAGE = 36
 @dataclass
 class XnxxVideo:
     """یک نتیجه سرچ XNXX."""
+
     title: str
     url: str
     thumbnail: str
@@ -62,14 +63,19 @@ async def search_xnxx(
     query: str,
     page: int = 0,
     limit: int = 20,
+    sort: str = "relevance",
 ) -> List[dict]:
     """
     سرچ ویدیو از XNXX.
 
-    Args:
-        query: عبارت جستجو
-        page: شماره صفحه (از 0 شروع میشه)
-        limit: حداکثر تعداد نتایج
+    sort options:
+      - relevance (default)
+      - uploaddate (جدیدترین)
+      - rating (بهترین امتیاز)
+      - length (طولانی‌ترین)
+      - views (بیشترین بازدید)
+      - hits (پربازدید - path based)
+      - month (ماهانه - path based)
 
     Returns:
         لیست dict با کلیدهای: title, url, thumbnail, duration, views, quality, video_id, source
@@ -80,12 +86,28 @@ async def search_xnxx(
     query = query.strip()
     encoded = quote_plus(query)
 
-    if page == 0:
-        search_url = f"{_BASE_URL}/search/{encoded}"
-    else:
-        search_url = f"{_BASE_URL}/search/{encoded}/{page}"
+    qs_sorts = {"uploaddate", "rating", "length", "views", "relevance"}
+    path_sorts = {"hits", "month"}
 
-    logger.info("Searching XNXX: q='%s' page=%d url=%s", query, page, search_url)
+    if sort in path_sorts:
+        if page == 0:
+            search_url = f"{_BASE_URL}/search/{sort}/{encoded}"
+        else:
+            search_url = f"{_BASE_URL}/search/{sort}/{encoded}/{page}"
+    elif sort in qs_sorts and sort != "relevance":
+        if page == 0:
+            search_url = f"{_BASE_URL}/search/{encoded}?sort={sort}"
+        else:
+            search_url = f"{_BASE_URL}/search/{encoded}/{page}?sort={sort}"
+    else:
+        if page == 0:
+            search_url = f"{_BASE_URL}/search/{encoded}"
+        else:
+            search_url = f"{_BASE_URL}/search/{encoded}/{page}"
+
+    logger.info(
+        "XNXX search: q='%s' page=%d sort=%s url=%s", query, page, sort, search_url
+    )
 
     html = await _fetch_page(search_url)
     if not html:
@@ -96,8 +118,55 @@ async def search_xnxx(
     if limit and len(results) > limit:
         results = results[:limit]
 
-    logger.info("Found %d results for '%s' (page %d)", len(results), query, page)
+    logger.info(
+        "Found %d results for '%s' (page %d, sort %s)", len(results), query, page, sort
+    )
     return [r.to_dict() for r in results]
+
+
+def parse_inline_query(raw_query: str) -> dict:
+    """
+    پارس query اینلاین XNXX.
+
+    فرمت‌ها:
+      step sis          → سرچ عادی، صفحه 0
+      step sis=2        → صفحه 2
+      step sis=new      → جدیدترین‌ها (?sort=uploaddate)
+      step sis=top      → بهترین امتیاز (?sort=rating)
+      step sis=long     → طولانی‌ترین‌ها (?sort=length)
+      step sis=views    → بیشترین بازدید (?sort=views)
+      step sis=month    → ماهانه (path based)
+      step sis=hits     → پربازدید (path based)
+    """
+    raw_query = raw_query.strip()
+
+    result = {"query": raw_query, "page": 0, "sort": "relevance"}
+
+    m = re.match(r"^(.+?)=(\S+)$", raw_query)
+    if not m:
+        return result
+
+    query_part = m.group(1).strip()
+    param = m.group(2).strip().lower()
+
+    result["query"] = query_part
+
+    if param.isdigit():
+        result["page"] = int(param)
+    elif param == "new":
+        result["sort"] = "uploaddate"
+    elif param == "top":
+        result["sort"] = "rating"
+    elif param == "long":
+        result["sort"] = "length"
+    elif param in ("views", "hits"):
+        result["sort"] = param
+    elif param == "month":
+        result["sort"] = "month"
+    elif param == "best":
+        result["sort"] = "rating"
+
+    return result
 
 
 async def search_xnxx_multi_page(
@@ -145,9 +214,7 @@ async def _fetch_page(url: str) -> Optional[str]:
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                url, headers=_HEADERS, allow_redirects=True
-            ) as resp:
+            async with session.get(url, headers=_HEADERS, allow_redirects=True) as resp:
                 if resp.status == 200:
                     return await resp.text(errors="replace")
                 logger.warning("HTTP %d for %s", resp.status, url)
@@ -273,7 +340,7 @@ def _extract_video_entries(html: str) -> List[dict]:
             idx = html.find(f"/video-{video_id}/")
             if idx >= 0:
                 # 500 کاراکتر قبلش رو بگرد
-                search_area = html[max(0, idx - 500):idx + 500]
+                search_area = html[max(0, idx - 500) : idx + 500]
                 ds = re.search(r'data-src="([^"]+xnxx-cdn\.com[^"]+)"', search_area)
                 if ds:
                     entry["thumbnail"] = ds.group(1)
@@ -282,7 +349,7 @@ def _extract_video_entries(html: str) -> List[dict]:
         # بعد از title link، metadata میاد
         title_pos = html.find(f'title="{title}"')
         if title_pos >= 0:
-            meta_area = html[title_pos:title_pos + 500]
+            meta_area = html[title_pos : title_pos + 500]
             meta_m = re.search(
                 r'<p\s+class="metadata">(.*?)</p>',
                 meta_area,
@@ -303,27 +370,27 @@ def _parse_metadata(meta_html: str, entry: dict) -> None:
     فرمت: <span class="right"> 2.6M <span class="icon-f icf-eye"></span>100%</span> 16min - 1080p
     """
     # حذف HTML tags
-    text = re.sub(r'<[^>]+>', ' ', meta_html)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"<[^>]+>", " ", meta_html)
+    text = re.sub(r"\s+", " ", text).strip()
 
     # Views: عدد + M/k قبل از آیکون چشم
-    views_m = re.search(r'([\d.]+[MkK]?)\s', text)
+    views_m = re.search(r"([\d.]+[MkK]?)\s", text)
     if views_m:
         entry["views"] = views_m.group(1).strip()
 
     # Duration: Xmin یا XhYmin
-    dur_m = re.search(r'(\d+\s*h\s*)?(\d+)\s*min', text, re.IGNORECASE)
+    dur_m = re.search(r"(\d+\s*h\s*)?(\d+)\s*min", text, re.IGNORECASE)
     if dur_m:
         hours = dur_m.group(1)
         mins = dur_m.group(2)
         if hours:
-            h = re.search(r'\d+', hours).group()
+            h = re.search(r"\d+", hours).group()
             entry["duration"] = f"{h}h {mins}min"
         else:
             entry["duration"] = f"{mins}min"
 
     # Quality: 720p, 1080p, 4K, etc.
-    qual_m = re.search(r'(\d{3,4}p|[48][kK])', text)
+    qual_m = re.search(r"(\d{3,4}p|[48][kK])", text)
     if qual_m:
         entry["quality"] = qual_m.group(1)
 
@@ -365,10 +432,12 @@ async def _test():
     results = await search_xnxx("japanese step sister", limit=5)
     print(f"\nFound {len(results)} results:\n")
     for i, v in enumerate(results):
-        print(f"  [{i+1}] {v['title'][:70]}")
+        print(f"  [{i + 1}] {v['title'][:70]}")
         print(f"      URL: {v['url'][:80]}")
         print(f"      Thumb: {v['thumbnail'][:80]}")
-        print(f"      Duration: {v['duration']} | Views: {v['views']} | Quality: {v['quality']}")
+        print(
+            f"      Duration: {v['duration']} | Views: {v['views']} | Quality: {v['quality']}"
+        )
         print()
 
 
