@@ -163,6 +163,12 @@ from otherwebsiteshandler.tnaflix_handler import (
     download_tnaflix_direct,
     download_tnaflix_m3u8,
 )
+from otherwebsiteshandler.eporner_handler import (
+    is_eporner_url,
+    extract_eporner_qualities,
+    download_eporner_direct,
+    download_eporner_m3u8,
+)
 from otherwebsiteshandler.pornzog_handler import (
     is_pornzog_url,
     extract_pornzog_qualities,
@@ -1664,6 +1670,7 @@ async def do_download_and_send(
             if gh_url:
                 gh_line = f"\n☁️ [GitHub DL]({gh_url})"
 
+        ul_id = f"ul_{event.chat_id}_{event.id}_{int(time.time())}"
         await send_file_with_progress(
             client=event.client,
             chat_id=event.chat_id,
@@ -1678,11 +1685,18 @@ async def do_download_and_send(
             ),
             status_msg=status_msg,
             supports_streaming=True,
+            ul_id=ul_id,
         )
         try:
             os.remove(filepath)
         except Exception:
             pass
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+        return False
     except Exception as e:
         logger.error(f"Upload error: {e}")
         await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
@@ -3739,6 +3753,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_eporner_url(target_url):
+        logger.info(f"[URL] Eporner detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_eporner_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_pornhub_url(target_url):
         logger.info(
             f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
@@ -4360,6 +4383,7 @@ async def process_y2mate_request(event, url: str, status_msg):
                 except Exception:
                     pass
 
+            ul_id = f"y2m_ul_{event.chat_id}_{event.id}_{int(time.time())}"
             await send_file_with_progress(
                 client=event.client,
                 chat_id=event.chat_id,
@@ -4367,6 +4391,7 @@ async def process_y2mate_request(event, url: str, status_msg):
                 caption=f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({url}){gh_line}",
                 status_msg=status_msg,
                 thumb_filepath=thumb_fp,
+                ul_id=ul_id,
             )
             if thumb_fp and os.path.exists(thumb_fp):
                 try:
@@ -5733,6 +5758,7 @@ async def y2mate_quality_callback(event):
                 except Exception:
                     pass
 
+            ul_id = f"y2mcb_ul_{event.chat_id}_{event.id}_{int(time.time())}"
             sent_msg = await send_file_with_progress(
                 client=event.client,
                 chat_id=event.chat_id,
@@ -5740,6 +5766,7 @@ async def y2mate_quality_callback(event):
                 caption=f"{caption_start}\n📦 {human_readable_size(final_size)}\n🔗 [Source]({source_url}){gh_line}",
                 status_msg=status_msg,
                 thumb_filepath=thumb_fp,
+                ul_id=ul_id,
             )
             # پاک کردن تامبنیل موقت
             if thumb_fp and os.path.exists(thumb_fp):
@@ -5900,15 +5927,24 @@ async def xnxx_quality_callback(event):
     safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "xnxx_video"
     filename = f"{safe_title}_{int(time.time())}.mp4"
     filepath = os.path.join(OUTPUT_FOLDER, filename)
+    dl_id = f"xnxx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
     try:
-        await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
     except Exception:
         pass
     status_msg = await event.get_message()
 
     async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
         try:
-            await status_msg.edit(text, parse_mode="markdown")
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
         except Exception:
             pass
 
@@ -5921,10 +5957,13 @@ async def xnxx_quality_callback(event):
             success, error, size = await download_xnxx_m3u8(
                 chosen["url"], filepath, progress_cb
             )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
         if not success or not os.path.exists(filepath) or size < 1024:
             err_msg = error or "Unknown error"
             await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
             return
+        ul_id = f"xnxx_ul_{event.chat_id}_{event.id}_{int(time.time())}"
         await safe_edit(status_msg, "📤 **در حال آپلود...**")
         caption = (
             f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
@@ -5937,11 +5976,18 @@ async def xnxx_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            ul_id=ul_id,
         )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[XNXX] Error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
+        active_downloads.pop(dl_id, None)
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -6005,15 +6051,24 @@ async def ytdlp_quality_callback(event):
     safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "video"
     filename = f"{safe_title}_{int(time.time())}.mp4"
     filepath = os.path.join(OUTPUT_FOLDER, filename)
+    dl_id = f"ytdlp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
     try:
-        await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
     except Exception:
         pass
     status_msg = await event.get_message()
 
     async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
         try:
-            await status_msg.edit(text, parse_mode="markdown")
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
         except Exception:
             pass
 
@@ -6021,10 +6076,13 @@ async def ytdlp_quality_callback(event):
         success, error, size = await download_with_ytdlp(
             entry["url"], chosen["format_id"], filepath, progress_cb
         )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
         if not success or not os.path.exists(filepath) or size < 1024:
             err_msg = error or "Unknown error"
             await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
             return
+        ul_id = f"ytdlp_ul_{event.chat_id}_{event.id}_{int(time.time())}"
         await safe_edit(status_msg, "📤 **در حال آپلود...**")
         caption = (
             f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
@@ -6037,11 +6095,18 @@ async def ytdlp_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            ul_id=ul_id,
         )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[YTDLP] Error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
+        active_downloads.pop(dl_id, None)
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -6115,17 +6180,25 @@ def _make_site_handler(
         )
         filename = f"{safe_title}_{int(time.time())}.mp4"
         filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+        dl_id = f"{prefix}_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+        active_downloads[dl_id] = {"paused": False, "cancelled": False}
+        cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
         try:
             await event.edit(
-                f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None
+                f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+                buttons=cancel_btn,
             )
         except Exception:
             pass
         status_msg = await event.get_message()
 
         async def progress_cb(text):
+            if active_downloads.get(dl_id, {}).get("cancelled"):
+                raise asyncio.CancelledError("Download cancelled by user")
             try:
-                await status_msg.edit(text, parse_mode="markdown")
+                await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
             except Exception:
                 pass
 
@@ -6138,10 +6211,13 @@ def _make_site_handler(
                 success, error, size = await download_m3u8_fn(
                     chosen["url"], filepath, progress_cb
                 )
+            if active_downloads.get(dl_id, {}).get("cancelled"):
+                raise asyncio.CancelledError("Download cancelled by user")
             if not success or not os.path.exists(filepath) or size < 1024:
                 err_msg = error or "Unknown error"
                 await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
                 return
+            ul_id = f"{prefix}_ul_{event.chat_id}_{event.id}_{int(time.time())}"
             await safe_edit(status_msg, "📤 **در حال آپلود...**")
             caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
             await send_file_with_progress(
@@ -6152,11 +6228,18 @@ def _make_site_handler(
                 status_msg=status_msg,
                 buttons=None,
                 supports_streaming=True,
+                ul_id=ul_id,
             )
+        except asyncio.CancelledError:
+            try:
+                await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"[{display_name}] Error: {e}", exc_info=True)
             await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
         finally:
+            active_downloads.pop(dl_id, None)
             try:
                 if os.path.exists(filepath):
                     os.remove(filepath)
@@ -6364,6 +6447,21 @@ tnaflix_sessions: dict = {}
     "Tnaflix",
 )
 
+eporner_sessions: dict = {}
+
+(
+    process_eporner_request,
+    eporner_quality_callback,
+    eporner_cancel_callback,
+) = _make_site_handler(
+    "ep",
+    extract_eporner_qualities,
+    download_eporner_direct,
+    download_eporner_m3u8,
+    eporner_sessions,
+    "Eporner",
+)
+
 pornzog_sessions: dict = {}
 
 
@@ -6462,15 +6560,24 @@ async def youporn_quality_callback(event):
     safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "YouPorn_video"
     filename = f"{safe_title}_{int(time.time())}.mp4"
     filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"yp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
     try:
-        await event.edit(f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=None)
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}", buttons=cancel_btn
+        )
     except Exception:
         pass
     status_msg = await event.get_message()
 
     async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
         try:
-            await status_msg.edit(text, parse_mode="markdown")
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
         except Exception:
             pass
 
@@ -6481,11 +6588,14 @@ async def youporn_quality_callback(event):
             progress_cb,
             format_id=chosen.get("format_id"),
         )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
         if not success or not os.path.exists(filepath) or size < 1024:
             await safe_edit(
                 status_msg, f"❌ دانلود ناموفق: `{error or 'Unknown error'}`"
             )
             return
+        ul_id = f"yp_ul_{event.chat_id}_{event.id}_{int(time.time())}"
         await safe_edit(status_msg, "📤 **در حال آپلود...**")
         caption = (
             f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
@@ -6498,11 +6608,18 @@ async def youporn_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            ul_id=ul_id,
         )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[YouPorn] Error: {e}", exc_info=True)
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
+        active_downloads.pop(dl_id, None)
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -6732,6 +6849,12 @@ async def main():
     )
     client.add_event_handler(
         tnaflix_cancel_callback, events.CallbackQuery(pattern=r"tf_cancel_.+")
+    )
+    client.add_event_handler(
+        eporner_quality_callback, events.CallbackQuery(pattern=r"ep_q_.+")
+    )
+    client.add_event_handler(
+        eporner_cancel_callback, events.CallbackQuery(pattern=r"ep_cancel_.+")
     )
     client.add_event_handler(
         pornzog_quality_callback, events.CallbackQuery(pattern=r"pz_q_.+")
