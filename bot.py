@@ -27,11 +27,14 @@ from playwright.async_api import async_playwright
 
 from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
+from telethon.tl import types as tl_types
 from telethon.tl.types import (
     Message,
     DocumentAttributeVideo,
     DocumentAttributeAudio,
     InputMediaUploadedDocument,
+    InputWebDocument,
+    DocumentAttributeImageSize,
 )
 from FastTelethon import upload_file as fast_upload_file
 from github import (
@@ -6054,21 +6057,34 @@ async def xnxx_inline_handler(event):
             if quality:
                 description += f" | 🎚 {quality}"
 
+            message_text = (
+                f"🎬 **{title}**\n\n"
+                f"⏱ Duration: {duration}\n"
+                f"👁 Views: {views}\n"
+                f"🎚 Quality: {quality}\n\n"
+                f"🔗 {url}"
+            )
+
+            thumb = None
             if thumb_url:
-                inline_results.append(
-                    builder.photo(
-                        file=thumb_url,
-                        text=url,
-                    )
+                thumb = InputWebDocument(
+                    url=thumb_url,
+                    size=0,
+                    mime_type="image/jpeg",
+                    attributes=[DocumentAttributeImageSize(w=320, h=180)],
                 )
-            else:
-                inline_results.append(
-                    builder.article(
-                        title=title,
-                        description=description,
-                        text=url,
-                    )
+
+            inline_results.append(
+                builder.article(
+                    title=title,
+                    description=description,
+                    url=url,
+                    thumb=thumb,
+                    text=message_text,
+                    parse_mode="md",
+                    id=str(i),
                 )
+            )
 
         await event.answer(
             inline_results,
