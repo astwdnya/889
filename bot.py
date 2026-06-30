@@ -6104,19 +6104,18 @@ async def pornhub_quality_callback(event):
         except Exception:
             pass
 
-    filepath = None
+    filepath = os.path.join(OUTPUT_FOLDER, f"ph_{safe_title}_{int(time.time())}.mp4")
     try:
-        filepath, error = await download_pornhub_video(
-            url, chosen["format_id"], OUTPUT_FOLDER, progress_cb
+        success, error, file_size = await download_pornhub_video(
+            url, chosen["format_id"], filepath, progress_cb
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
-        if not filepath or not os.path.exists(filepath):
+        if not success:
             err_msg = error or "Unknown error"
             await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
             return
 
-        file_size = os.path.getsize(filepath)
         ul_id = f"pornhub_ul_{event.chat_id}_{event.id}_{int(time.time())}"
         await safe_edit(status_msg, "📤 **در حال آپلود...**")
         caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(file_size)}"
