@@ -55,6 +55,7 @@ from xnxx_handler import (
 )
 from searcher.xnxx_search import search_xnxx, parse_inline_query
 from searcher.pornhub_search import search_pornhub
+from searcher.xvideos_search import search_xvideos
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -6403,28 +6404,34 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        # تشخیص منبع: ph:xxx → PornHub, بقیه → XNXX
+        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, بقیه → XNXX
         is_ph = raw.lower().startswith("ph:")
+        is_xv = raw.lower().startswith("xv:")
         if is_ph:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
             ph_sort = PH_SORT_MAP.get(parsed["sort"], "")
+        elif is_xv:
+            inner = raw[3:].strip()
+            parsed = parse_inline_query(inner)
         else:
             parsed = parse_inline_query(raw)
-            ph_sort = ""
 
         query = parsed["query"]
         page = parsed["page"]
         sort = parsed["sort"]
 
-        logger.info(
-            f"[INLINE] {'PH' if is_ph else 'XNXX'}: q='{query}' page={page} sort={sort}"
-        )
+        source = "XV" if is_xv else ("PH" if is_ph else "XNXX")
+        logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
         if is_ph:
             ph_page = max(1, page) if page > 0 else 1
             results = await search_pornhub(
                 query, page=ph_page, limit=INLINE_RESULTS_LIMIT, sort=ph_sort
+            )
+        elif is_xv:
+            results = await search_xvideos(
+                query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
             )
         else:
             results = await search_xnxx(
@@ -6453,6 +6460,10 @@ async def xnxx_inline_handler(event):
                 quality = video.get("rating", "")
                 hd_tag = " 📺 HD" if video.get("hd") else ""
                 source_tag = "PH"
+            elif is_xv:
+                quality = video.get("quality", "")
+                hd_tag = ""
+                source_tag = "XV"
             else:
                 quality = video.get("quality", "")
                 hd_tag = ""
