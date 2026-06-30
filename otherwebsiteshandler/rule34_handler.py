@@ -47,13 +47,15 @@ _PAHEAL_API = "https://rule34.paheal.net/api/danbooru/find_posts"
 _PAHEAL_BASE = "https://rule34.paheal.net"
 
 # دامنه‌های مجاز
-_ALLOWED_HOSTS = frozenset({
-    "rule34.xxx",
-    "www.rule34.xxx",
-    "rule34.paheal.net",
-    "rule34.us",
-    "www.rule34.us",
-})
+_ALLOWED_HOSTS = frozenset(
+    {
+        "rule34.xxx",
+        "www.rule34.xxx",
+        "rule34.paheal.net",
+        "rule34.us",
+        "www.rule34.us",
+    }
+)
 
 _ALLOWED_CDN_SUFFIXES = (
     ".paheal-cdn.net",
@@ -117,7 +119,9 @@ def _is_allowed_cdn(url: str) -> bool:
     """بررسی CDN مجاز."""
     try:
         host = urlparse(url).hostname or ""
-        return any(host.endswith(s) or host == s.lstrip(".") for s in _ALLOWED_CDN_SUFFIXES)
+        return any(
+            host.endswith(s) or host == s.lstrip(".") for s in _ALLOWED_CDN_SUFFIXES
+        )
     except Exception:
         return False
 
@@ -170,8 +174,16 @@ def _detect_media_type(file_url: str) -> str:
 def _make_title(tags: str, post_id: str) -> str:
     """ساخت عنوان از tags."""
     skip = {
-        "animated", "video", "sound", "tagme", "webm", "mp4",
-        "gif", "loop", "has_audio", "no_audio",
+        "animated",
+        "video",
+        "sound",
+        "tagme",
+        "webm",
+        "mp4",
+        "gif",
+        "loop",
+        "has_audio",
+        "no_audio",
     }
     parts = [t for t in tags.split() if t.lower() not in skip]
     if parts:
@@ -187,9 +199,7 @@ async def _fetch(url: str, timeout_sec: int = 15) -> Optional[str]:
     timeout = ClientTimeout(total=timeout_sec, connect=10)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                url, headers=_HEADERS, allow_redirects=True
-            ) as resp:
+            async with session.get(url, headers=_HEADERS, allow_redirects=True) as resp:
                 if resp.status == 200:
                     return await resp.text(errors="replace")
                 logger.warning("HTTP %d for %s", resp.status, url)
@@ -212,8 +222,6 @@ async def extract_rule34_post(
 
     Returns:
         (post_dict, error_message)
-        post_dict keys: file_url, preview_url, tags, title,
-                        media_type, post_id, width, height, score
     """
     if not is_rule34_url(url):
         return None, "Invalid URL"
@@ -222,50 +230,237 @@ async def extract_rule34_post(
     if not post_id:
         return None, "Could not extract post ID from URL"
 
+    host = urlparse(url).hostname or ""
+
     if debug_cb:
         await debug_cb(f"🔍 Fetching post #{post_id}...")
 
-    # ── روش 1: paheal.net صفحه پست ──
-    logger.info("Fetching rule34 post #%d via paheal", post_id)
-    post_url = f"{_PAHEAL_BASE}/post/view/{post_id}"
-    html = await _fetch(post_url)
-
-    if html:
-        post = _parse_paheal_post_page(html, post_id)
+    if "rule34.xxx" in host:
+        post = await _extract_from_rule34xxx(post_id, debug_cb)
         if post:
-            if debug_cb:
-                await debug_cb(f"✅ Found: {post['media_type']} | {post['title'][:50]}")
             return post, ""
 
-    # ── روش 2: paheal API با tags از URL ──
-    tags = _extract_tags(url)
-    if tags:
         if debug_cb:
-            await debug_cb(f"🔍 Searching API with tags: {tags}")
-        api_url = f"{_PAHEAL_API}?tags={quote_plus(tags)}&limit=100"
-        xml_text = await _fetch(api_url)
-        if xml_text:
-            posts = _parse_paheal_api(xml_text)
-            # پیدا کردن post با ID مورد نظر
-            for p in posts:
-                if str(p.get("post_id")) == str(post_id):
-                    if debug_cb:
-                        await debug_cb(f"✅ Found via API: {p['media_type']}")
-                    return p, ""
-
-    # ── روش 3: rule34.us ──
-    if debug_cb:
-        await debug_cb("🔍 Trying rule34.us...")
-    r34us_url = f"https://rule34.us/index.php?r=posts/view&id={post_id}"
-    html = await _fetch(r34us_url)
-    if html:
-        post = _parse_rule34us_post(html, post_id)
+            await debug_cb("🔍 Trying rule34.us...")
+        post = await _extract_from_rule34us(post_id, debug_cb)
         if post:
-            if debug_cb:
-                await debug_cb(f"✅ Found via rule34.us: {post['media_type']}")
             return post, ""
+
+    elif "paheal" in host:
+        post = await _extract_from_paheal(post_id, debug_cb)
+        if post:
+            return post, ""
+
+    elif "rule34.us" in host:
+        post = await _extract_from_rule34us(post_id, debug_cb)
+        if post:
+            return post, ""
+
+    else:
+        for method in [
+            _extract_from_rule34xxx,
+            _extract_from_rule34us,
+            _extract_from_paheal,
+        ]:
+            post = await method(post_id, debug_cb)
+            if post:
+                return post, ""
 
     return None, f"Could not find post #{post_id}"
+
+
+async def _extract_from_rule34xxx(
+    post_id: int,
+    debug_cb: Optional[ProgressCallback] = None,
+) -> Optional[dict]:
+    """استخراج از rule34.xxx با curl_cffi (bypass Cloudflare)."""
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        logger.warning("curl_cffi not installed, skipping rule34.xxx")
+        return None
+
+    page_url = f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}"
+
+    if debug_cb:
+        await debug_cb("🔍 Fetching from rule34.xxx (curl_cffi)...")
+
+    try:
+        async with AsyncSession() as session:
+            try:
+                await session.get(
+                    "https://rule34.xxx/",
+                    impersonate="chrome",
+                    timeout=15,
+                )
+            except Exception:
+                pass
+
+            resp = await session.get(
+                page_url,
+                impersonate="chrome",
+                headers={
+                    "Referer": "https://rule34.xxx/",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+
+            if resp.status_code != 200:
+                logger.info("rule34.xxx returned HTTP %d", resp.status_code)
+                return None
+
+            html = resp.text
+            return _parse_rule34xxx_page(html, post_id)
+
+    except Exception as e:
+        logger.warning("rule34.xxx extraction failed: %s", e)
+        return None
+
+
+def _parse_rule34xxx_page(html: str, post_id: int) -> Optional[dict]:
+    """پارس صفحه پست rule34.xxx."""
+    file_url = None
+
+    m = re.search(r'<source[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if m:
+        file_url = m.group(1)
+
+    if not file_url:
+        m = re.search(
+            r'<img[^>]+id=["\']image["\'][^>]+src=["\']([^"\']+)["\']',
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            file_url = m.group(1)
+
+    if not file_url:
+        m = re.search(
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>\s*Original\s*(?:image|file)',
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            file_url = m.group(1)
+
+    if not file_url:
+        m = re.search(
+            r'<a[^>]+id=["\']highres["\'][^>]+href=["\']([^"\']+)["\']',
+            html,
+            re.IGNORECASE,
+        )
+        if not m:
+            m = re.search(
+                r'href=["\']([^"\']+)["\'][^>]+id=["\']highres["\']',
+                html,
+                re.IGNORECASE,
+            )
+        if m:
+            file_url = m.group(1)
+
+    if not file_url:
+        m = re.search(
+            r'["\']([^"\']*(?:rule34|r34|wimg)[^"\']*\.(?:mp4|webm|gif|jpg|png)[^"\']*)["\']',
+            html,
+        )
+        if m:
+            file_url = m.group(1)
+
+    if not file_url:
+        logger.info("No file URL found in rule34.xxx page for #%d", post_id)
+        return None
+
+    if file_url.startswith("//"):
+        file_url = "https:" + file_url
+    elif file_url.startswith("/"):
+        file_url = "https://rule34.xxx" + file_url
+
+    tags = ""
+    tag_section = re.search(
+        r'id=["\']tag-sidebar["\'][^>]*>(.*?)</ul>', html, re.DOTALL | re.IGNORECASE
+    )
+    if tag_section:
+        tag_matches = re.findall(
+            r'class=["\'][^"\']*tag-type[^"\']*["\'][^>]*>.*?<a[^>]*>([^<]+)</a>',
+            tag_section.group(1),
+            re.DOTALL,
+        )
+        if tag_matches:
+            tags = " ".join(t.strip() for t in tag_matches)
+
+    if not tags:
+        tag_matches = re.findall(
+            r'href=["\'][^"\']*[?&]tags=([^"\'&]+)["\']',
+            html,
+        )
+        if tag_matches:
+            unique_tags = list(dict.fromkeys(tag_matches))
+            tags = " ".join(t.replace("+", " ") for t in unique_tags[:20])
+
+    media_type = _detect_media_type(file_url)
+    title = _make_title(tags, str(post_id))
+
+    preview = ""
+    pm = re.search(
+        r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        html,
+        re.IGNORECASE,
+    )
+    if not pm:
+        pm = re.search(
+            r'content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            html,
+            re.IGNORECASE,
+        )
+    if pm:
+        preview = pm.group(1)
+
+    return {
+        "file_url": file_url,
+        "preview_url": preview,
+        "tags": tags,
+        "title": title,
+        "media_type": media_type,
+        "post_id": str(post_id),
+        "post_url": f"https://rule34.xxx/index.php?page=post&s=view&id={post_id}",
+        "width": 0,
+        "height": 0,
+        "score": "0",
+    }
+
+
+async def _extract_from_paheal(
+    post_id: int,
+    debug_cb: Optional[ProgressCallback] = None,
+) -> Optional[dict]:
+    """استخراج از paheal.net."""
+    if debug_cb:
+        await debug_cb("🔍 Trying paheal.net...")
+
+    post_url = f"{_PAHEAL_BASE}/post/view/{post_id}"
+    html = await _fetch(post_url)
+    if not html:
+        return None
+
+    return _parse_paheal_post_page(html, post_id)
+
+
+async def _extract_from_rule34us(
+    post_id: int,
+    debug_cb: Optional[ProgressCallback] = None,
+) -> Optional[dict]:
+    """استخراج از rule34.us."""
+    if debug_cb:
+        await debug_cb("🔍 Trying rule34.us...")
+
+    r34us_url = f"https://rule34.us/index.php?r=posts/view&id={post_id}"
+    html = await _fetch(r34us_url)
+    if not html:
+        return None
+
+    return _parse_rule34us_post(html, post_id)
 
 
 # ─── Parsers ───────────────────────────────────────────────
@@ -279,7 +474,8 @@ def _parse_paheal_post_page(html: str, post_id: int) -> Optional[dict]:
     # الگو 1: لینک File/Download
     m = re.search(
         r"href=['\"]([^'\"]+)['\"][^>]*>\s*(?:File|Download|Original)",
-        html, re.IGNORECASE,
+        html,
+        re.IGNORECASE,
     )
     if m:
         file_url = m.group(1)
@@ -294,7 +490,8 @@ def _parse_paheal_post_page(html: str, post_id: int) -> Optional[dict]:
     if not file_url:
         m = re.search(
             r"<img[^>]+id=['\"]main_image['\"][^>]+src=['\"]([^'\"]+)['\"]",
-            html, re.IGNORECASE,
+            html,
+            re.IGNORECASE,
         )
         if m:
             file_url = m.group(1)
@@ -322,7 +519,9 @@ def _parse_paheal_post_page(html: str, post_id: int) -> Optional[dict]:
 
     # preview
     preview = ""
-    pm = re.search(r"<img[^>]+id=['\"]thumb['\"][^>]+src=['\"]([^'\"]+)['\"]", html, re.IGNORECASE)
+    pm = re.search(
+        r"<img[^>]+id=['\"]thumb['\"][^>]+src=['\"]([^'\"]+)['\"]", html, re.IGNORECASE
+    )
     if pm:
         preview = pm.group(1)
 
@@ -370,18 +569,20 @@ def _parse_paheal_api(xml_text: str) -> List[dict]:
             except (ValueError, TypeError):
                 width, height = 0, 0
 
-            posts.append({
-                "file_url": file_url,
-                "preview_url": elem.get("preview_url", ""),
-                "tags": tags,
-                "title": _make_title(tags, post_id),
-                "media_type": media_type,
-                "post_id": post_id,
-                "post_url": f"{_PAHEAL_BASE}/post/view/{post_id}",
-                "width": width,
-                "height": height,
-                "score": elem.get("score", "0"),
-            })
+            posts.append(
+                {
+                    "file_url": file_url,
+                    "preview_url": elem.get("preview_url", ""),
+                    "tags": tags,
+                    "title": _make_title(tags, post_id),
+                    "media_type": media_type,
+                    "post_id": post_id,
+                    "post_url": f"{_PAHEAL_BASE}/post/view/{post_id}",
+                    "width": width,
+                    "height": height,
+                    "score": elem.get("score", "0"),
+                }
+            )
     else:
         # regex fallback
         for m in re.finditer(r"<tag\s+([^>]+?)/?>", xml_text, re.DOTALL):
@@ -397,18 +598,20 @@ def _parse_paheal_api(xml_text: str) -> List[dict]:
             post_id = attrs.get("id", "")
             media_type = _detect_media_type(file_url)
 
-            posts.append({
-                "file_url": file_url,
-                "preview_url": attrs.get("preview_url", ""),
-                "tags": tags,
-                "title": _make_title(tags, post_id),
-                "media_type": media_type,
-                "post_id": post_id,
-                "post_url": f"{_PAHEAL_BASE}/post/view/{post_id}",
-                "width": int(attrs.get("width", 0)),
-                "height": int(attrs.get("height", 0)),
-                "score": attrs.get("score", "0"),
-            })
+            posts.append(
+                {
+                    "file_url": file_url,
+                    "preview_url": attrs.get("preview_url", ""),
+                    "tags": tags,
+                    "title": _make_title(tags, post_id),
+                    "media_type": media_type,
+                    "post_id": post_id,
+                    "post_url": f"{_PAHEAL_BASE}/post/view/{post_id}",
+                    "width": int(attrs.get("width", 0)),
+                    "height": int(attrs.get("height", 0)),
+                    "score": attrs.get("score", "0"),
+                }
+            )
 
     return posts
 
@@ -426,14 +629,18 @@ def _parse_rule34us_post(html: str, post_id: int) -> Optional[dict]:
     if not file_url:
         m = re.search(
             r"<img[^>]+(?:id=['\"](?:image|content_image)['\"]|class=['\"][^'\"]*content[^'\"]*['\"])[^>]+src=['\"]([^'\"]+)['\"]",
-            html, re.IGNORECASE,
+            html,
+            re.IGNORECASE,
         )
         if m:
             file_url = m.group(1)
 
     # any rule34.us media URL
     if not file_url:
-        m = re.search(r"['\"]([^'\"]*rule34\.us[^'\"]*\.(?:mp4|webm|gif|jpg|png)[^'\"]*)['\"]", html)
+        m = re.search(
+            r"['\"]([^'\"]*rule34\.us[^'\"]*\.(?:mp4|webm|gif|jpg|png)[^'\"]*)['\"]",
+            html,
+        )
         if m:
             file_url = m.group(1)
 
@@ -442,7 +649,11 @@ def _parse_rule34us_post(html: str, post_id: int) -> Optional[dict]:
 
     # tags
     tag_matches = re.findall(r"class=['\"][^'\"]*tag[^'\"]*['\"][^>]*>([^<]+)<", html)
-    tags = " ".join(t.strip() for t in tag_matches if len(t.strip()) > 1) if tag_matches else ""
+    tags = (
+        " ".join(t.strip() for t in tag_matches if len(t.strip()) > 1)
+        if tag_matches
+        else ""
+    )
 
     media_type = _detect_media_type(file_url)
     title = _make_title(tags, str(post_id))
@@ -494,7 +705,11 @@ async def download_rule34(
 
                     content_length = int(resp.headers.get("Content-Length", 0))
                     if content_length > MAX_DOWNLOAD_SIZE:
-                        return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                        return (
+                            False,
+                            f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                            0,
+                        )
 
                     downloaded = 0
                     start_time = time.time()
@@ -513,7 +728,9 @@ async def download_rule34(
                             if now - last_update >= PROGRESS_INTERVAL:
                                 last_update = now
                                 await progress_cb(
-                                    _format_progress(downloaded, content_length, start_time, now)
+                                    _format_progress(
+                                        downloaded, content_length, start_time, now
+                                    )
                                 )
 
                     size = os.path.getsize(filepath)
