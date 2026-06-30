@@ -47,12 +47,14 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2.0
 
 # دامنه‌های مجاز
-_ALLOWED_HOSTS = frozenset({
-    "xvideos.com",
-    "www.xvideos.com",
-    "xvideos2.com",
-    "www.xvideos2.com",
-})
+_ALLOWED_HOSTS = frozenset(
+    {
+        "xvideos.com",
+        "www.xvideos.com",
+        "xvideos2.com",
+        "www.xvideos2.com",
+    }
+)
 
 _ALLOWED_HOST_SUFFIXES = (
     ".xvideos.com",
@@ -76,9 +78,8 @@ def _is_allowed_host(url: str) -> bool:
     """بررسی اینکه URL به دامنه‌های مجاز اشاره میکنه."""
     try:
         host = urlparse(url).hostname or ""
-        return (
-            host in _ALLOWED_HOSTS
-            or any(host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES)
+        return host in _ALLOWED_HOSTS or any(
+            host.endswith(s) for s in _ALLOWED_HOST_SUFFIXES
         )
     except Exception:
         return False
@@ -101,7 +102,8 @@ def cleanup_expired_sessions() -> int:
     """پاکسازی session های منقضی شده."""
     now = time.time()
     expired = [
-        sid for sid, data in xvideos_sessions.items()
+        sid
+        for sid, data in xvideos_sessions.items()
         if now - data.get("created_at", 0) > SESSION_TTL
     ]
     for sid in expired:
@@ -210,7 +212,10 @@ async def _fetch_with_retry(
             last_error = str(e)[:120]
             logger.warning(
                 "Attempt %d/%d failed for %s: %s",
-                attempt, max_retries, url, last_error,
+                attempt,
+                max_retries,
+                url,
+                last_error,
             )
 
         if attempt < max_retries:
@@ -304,11 +309,13 @@ def _extract_direct_mp4(html: str, qualities: List[dict]) -> None:
         if any(q["url"] == video_url for q in qualities):
             continue
 
-        qualities.append({
-            "label": label,
-            "url": video_url,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": video_url,
+                "method": "direct",
+            }
+        )
 
 
 async def _extract_m3u8_streams(html: str, qualities: List[dict]) -> None:
@@ -331,9 +338,7 @@ async def _extract_m3u8_streams(html: str, qualities: List[dict]) -> None:
                 continue
 
             if not _is_allowed_host(m3u8_url):
-                logger.warning(
-                    "Blocked M3U8 URL with disallowed host: %s", m3u8_url
-                )
+                logger.warning("Blocked M3U8 URL with disallowed host: %s", m3u8_url)
                 continue
 
             if any(q["url"] == m3u8_url for q in qualities):
@@ -345,11 +350,13 @@ async def _extract_m3u8_streams(html: str, qualities: List[dict]) -> None:
                     if not any(q["url"] == sq["url"] for q in qualities):
                         qualities.append(sq)
             else:
-                qualities.append({
-                    "label": "📡 M3U8 Stream",
-                    "url": m3u8_url,
-                    "method": "m3u8",
-                })
+                qualities.append(
+                    {
+                        "label": "📡 M3U8 Stream",
+                        "url": m3u8_url,
+                        "method": "m3u8",
+                    }
+                )
 
 
 async def _parse_m3u8_variants(master_url: str) -> List[dict]:
@@ -383,9 +390,7 @@ async def _parse_m3u8_variants(master_url: str) -> List[dict]:
             stream_uri = base_url + stream_uri
 
         if not _is_allowed_host(stream_uri):
-            logger.warning(
-                "Blocked M3U8 variant with disallowed host: %s", stream_uri
-            )
+            logger.warning("Blocked M3U8 variant with disallowed host: %s", stream_uri)
             continue
 
         res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
@@ -400,11 +405,13 @@ async def _parse_m3u8_variants(master_url: str) -> List[dict]:
         else:
             label = "📡 M3U8 Stream"
 
-        results.append({
-            "label": label,
-            "url": stream_uri,
-            "method": "m3u8",
-        })
+        results.append(
+            {
+                "label": label,
+                "url": stream_uri,
+                "method": "m3u8",
+            }
+        )
 
     return results
 
@@ -419,6 +426,7 @@ async def download_xvideos_direct(
 ) -> Tuple[bool, str, int]:
     """
     دانلود لینک مستقیم MP4.
+    اول multi-segment، بعد aiohttp.
 
     Returns:
         (success, error_message, file_size)
@@ -426,6 +434,17 @@ async def download_xvideos_direct(
     if not _is_allowed_host(url):
         return False, "URL host not allowed", 0
 
+    # ── روش 1: دانلود چند تیکه‌ای (سریع‌ترین) ──
+    logger.info("Download attempt 1: multi-segment (8 connections)")
+    success, error, size = await _download_multi_segment(
+        url, filepath, progress_cb, num_segments=8
+    )
+    if success:
+        return True, "", size
+    logger.info("Multi-segment failed: %s", error)
+    _cleanup_file(filepath)
+
+    # ── روش 2: aioHTTP تک connection ──
     headers = {
         **_DEFAULT_HEADERS,
         "Referer": "https://www.xvideos.com/",
@@ -451,7 +470,9 @@ async def download_xvideos_direct(
             error = str(e)[:150]
             logger.warning(
                 "Download attempt %d/%d failed: %s",
-                attempt, MAX_RETRIES, error,
+                attempt,
+                MAX_RETRIES,
+                error,
             )
 
         if attempt < MAX_RETRIES:
@@ -460,6 +481,183 @@ async def download_xvideos_direct(
 
     _cleanup_file(filepath)
     return False, f"Failed after {MAX_RETRIES} attempts: {error}", 0
+
+
+# ─── Download: Multi-segment (fast) ────────────────────────
+
+
+async def _download_multi_segment(
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+    num_segments: int = 8,
+) -> Tuple[bool, str, int]:
+    """
+    دانلود چند تیکه‌ای با چند connection همزمان با aiohttp.
+    هر تیکه یه Range request جدا میزنه → سرعت N برابر.
+    """
+    try:
+        timeout = ClientTimeout(total=30, connect=15)
+        async with _get_session(timeout) as session:
+            async with session.head(
+                url,
+                headers={"Referer": "https://www.xvideos.com/"},
+                allow_redirects=True,
+            ) as resp:
+                if resp.status != 200:
+                    return False, f"HEAD failed: HTTP {resp.status}", 0
+
+                content_length = int(resp.headers.get("Content-Length", 0))
+                accept_ranges = resp.headers.get("Accept-Ranges", "")
+
+                if content_length == 0:
+                    return False, "Cannot determine file size", 0
+
+                if content_length > MAX_DOWNLOAD_SIZE:
+                    return (
+                        False,
+                        (f"File too large: {content_length / 1024 / 1024:.0f} MB"),
+                        0,
+                    )
+
+                if accept_ranges.lower() != "bytes":
+                    logger.info("Server doesn't support Range requests, falling back")
+                    return False, "Range not supported", 0
+
+        total_mb = content_length / 1024 / 1024
+        await progress_cb(
+            f"📥 **دانلود چند تیکه‌ای ({num_segments} بخش)...**\n"
+            f"💾 حجم: {total_mb:.1f} MB"
+        )
+
+        segment_size = content_length // num_segments
+        segments = []
+        for i in range(num_segments):
+            start = i * segment_size
+            end = (
+                content_length - 1
+                if i == num_segments - 1
+                else (i + 1) * segment_size - 1
+            )
+            segments.append((i, start, end))
+
+        segment_files = [f"{filepath}.part{i}" for i in range(num_segments)]
+        downloaded_bytes = [0] * num_segments
+        start_time = time.time()
+        last_update = [0.0]
+        lock = asyncio.Lock()
+
+        async def _download_segment(seg_idx: int, byte_start: int, byte_end: int):
+            seg_file = segment_files[seg_idx]
+            for attempt in range(MAX_RETRIES):
+                try:
+                    seg_timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
+                    async with _get_session(seg_timeout) as session:
+                        headers = {
+                            "Referer": "https://www.xvideos.com/",
+                            "Range": f"bytes={byte_start}-{byte_end}",
+                        }
+                        async with session.get(
+                            url, headers=headers, allow_redirects=True
+                        ) as resp:
+                            if resp.status not in (200, 206):
+                                raise Exception(f"HTTP {resp.status}")
+
+                            async with aiofiles.open(seg_file, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(
+                                    1024 * 1024
+                                ):
+                                    if not chunk:
+                                        continue
+                                    await f.write(chunk)
+                                    downloaded_bytes[seg_idx] += len(chunk)
+
+                                    now = time.time()
+                                    async with lock:
+                                        if now - last_update[0] >= 2.0:
+                                            last_update[0] = now
+                                            total_dl = sum(downloaded_bytes)
+                                            await progress_cb(
+                                                _format_progress(
+                                                    total_dl,
+                                                    content_length,
+                                                    start_time,
+                                                    now,
+                                                )
+                                            )
+                        return
+
+                except asyncio.CancelledError:
+                    _cleanup_file(seg_file)
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "Segment %d attempt %d failed: %s",
+                        seg_idx,
+                        attempt + 1,
+                        e,
+                    )
+                    _cleanup_file(seg_file)
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(2.0 * (attempt + 1))
+
+            raise Exception(f"Segment {seg_idx} failed after {MAX_RETRIES} attempts")
+
+        try:
+            await asyncio.gather(
+                *[_download_segment(idx, start, end) for idx, start, end in segments]
+            )
+        except Exception as e:
+            for sf in segment_files:
+                _cleanup_file(sf)
+            return False, str(e)[:200], 0
+
+        await progress_cb("🔗 **ترکیب بخش‌ها...**")
+        try:
+            async with aiofiles.open(filepath, "wb") as outfile:
+                for sf in segment_files:
+                    if not os.path.exists(sf):
+                        raise FileNotFoundError(f"Missing segment: {sf}")
+                    async with aiofiles.open(sf, "rb") as infile:
+                        while True:
+                            chunk = await infile.read(4 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            await outfile.write(chunk)
+        finally:
+            for sf in segment_files:
+                _cleanup_file(sf)
+
+        if not os.path.exists(filepath):
+            return False, "Merged file not created", 0
+
+        final_size = os.path.getsize(filepath)
+        if final_size == 0:
+            _cleanup_file(filepath)
+            return False, "Merged file is empty", 0
+
+        if abs(final_size - content_length) > 1024:
+            logger.warning(
+                "Size mismatch: expected %d, got %d",
+                content_length,
+                final_size,
+            )
+
+        elapsed = time.time() - start_time
+        avg_speed = final_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+        logger.info(
+            "Multi-segment download complete: %.1f MB in %.1fs (%.1f MB/s)",
+            final_size / 1024 / 1024,
+            elapsed,
+            avg_speed,
+        )
+
+        return True, "", final_size
+
+    except Exception as e:
+        logger.warning("Multi-segment download error: %s", e)
+        _cleanup_file(filepath)
+        return False, str(e)[:200], 0
 
 
 async def _do_direct_download(
@@ -537,12 +735,17 @@ async def download_xvideos_m3u8(
             "--quiet",
             "--progress",
             "--newline",
-            "-f", "best",
+            "-f",
+            "best",
             "--hls-prefer-native",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", "Referer:https://www.xvideos.com/",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "-o", filepath,
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            "Referer:https://www.xvideos.com/",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "-o",
+            filepath,
             m3u8_url,
         ]
 
@@ -555,9 +758,7 @@ async def download_xvideos_m3u8(
         last_update = 0.0
         while True:
             try:
-                line = await asyncio.wait_for(
-                    process.stdout.readline(), timeout=120
-                )
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=120)
             except asyncio.TimeoutError:
                 logger.warning("yt-dlp stdout read timed out, killing process")
                 process.kill()

@@ -341,6 +341,190 @@ async def extract_sexvid_qualities(url: str) -> Tuple[List[dict], str]:
 
 # ─── Download ───────────────────────────────────────────────
 
+# ─── Download: Multi-segment (fast) ────────────────────────
+
+
+async def _download_multi_segment(
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+    num_segments: int = 8,
+) -> Tuple[bool, str, int]:
+    """
+    دانلود چند تیکه‌ای با چند connection همزمان.
+    هر تیکه یه Range request جدا میزنه → سرعت N برابر.
+    """
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        return False, "curl_cffi not installed", 0
+
+    try:
+        async with AsyncSession() as session:
+            head_resp = await session.head(
+                url,
+                impersonate="chrome",
+                headers={"Referer": _SITE_REFERER},
+                allow_redirects=True,
+                timeout=15,
+            )
+
+            content_length = int(head_resp.headers.get("Content-Length", 0))
+            accept_ranges = head_resp.headers.get("Accept-Ranges", "")
+
+            if content_length == 0:
+                return False, "Cannot determine file size", 0
+
+            if content_length > MAX_DOWNLOAD_SIZE:
+                return (
+                    False,
+                    (f"File too large: {content_length / 1024 / 1024:.0f} MB"),
+                    0,
+                )
+
+            if accept_ranges.lower() != "bytes":
+                logger.info("Server doesn't support Range requests, falling back")
+                return False, "Range not supported", 0
+
+        total_mb = content_length / 1024 / 1024
+        await progress_cb(
+            f"📥 **دانلود چند تیکه‌ای ({num_segments} بخش)...**\n"
+            f"💾 حجم: {total_mb:.1f} MB"
+        )
+
+        segment_size = content_length // num_segments
+        segments = []
+        for i in range(num_segments):
+            start = i * segment_size
+            end = (
+                content_length - 1
+                if i == num_segments - 1
+                else (i + 1) * segment_size - 1
+            )
+            segments.append((i, start, end))
+
+        segment_files = [f"{filepath}.part{i}" for i in range(num_segments)]
+        downloaded_bytes = [0] * num_segments
+        start_time = time.time()
+        last_update = [0.0]
+        lock = asyncio.Lock()
+
+        async def _download_segment(seg_idx: int, byte_start: int, byte_end: int):
+            seg_file = segment_files[seg_idx]
+            for attempt in range(MAX_RETRIES):
+                try:
+                    async with AsyncSession() as session:
+                        resp = await session.get(
+                            url,
+                            impersonate="chrome",
+                            headers={
+                                "Referer": _SITE_REFERER,
+                                "Range": f"bytes={byte_start}-{byte_end}",
+                                "Accept": "*/*",
+                                "Accept-Language": "en-US,en;q=0.9",
+                            },
+                            allow_redirects=True,
+                            timeout=300,
+                            stream=True,
+                        )
+
+                        if resp.status_code not in (200, 206):
+                            raise Exception(f"HTTP {resp.status_code}")
+
+                        async with aiofiles.open(seg_file, "wb") as f:
+                            async for chunk in resp.aiter_content():
+                                if not chunk:
+                                    continue
+                                await f.write(chunk)
+                                downloaded_bytes[seg_idx] += len(chunk)
+
+                                now = time.time()
+                                async with lock:
+                                    if now - last_update[0] >= 2.0:
+                                        last_update[0] = now
+                                        total_dl = sum(downloaded_bytes)
+                                        await progress_cb(
+                                            _format_progress(
+                                                total_dl,
+                                                content_length,
+                                                start_time,
+                                                now,
+                                            )
+                                        )
+                        return
+
+                except asyncio.CancelledError:
+                    _cleanup_file(seg_file)
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "Segment %d attempt %d failed: %s",
+                        seg_idx,
+                        attempt + 1,
+                        e,
+                    )
+                    _cleanup_file(seg_file)
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(2.0 * (attempt + 1))
+
+            raise Exception(f"Segment {seg_idx} failed after {MAX_RETRIES} attempts")
+
+        try:
+            await asyncio.gather(
+                *[_download_segment(idx, start, end) for idx, start, end in segments]
+            )
+        except Exception as e:
+            for sf in segment_files:
+                _cleanup_file(sf)
+            return False, str(e)[:200], 0
+
+        await progress_cb("🔗 **ترکیب بخش‌ها...**")
+        try:
+            async with aiofiles.open(filepath, "wb") as outfile:
+                for sf in segment_files:
+                    if not os.path.exists(sf):
+                        raise FileNotFoundError(f"Missing segment: {sf}")
+                    async with aiofiles.open(sf, "rb") as infile:
+                        while True:
+                            chunk = await infile.read(4 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            await outfile.write(chunk)
+        finally:
+            for sf in segment_files:
+                _cleanup_file(sf)
+
+        if not os.path.exists(filepath):
+            return False, "Merged file not created", 0
+
+        final_size = os.path.getsize(filepath)
+        if final_size == 0:
+            _cleanup_file(filepath)
+            return False, "Merged file is empty", 0
+
+        if abs(final_size - content_length) > 1024:
+            logger.warning(
+                "Size mismatch: expected %d, got %d",
+                content_length,
+                final_size,
+            )
+
+        elapsed = time.time() - start_time
+        avg_speed = final_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+        logger.info(
+            "Multi-segment download complete: %.1f MB in %.1fs (%.1f MB/s)",
+            final_size / 1024 / 1024,
+            elapsed,
+            avg_speed,
+        )
+
+        return True, "", final_size
+
+    except Exception as e:
+        logger.warning("Multi-segment download error: %s", e)
+        _cleanup_file(filepath)
+        return False, str(e)[:200], 0
+
 
 async def _download_with_curl_cffi(
     url: str,
@@ -492,10 +676,25 @@ async def download_sexvid_direct(
     filepath: str,
     progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
-    """دانلود لینک مستقیم MP4 از sexvid.xxx."""
+    """دانلود لینک مستقیم MP4 از sexvid.xxx.
+
+    اول multi-segment، بعد curl_cffi، آخر aiohttp.
+    """
     if not _is_allowed_host(url):
         return False, "URL host not allowed", 0
 
+    # ── روش 1: دانلود چند تیکه‌ای (سریع‌ترین) ──
+    if _check_impersonation_support():
+        logger.info("Download attempt 1: multi-segment (8 connections)")
+        success, error, size = await _download_multi_segment(
+            url, filepath, progress_cb, num_segments=8
+        )
+        if success:
+            return True, "", size
+        logger.info("Multi-segment failed: %s", error)
+        _cleanup_file(filepath)
+
+    # ── روش 2: curl_cffi ──
     if _check_impersonation_support():
         logger.info("Trying download with curl_cffi: %s", url[:80])
         success, error, size = await _download_with_curl_cffi(
@@ -506,6 +705,7 @@ async def download_sexvid_direct(
         logger.info("curl_cffi download failed: %s", error)
         _cleanup_file(filepath)
 
+    # ── روش 3: aiohttp ──
     logger.info("Trying download with aiohttp: %s", url[:80])
     success, error, size = await _download_with_aiohttp(url, filepath, progress_cb)
     if success:
