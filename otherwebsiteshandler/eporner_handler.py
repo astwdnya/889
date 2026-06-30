@@ -99,9 +99,8 @@ def _is_allowed_host(url: str) -> bool:
     """بررسی اینکه URL به دامنه‌های مجاز اشاره میکنه."""
     try:
         host = urlparse(url).hostname or ""
-        return (
-            host in _ALLOWED_HOSTS
-            or any(host.endswith(s) for s in _ALLOWED_CDN_SUFFIXES)
+        return host in _ALLOWED_HOSTS or any(
+            host.endswith(s) for s in _ALLOWED_CDN_SUFFIXES
         )
     except Exception:
         return False
@@ -182,6 +181,7 @@ def _check_impersonation_support() -> bool:
     """بررسی اینکه curl_cffi نصبه."""
     try:
         import curl_cffi  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -211,9 +211,7 @@ async def _get_session(timeout: Optional[ClientTimeout] = None):
     """ساخت aiohttp session."""
     t = timeout or ClientTimeout(total=30, connect=10)
     jar = aiohttp.CookieJar(unsafe=True)
-    session = aiohttp.ClientSession(
-        timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar
-    )
+    session = aiohttp.ClientSession(timeout=t, headers=_DEFAULT_HEADERS, cookie_jar=jar)
     try:
         yield session
     finally:
@@ -246,7 +244,10 @@ async def _fetch_with_retry(
             last_error = str(e)[:200]
             logger.warning(
                 "Attempt %d/%d failed for %s: %s",
-                attempt, max_retries, url, last_error,
+                attempt,
+                max_retries,
+                url,
+                last_error,
             )
         if attempt < max_retries:
             await asyncio.sleep(RETRY_DELAY * attempt)
@@ -352,11 +353,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             ext = data.get("ext", "mp4")
             height = data.get("height")
             label = f"🎥 {ext.upper()} {height}p" if height else f"🎥 {ext.upper()}"
-            qualities.append({
-                "label": label,
-                "url": direct_url,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": direct_url,
+                    "method": "direct",
+                }
+            )
         return qualities
 
     for fmt in formats:
@@ -376,9 +379,7 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
             continue
 
         is_m3u8 = (
-            protocol in ("m3u8", "m3u8_native")
-            or ".m3u8" in fmt_url
-            or ext == "m3u8"
+            protocol in ("m3u8", "m3u8_native") or ".m3u8" in fmt_url or ext == "m3u8"
         )
 
         size_str = f" ({filesize / 1024 / 1024:.0f}MB)" if filesize else ""
@@ -395,11 +396,13 @@ def _parse_ytdlp_formats(data: dict) -> List[dict]:
         else:
             label = f"🎥 {ext.upper()}{size_str}"
 
-        qualities.append({
-            "label": label,
-            "url": fmt_url,
-            "method": "m3u8" if is_m3u8 else "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": fmt_url,
+                "method": "m3u8" if is_m3u8 else "direct",
+            }
+        )
 
     return qualities
 
@@ -481,19 +484,23 @@ def _extract_title(html: str) -> str:
     """استخراج عنوان ویدیو."""
     m = re.search(
         r'(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
-        html, re.IGNORECASE,
+        html,
+        re.IGNORECASE,
     )
     if not m:
         m = re.search(
             r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']',
-            html, re.IGNORECASE,
+            html,
+            re.IGNORECASE,
         )
     if m:
         title = m.group(1).strip()
         # حذف " - EPORNER" از آخر
         title = re.sub(r"\s*-\s*EPORNER\s*$", "", title, flags=re.IGNORECASE)
         # decode HTML entities
-        title = title.replace("&#039;", "'").replace("&amp;", "&").replace("&quot;", '"')
+        title = (
+            title.replace("&#039;", "'").replace("&amp;", "&").replace("&quot;", '"')
+        )
         return title
 
     m = re.search(r"<title>([^<]+)</title>", html, re.IGNORECASE)
@@ -546,18 +553,21 @@ def _extract_dload_links(html: str, page_url: str, qualities: List[dict]) -> Non
         if any(q["url"] == full_url for q in qualities):
             continue
 
-        qualities.append({
-            "label": label,
-            "url": full_url,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": label,
+                "url": full_url,
+                "method": "direct",
+            }
+        )
 
 
 def _extract_json_ld(html: str, page_url: str, qualities: List[dict]) -> None:
     """استخراج از JSON-LD."""
     for m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
+        html,
+        re.DOTALL | re.IGNORECASE,
     ):
         try:
             data = json.loads(m.group(1))
@@ -578,11 +588,13 @@ def _extract_json_ld(html: str, page_url: str, qualities: List[dict]) -> None:
         if any(q["url"] == video_url for q in qualities):
             continue
 
-        qualities.append({
-            "label": "🎥 MP4 (original)",
-            "url": video_url,
-            "method": "direct",
-        })
+        qualities.append(
+            {
+                "label": "🎥 MP4 (original)",
+                "url": video_url,
+                "method": "direct",
+            }
+        )
 
 
 def _extract_video_tag(html: str, page_url: str, qualities: List[dict]) -> None:
@@ -596,9 +608,7 @@ def _extract_video_tag(html: str, page_url: str, qualities: List[dict]) -> None:
         logger.debug("Found data-vid: %s", vid_path)
 
 
-async def _extract_from_xhr_api(
-    video_id: str, hash_val: str
-) -> List[dict]:
+async def _extract_from_xhr_api(video_id: str, hash_val: str) -> List[dict]:
     """
     استخراج از XHR API.
     endpoint: /xhr/video/{id}?hash={hash}
@@ -643,11 +653,13 @@ async def _extract_from_xhr_api(
             if any(q["url"] == src for q in qualities):
                 continue
 
-            qualities.append({
-                "label": label,
-                "url": src,
-                "method": "direct",
-            })
+            qualities.append(
+                {
+                    "label": label,
+                    "url": src,
+                    "method": "direct",
+                }
+            )
 
     except Exception as e:
         logger.debug("XHR API extraction failed: %s", e)
@@ -740,7 +752,11 @@ async def _download_multi_segment(
                 return False, "Cannot determine file size", 0
 
             if content_length > MAX_DOWNLOAD_SIZE:
-                return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                return (
+                    False,
+                    f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                    0,
+                )
 
             if accept_ranges.lower() != "bytes":
                 logger.info("Server doesn't support Range requests")
@@ -756,7 +772,11 @@ async def _download_multi_segment(
         segments = []
         for i in range(num_segments):
             start = i * segment_size
-            end = content_length - 1 if i == num_segments - 1 else (i + 1) * segment_size - 1
+            end = (
+                content_length - 1
+                if i == num_segments - 1
+                else (i + 1) * segment_size - 1
+            )
             segments.append((i, start, end))
 
         segment_files = [f"{filepath}.part{i}" for i in range(num_segments)]
@@ -799,7 +819,12 @@ async def _download_multi_segment(
                                         last_update[0] = now
                                         total_dl = sum(downloaded_bytes)
                                         await progress_cb(
-                                            _format_progress(total_dl, content_length, start_time, now)
+                                            _format_progress(
+                                                total_dl,
+                                                content_length,
+                                                start_time,
+                                                now,
+                                            )
                                         )
                         return
 
@@ -807,7 +832,9 @@ async def _download_multi_segment(
                     _cleanup_file(seg_file)
                     raise
                 except Exception as e:
-                    logger.warning("Segment %d attempt %d failed: %s", seg_idx, attempt + 1, e)
+                    logger.warning(
+                        "Segment %d attempt %d failed: %s", seg_idx, attempt + 1, e
+                    )
                     _cleanup_file(seg_file)
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(RETRY_DELAY * (attempt + 1))
@@ -851,7 +878,9 @@ async def _download_multi_segment(
         avg_speed = final_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
         logger.info(
             "Multi-segment download: %.1f MB in %.1fs (%.1f MB/s)",
-            final_size / 1024 / 1024, elapsed, avg_speed,
+            final_size / 1024 / 1024,
+            elapsed,
+            avg_speed,
         )
 
         return True, "", final_size
@@ -893,7 +922,11 @@ async def _download_with_curl_cffi(
 
             content_length = int(resp.headers.get("Content-Length", 0))
             if content_length > MAX_DOWNLOAD_SIZE:
-                return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                return (
+                    False,
+                    f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                    0,
+                )
 
             downloaded = 0
             start_time = time.time()
@@ -914,7 +947,9 @@ async def _download_with_curl_cffi(
                     if now - last_update >= PROGRESS_INTERVAL:
                         last_update = now
                         await progress_cb(
-                            _format_progress(downloaded, content_length, start_time, now)
+                            _format_progress(
+                                downloaded, content_length, start_time, now
+                            )
                         )
 
         if not os.path.exists(filepath):
@@ -946,26 +981,40 @@ async def _download_with_ytdlp(
     try:
         cmd = [
             "yt-dlp",
-            "--no-warnings", "--progress", "--newline",
+            "--no-warnings",
+            "--progress",
+            "--newline",
             "--no-check-certificates",
-            "-f", "best",
-            "--concurrent-fragments", "16",
-            "--retries", "10",
-            "--fragment-retries", "10",
-            "--buffer-size", "16K",
-            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
-            "--add-header", f"Referer:{referer}",
-            "--add-header", f"User-Agent:{_USER_AGENT}",
-            "-o", filepath,
+            "-f",
+            "best",
+            "--concurrent-fragments",
+            "16",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--buffer-size",
+            "16K",
+            "--max-filesize",
+            str(MAX_DOWNLOAD_SIZE),
+            "--add-header",
+            f"Referer:{referer}",
+            "--add-header",
+            f"User-Agent:{_USER_AGENT}",
+            "-o",
+            filepath,
         ]
 
         if has_aria2c:
-            cmd.extend([
-                "--downloader", "aria2c",
-                "--downloader-args",
-                "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
-                "--min-split-size=1M --console-log-level=warn",
-            ])
+            cmd.extend(
+                [
+                    "--downloader",
+                    "aria2c",
+                    "--downloader-args",
+                    "aria2c:-x16 -s16 -k1M --max-connection-per-server=16 "
+                    "--min-split-size=1M --console-log-level=warn",
+                ]
+            )
 
         if _check_impersonation_support():
             cmd.extend(["--impersonate", "chrome"])
@@ -1048,7 +1097,11 @@ async def _download_with_aiohttp(
                     else:
                         content_length = int(resp.headers.get("Content-Length", 0))
                         if content_length > MAX_DOWNLOAD_SIZE:
-                            return False, f"File too large: {content_length / 1024 / 1024:.0f} MB", 0
+                            return (
+                                False,
+                                f"File too large: {content_length / 1024 / 1024:.0f} MB",
+                                0,
+                            )
 
                         downloaded = 0
                         start_time = time.time()
@@ -1067,7 +1120,9 @@ async def _download_with_aiohttp(
                                 if now - last_update >= PROGRESS_INTERVAL:
                                     last_update = now
                                     await progress_cb(
-                                        _format_progress(downloaded, content_length, start_time, now)
+                                        _format_progress(
+                                            downloaded, content_length, start_time, now
+                                        )
                                     )
 
                         size = os.path.getsize(filepath)
@@ -1118,7 +1173,7 @@ async def download_eporner_direct(
     if _check_impersonation_support():
         logger.info("Download attempt 1: multi-segment")
         success, error, size = await _download_multi_segment(
-            url, filepath, referer, progress_cb, num_segments=8
+            url, filepath, referer, progress_cb, num_segments=16
         )
         if success:
             return True, "", size
