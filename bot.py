@@ -54,6 +54,7 @@ from xnxx_handler import (
     xnxx_sessions,
 )
 from searcher.xnxx_search import search_xnxx, parse_inline_query
+from searcher.pornhub_search import search_pornhub
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -6114,6 +6115,9 @@ INLINE_CACHE_TIME = 60
 INLINE_RESULTS_LIMIT = 20
 
 
+PH_SORT_MAP = {"new": "mr", "top": "tr", "long": "lg", "best": "tr", "views": "tr"}
+
+
 async def xnxx_inline_handler(event):
     try:
         raw = event.text.strip() if event.text else ""
@@ -6128,16 +6132,34 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        parsed = parse_inline_query(raw)
+        # تشخیص منبع: ph:xxx → PornHub, بقیه → XNXX
+        is_ph = raw.lower().startswith("ph:")
+        if is_ph:
+            inner = raw[3:].strip()
+            parsed = parse_inline_query(inner)
+            ph_sort = PH_SORT_MAP.get(parsed["sort"], "")
+        else:
+            parsed = parse_inline_query(raw)
+            ph_sort = ""
+
         query = parsed["query"]
         page = parsed["page"]
         sort = parsed["sort"]
 
-        logger.info(f"[INLINE] Parsed: q='{query}' page={page} sort={sort}")
-
-        results = await search_xnxx(
-            query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+        logger.info(
+            f"[INLINE] {'PH' if is_ph else 'XNXX'}: q='{query}' page={page} sort={sort}"
         )
+
+        if is_ph:
+            ph_page = max(1, page) if page > 0 else 1
+            results = await search_pornhub(
+                query, page=ph_page, limit=INLINE_RESULTS_LIMIT, sort=ph_sort
+            )
+        else:
+            results = await search_xnxx(
+                query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+            )
+
         if not results:
             await event.answer(
                 [],
@@ -6155,19 +6177,30 @@ async def xnxx_inline_handler(event):
             thumb_url = video.get("thumbnail", "")
             duration = video.get("duration", "?")
             views = video.get("views", "?")
-            quality = video.get("quality", "")
+
+            if is_ph:
+                quality = video.get("rating", "")
+                hd_tag = " 📺 HD" if video.get("hd") else ""
+                source_tag = "PH"
+            else:
+                quality = video.get("quality", "")
+                hd_tag = ""
+                source_tag = "XNXX"
 
             description = f"⏱ {duration}"
             if views:
                 description += f" | 👁 {views}"
             if quality:
                 description += f" | 🎚 {quality}"
+            if hd_tag:
+                description += hd_tag
 
             message_text = (
                 f"🎬 **{title}**\n\n"
                 f"⏱ Duration: {duration}\n"
                 f"👁 Views: {views}\n"
-                f"🎚 Quality: {quality}\n\n"
+                f"🎚 Quality: {quality}\n"
+                f"📌 Source: {source_tag}\n\n"
                 f"🔗 {url}"
             )
 
@@ -6196,7 +6229,9 @@ async def xnxx_inline_handler(event):
             inline_results,
             cache_time=300,
         )
-        logger.info(f"[INLINE] Returned {len(inline_results)} results for '{query}'")
+        logger.info(
+            f"[INLINE] {'PH' if is_ph else 'XNXX'}: {len(inline_results)} results for '{query}'"
+        )
 
     except Exception as e:
         logger.error(f"[INLINE] Error: {e}", exc_info=True)
