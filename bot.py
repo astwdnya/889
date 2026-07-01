@@ -243,8 +243,8 @@ video_send_timers: Dict[str, asyncio.Task] = {}
 # اشتراک‌گذاری ویدیو با لینک (جهت کاربرای غیرمجاز)
 share_links: Dict[str, dict] = {}
 BOT_USERNAME: str = ""
-SPONSOR_CHAT_ID: str = ""  # آیدی کانال/گروه اسپانسر (مثلاً @channel یا -100123)
-SPONSOR_LINK: str = ""  # لینک دعوت اسپانسر
+sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
+pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
 
 # نگه‌داری ویدیوهایی که منتظر فایل زیرنویس هستن
 subtitle_sessions: Dict[int, Dict] = {}  # key: chat_id
@@ -2671,27 +2671,32 @@ async def admin_input_handler(event):
     action = admin_pending_add.pop(event.sender_id)
     raw = event.raw_text.strip()
 
-    if action == "sponsor_set":
-        global SPONSOR_CHAT_ID, SPONSOR_LINK
-        txt = raw
-        # تشخیص لینک دعوت
-        if txt.startswith("https://t.me/+"):
-            SPONSOR_LINK = txt
-            SPONSOR_CHAT_ID = txt
-        elif txt.startswith("https://t.me/joinchat/"):
-            SPONSOR_LINK = txt
-            SPONSOR_CHAT_ID = txt
-        elif txt.startswith("-100"):
-            SPONSOR_CHAT_ID = txt
-            SPONSOR_LINK = txt
-        elif txt.startswith("@"):
-            SPONSOR_CHAT_ID = txt
-            SPONSOR_LINK = txt
-        else:
-            SPONSOR_CHAT_ID = txt
-            SPONSOR_LINK = txt
+    if action == "sponsor_set_name":
+        # مرحله ۱: ذخیره اسم و درخواست لینک
+        pending_sponsor_name[event.sender_id] = raw
+        admin_pending_add[event.sender_id] = "sponsor_set_link"
         await event.reply(
-            f"✅ **Sponsor set!**\n📢 `{SPONSOR_CHAT_ID}`",
+            f"✅ اسم `{raw}` ذخیره شد.\nحالا لینک دعوت یا آیدی کانال رو بفرست:\n"
+            "مثلاً:\n"
+            "`https://t.me/joinchat/xxx`\n"
+            "یا `@channel_id`\n"
+            "یا `-1001234567890`",
+            parse_mode="markdown",
+        )
+        raise events.StopPropagation
+
+    if action == "sponsor_set_link":
+        # مرحله ۲: ذخیره لینک و ساخت اسپانسر
+        name = pending_sponsor_name.pop(event.sender_id, "Unknown")
+        txt = raw
+        link = txt
+        chat_id = txt
+        if txt.startswith("https://t.me/+") or txt.startswith("https://t.me/joinchat/"):
+            chat_id = txt
+            link = txt
+        sponsors.append({"name": name, "chat_id": chat_id, "link": link})
+        await event.reply(
+            f"✅ **اسپانسر اضافه شد!**\n📢 `{name}` — `{chat_id}`",
             parse_mode="markdown",
         )
         raise events.StopPropagation
@@ -3140,18 +3145,23 @@ async def admin_cmd(event):
     if event.sender_id != ADMIN_ID:
         return await event.reply("⛔ Unauthorized")
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
-    sponsor_status = f"✅ `{SPONSOR_CHAT_ID}`" if SPONSOR_CHAT_ID else "❌ Not set"
+    sponsor_count = len(sponsors)
+    sponsor_lines = (
+        "\n".join([f"• {s['name']}" for s in sponsors])
+        if sponsors
+        else "❌ No sponsors"
+    )
     await event.reply(
         f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\n"
-        f"**Sponsor:** {sponsor_status}\n"
+        f"**Sponsors ({sponsor_count}):**\n{sponsor_lines}\n"
         f"Choose an action:",
         parse_mode="markdown",
         buttons=[
             [Button.inline("➕ Add User", "admin_add")],
             [Button.inline("➖ Remove User", "admin_remove")],
             [Button.inline("🔄 Refresh List", "admin_refresh")],
-            [Button.inline("📢 Set Sponsor", "admin_sponsor_set")],
-            [Button.inline("🚫 Remove Sponsor", "admin_sponsor_remove")],
+            [Button.inline("📢 Add Sponsor", "admin_sponsor_add")],
+            [Button.inline("🚫 Remove Sponsor", "admin_sponsor_rmlist")],
         ],
     )
 
@@ -3186,20 +3196,25 @@ async def admin_refresh_callback(event):
     if event.sender_id != ADMIN_ID:
         return await event.answer("Unauthorized", alert=True)
     users_list = "\n".join([f"• `{uid}`" for uid in sorted(AUTHORIZED_USERS)])
-    sponsor_status = f"✅ `{SPONSOR_CHAT_ID}`" if SPONSOR_CHAT_ID else "❌ Not set"
+    sponsor_count = len(sponsors)
+    sponsor_lines = (
+        "\n".join([f"• {s['name']}" for s in sponsors])
+        if sponsors
+        else "❌ No sponsors"
+    )
     await event.answer("✅ Refreshed", alert=False)
     try:
         await event.edit(
             f"👑 **Admin Panel**\n\n**Authorized Users ({len(AUTHORIZED_USERS)}):**\n{users_list}\n\n"
-            f"**Sponsor:** {sponsor_status}\n"
+            f"**Sponsors ({sponsor_count}):**\n{sponsor_lines}\n"
             f"Choose an action:",
             parse_mode="markdown",
             buttons=[
                 [Button.inline("➕ Add User", "admin_add")],
                 [Button.inline("➖ Remove User", "admin_remove")],
                 [Button.inline("🔄 Refresh List", "admin_refresh")],
-                [Button.inline("📢 Set Sponsor", "admin_sponsor_set")],
-                [Button.inline("🚫 Remove Sponsor", "admin_sponsor_remove")],
+                [Button.inline("📢 Add Sponsor", "admin_sponsor_add")],
+                [Button.inline("🚫 Remove Sponsor", "admin_sponsor_rmlist")],
             ],
         )
     except Exception:
@@ -3220,39 +3235,60 @@ async def admin_cancel_callback(event):
 # ====================== SPONSOR HANDLERS ======================
 
 
-async def admin_sponsor_set_callback(event):
+async def admin_sponsor_add_callback(event):
+    """مرحله ۱: گرفتن اسم کانال اسپانسر"""
     if event.sender_id != ADMIN_ID:
         return await event.answer("Unauthorized", alert=True)
-    admin_pending_add[event.sender_id] = "sponsor_set"
+    admin_pending_add[event.sender_id] = "sponsor_set_name"
     await event.answer("", alert=False)
     await event.client.send_message(
         event.chat_id,
-        "📢 لینک دعوت یا آیدی کانال/گروه اسپانسر رو بفرست:\n"
-        "مثلاً:\n"
-        "`@my_channel`\n"
-        "یا\n"
-        "`https://t.me/joinchat/xxx`\n"
-        "یا\n"
-        "`-1001234567890`",
+        "📢 اسم کانال اسپانسر رو بفرست:\nمثلاً: `کانال اول`",
         parse_mode="markdown",
         buttons=[[Button.inline("❌ Cancel", "admin_cancel")]],
     )
 
 
-async def admin_sponsor_remove_callback(event):
-    global SPONSOR_CHAT_ID, SPONSOR_LINK
+async def admin_sponsor_rmlist_callback(event):
+    """نمایش لیست اسپانسرها برای حذف"""
     if event.sender_id != ADMIN_ID:
         return await event.answer("Unauthorized", alert=True)
-    SPONSOR_CHAT_ID = ""
-    SPONSOR_LINK = ""
-    await event.answer("✅ Sponsor removed", alert=False)
-    await event.edit("🚫 **Sponsor removed.**", buttons=None)
+    if not sponsors:
+        await event.answer("❌ هیچ اسپانسری تنظیم نشده.", alert=True)
+        return
+    buttons = []
+    for i, s in enumerate(sponsors):
+        buttons.append([Button.inline(f"❌ {s['name']}", f"admin_sponsor_rm_{i}")])
+    buttons.append([Button.inline("🔙 برگشت", "admin_refresh")])
+    await event.answer("", alert=False)
+    try:
+        await event.edit(
+            "🚫 **روی اسپانسر مورد نظر کلیک کنید تا حذف شود:**",
+            buttons=buttons,
+        )
+    except Exception:
+        pass
+
+
+async def admin_sponsor_rm_callback(event):
+    """حذف یک اسپانسر خاص"""
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Unauthorized", alert=True)
+    idx_str = event.data.decode().replace("admin_sponsor_rm_", "")
+    try:
+        idx = int(idx_str)
+        removed = sponsors.pop(idx)
+        await event.answer(f"✅ {removed['name']} حذف شد!", alert=False)
+    except (IndexError, ValueError):
+        await event.answer("❌ خطا در حذف.", alert=True)
+        return
+    # برگشت به پنل
+    await admin_refresh_callback(event)
 
 
 async def sponsor_join_check_callback(event):
-    """کاربر روی ✅ عضو شدم زده — چک میکنه عضو هست یا نه."""
+    """کاربر روی ✅ عضو شدم زده — چک میکنه عضو همه اسپانسرها هست یا نه."""
     data = event.data.decode()
-    # data = "sponsor_ok_{key}_{user_id}"
     parts = data.split("_", 3)
     if len(parts) < 4:
         return await event.answer("❌ خطا", alert=True)
@@ -3264,21 +3300,22 @@ async def sponsor_join_check_callback(event):
     if not info:
         return await event.answer("❌ لینک منقضی شده.", alert=True)
 
-    if not SPONSOR_CHAT_ID:
+    if not sponsors:
         await event.answer("", alert=False)
         await _forward_share_videos(event, key, info)
         return
 
     user_id = event.sender_id
-    try:
-        resolver = await event.client.get_entity(SPONSOR_CHAT_ID)
-        await event.client.get_permissions(resolver, user_id)
-        is_member = True
-    except Exception:
-        is_member = False
+    not_joined = []
+    for s in sponsors:
+        try:
+            resolver = await event.client.get_entity(s["chat_id"])
+            await event.client.get_permissions(resolver, user_id)
+        except Exception:
+            not_joined.append(s)
 
-    if not is_member:
-        await event.answer("❌ شما هنوز عضو نشدید!", alert=True)
+    if not_joined:
+        await event.answer("❌ هنوز عضو همه کانال‌ها نشدید!", alert=True)
         return
 
     await event.answer("✅ عضویت تأیید شد!", alert=False)
@@ -3522,29 +3559,33 @@ async def start_cmd(event):
             if not info:
                 return await event.reply("❌ این لینک منقضی شده یا معتبر نیست.")
 
-            # بررسی اسپانسر
-            if SPONSOR_CHAT_ID:
+            # بررسی اسپانسرها
+            if sponsors:
                 user_id = event.sender_id
-                is_member = False
-                try:
-                    resolver = await event.client.get_entity(SPONSOR_CHAT_ID)
-                    await event.client.get_permissions(resolver, user_id)
-                    is_member = True
-                except Exception:
-                    pass
+                not_joined = []
+                for s in sponsors:
+                    try:
+                        resolver = await event.client.get_entity(s["chat_id"])
+                        await event.client.get_permissions(resolver, user_id)
+                    except Exception:
+                        not_joined.append(s)
 
-                if not is_member:
-                    sponsor_link_display = (
-                        SPONSOR_LINK if SPONSOR_LINK else SPONSOR_CHAT_ID
+                if not_joined:
+                    buttons = []
+                    row = []
+                    for s in not_joined:
+                        link = s.get("link") or s.get("chat_id", "")
+                        row.append(Button.url(s["name"], link))
+                    buttons.append(row)
+                    buttons.append(
+                        [Button.inline("✅ عضو شدم", f"sponsor_ok_{key}_{user_id}")]
                     )
+
                     await event.reply(
-                        f"🔒 **لطفاً قبل از مشاهده ویدیو، عضو کانال اسپانسر شوید:**\n\n"
-                        f"📢 {sponsor_link_display}\n\n"
-                        f"بعد از عضویت، دکمه زیر رو بزنید ✅",
+                        "🔒 **لطفاً قبل از مشاهده ویدیو، عضو کانال‌های اسپانسر شوید:**\n\n"
+                        "روی هر کدام کلیک کنید و بعد دکمه ✅ رو بزنید.",
                         parse_mode="markdown",
-                        buttons=[
-                            [Button.inline("✅ عضو شدم", f"sponsor_ok_{key}_{user_id}")]
-                        ],
+                        buttons=buttons,
                     )
                     return
 
@@ -7472,11 +7513,14 @@ async def main():
         admin_cancel_callback, events.CallbackQuery(pattern=r"admin_cancel")
     )
     client.add_event_handler(
-        admin_sponsor_set_callback, events.CallbackQuery(pattern=r"admin_sponsor_set")
+        admin_sponsor_add_callback, events.CallbackQuery(pattern=r"admin_sponsor_add")
     )
     client.add_event_handler(
-        admin_sponsor_remove_callback,
-        events.CallbackQuery(pattern=r"admin_sponsor_remove"),
+        admin_sponsor_rmlist_callback,
+        events.CallbackQuery(pattern=r"admin_sponsor_rmlist"),
+    )
+    client.add_event_handler(
+        admin_sponsor_rm_callback, events.CallbackQuery(pattern=r"admin_sponsor_rm_\d+")
     )
     client.add_event_handler(
         sponsor_join_check_callback, events.CallbackQuery(pattern=r"sponsor_ok_.+")
