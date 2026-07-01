@@ -40,9 +40,8 @@ _HEADERS = {
 }
 
 _BASE_URL = "https://www.eporner.com"
-_RESULTS_PER_PAGE = 78
+_RESULTS_PER_PAGE = 77
 
-# sort های مجاز (مقدار query param order)
 _SORT_MAP = {
     "relevance": None,
     "new": "newest",
@@ -75,6 +74,7 @@ class EpornerVideo:
     rating: str
     quality: str
     video_id: str
+    uploader: str = ""
     source: str = "eporner"
 
     def to_dict(self) -> dict:
@@ -138,7 +138,7 @@ async def search_eporner(
         sort: نوع مرتب‌سازی (relevance, new, top, long, views)
 
     Returns:
-        لیست dict با کلیدهای: title, url, thumbnail, duration, views, rating, quality, video_id, source
+        لیست dict
     """
     if not query or len(query.strip()) < 2:
         return []
@@ -176,15 +176,7 @@ async def search_eporner_multi_page(
     limit: int = 50,
     sort: str = "relevance",
 ) -> List[dict]:
-    """
-    سرچ چند صفحه‌ای.
-
-    Args:
-        query: عبارت جستجو
-        pages: تعداد صفحات (1-5)
-        limit: حداکثر کل نتایج
-        sort: نوع مرتب‌سازی
-    """
+    """سرچ چند صفحه‌ای."""
     if not query or len(query.strip()) < 2:
         return []
 
@@ -220,13 +212,11 @@ def _build_search_url(query: str, page: int, sort: str) -> str:
     """ساخت URL سرچ."""
     encoded = quote_plus(query)
 
-    # مسیر پایه
     if page <= 1:
         path = f"{_BASE_URL}/search/{encoded}/"
     else:
         path = f"{_BASE_URL}/search/{encoded}/{page}/"
 
-    # اضافه کردن sort
     order_val = _SORT_MAP.get(sort)
     if order_val:
         path += f"?order={order_val}"
@@ -249,13 +239,18 @@ async def _fetch_page(url: str) -> Optional[str]:
                     if resp.status == 200:
                         return await resp.text(errors="replace")
                     if 400 <= resp.status < 500:
-                        logger.warning("HTTP %d (client error) for %s", resp.status, url)
+                        logger.warning("HTTP %d for %s", resp.status, url)
                         return None
-                    logger.warning("HTTP %d for %s (attempt %d)", resp.status, url, attempt)
+                    logger.warning(
+                        "HTTP %d for %s (attempt %d/%d)",
+                        resp.status, url, attempt, MAX_RETRIES,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("Fetch attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
+            logger.warning(
+                "Fetch attempt %d/%d failed: %s", attempt, MAX_RETRIES, e
+            )
 
         if attempt < MAX_RETRIES:
             await asyncio.sleep(RETRY_DELAY * attempt)
@@ -270,136 +265,134 @@ def _parse_search_results(page_html: str) -> List[EpornerVideo]:
     """
     پارس نتایج سرچ از HTML.
 
-    ساختار eporner:
-      <div class="mb" id="vfXXXXXXX">
-        <a href="/video-XXXXX/slug/">
-          <img src="https://static-eu-cdn.eporner.com/thumbs/.../X_240.jpg"
-               alt="Video Title" />
-          <div class="mbunder">
-            ... duration, views, rating ...
+    ساختار واقعی eporner:
+      <div class="mb" data-id="14550675" data-vp="..." id="vf14550675">
+        <div class="mbimg">
+          <div class="mbcontent">
+            <a href="/video-XXX/slug/">
+              <img src="https://static-eu-cdn.eporner.com/thumbs/..." alt="Title" />
+            </a>
+            <div class="mvhdico" title="Quality"><span>720p</span></div>
           </div>
-        </a>
+        </div>
+        <div class="mbunder">
+          <p class="mbtit">
+            <a href="/video-XXX/slug/">Full Title - Pornstar Name</a>
+          </p>
+          <p class="mbstats">
+            <span class="mbtim" title="Duration">39:27</span>
+            <span class="mbrate" title="Rating">86%</span>
+            <span class="mbvie" title="Views">302,384</span>
+            <span class="mb-uploader">
+              <a href="/profile/user/" title="Uploader">user</a>
+            </span>
+          </p>
+        </div>
       </div>
     """
     results = []
     seen_ids = set()
 
-    # هر div.mb یه ویدیوئه
-    # id فرمت: vfXXXXXXX
-    mb_pattern = re.compile(
-        r'<div\s+class="mb"\s+id="(vf\w+)"[^>]*>(.*?)</div>\s*</div>\s*</div>',
-        re.DOTALL,
-    )
+    # پیدا کردن همه بلاک‌ها با id=vfXXXXX
+    # split بین هر id="vf
+    block_starts = list(re.finditer(r'id="vf(\d+)"', page_html))
 
-    # اگه pattern بالا کار نکرد، fallback به split
-    blocks = mb_pattern.findall(page_html)
+    for i, match in enumerate(block_starts):
+        vid = match.group(1)
 
-    if not blocks:
-        # fallback: split by div.mb
-        blocks = _split_by_mb_blocks(page_html)
+        # جلوگیری از تکراری
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
 
-    for block_data in blocks:
-        if isinstance(block_data, tuple):
-            block_id, block_html = block_data
-        else:
-            block_id = ""
-            block_html = block_data
+        # محدوده بلاک: از این id تا id بعدی
+        start = match.start()
+        end = block_starts[i + 1].start() if i + 1 < len(block_starts) else start + 2000
+        block_html = page_html[start:end]
 
-        video = _parse_single_block(block_id, block_html)
-        if video and video.video_id not in seen_ids:
-            seen_ids.add(video.video_id)
+        video = _parse_single_block(vid, block_html)
+        if video:
             results.append(video)
 
     return results
 
 
-def _split_by_mb_blocks(page_html: str) -> List[str]:
-    """Fallback: split HTML by div.mb markers."""
-    blocks = []
-    # پیدا کردن همه شروع‌های div.mb
-    starts = [m.start() for m in re.finditer(r'<div\s+class="mb"\s+id="vf', page_html)]
-
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else start + 3000
-        block = page_html[start:end]
-        blocks.append(block)
-
-    return blocks
-
-
-def _parse_single_block(block_id: str, block_html: str) -> Optional[EpornerVideo]:
+def _parse_single_block(video_id: str, block_html: str) -> Optional[EpornerVideo]:
     """پارس یک بلاک ویدیو."""
 
-    # Video ID از block_id یا از لینک
-    video_id = ""
-    if block_id.startswith("vf"):
-        video_id = block_id[2:]  # حذف "vf"
-
     # لینک ویدیو
-    link_m = re.search(r'href="(/video-([a-zA-Z0-9]+)/[^"]*)"', block_html)
+    link_m = re.search(
+        r'href="(/video-([a-zA-Z0-9]+)/[^"]*)"', block_html
+    )
     if not link_m:
         return None
 
     video_path = link_m.group(1)
-    if not video_id:
-        video_id = link_m.group(2)
-
     video_url = f"{_BASE_URL}{video_path}"
 
-    # عنوان از alt تامبنیل
+    # عنوان: اول از mbtit (عنوان کامل‌تره)، بعد از alt
     title = ""
-    alt_m = re.search(r'alt="([^"]+)"', block_html)
-    if alt_m:
-        title = html_lib.unescape(alt_m.group(1).strip())
+    mbtit_m = re.search(
+        r'class="mbtit">\s*<a[^>]*>([^<]+)</a>', block_html
+    )
+    if mbtit_m:
+        title = html_lib.unescape(mbtit_m.group(1).strip())
 
-    # fallback عنوان از title attribute لینک
     if not title:
-        title_m = re.search(r'title="([^"]+)"', block_html)
-        if title_m:
-            title = html_lib.unescape(title_m.group(1).strip())
+        alt_m = re.search(r'alt="([^"]+)"', block_html)
+        if alt_m:
+            title = html_lib.unescape(alt_m.group(1).strip())
 
     if not title:
         return None
 
     # تامبنیل
     thumbnail = ""
-    img_m = re.search(r'<img[^>]+src="(https://[^"]+eporner\.com/thumbs/[^"]+)"', block_html)
+    img_m = re.search(
+        r'<img[^>]+src="(https://static[^"]+\.jpg)"', block_html
+    )
     if img_m:
         thumbnail = img_m.group(1)
-    else:
-        # fallback: هر img src با cdn
-        img_m2 = re.search(r'<img[^>]+src="(https://static[^"]+\.jpg)"', block_html)
-        if img_m2:
-            thumbnail = img_m2.group(1)
 
-    # Duration (فرمت: XX:XX یا X:XX:XX)
-    duration = ""
-    dur_m = re.search(r'(\d{1,2}:\d{2}(?::\d{2})?)', block_html)
-    if dur_m:
-        duration = dur_m.group(1)
-
-    # Views
-    views = ""
-    views_m = re.search(r'([\d,]+)\s*(?:views|Views)', block_html)
-    if views_m:
-        views = views_m.group(1)
-    else:
-        # fallback: عدد بزرگ با K/M
-        views_m2 = re.search(r'([\d.]+[KkMm]?)\s*views', block_html, re.IGNORECASE)
-        if views_m2:
-            views = views_m2.group(1)
-
-    # Rating (درصد)
-    rating = ""
-    rating_m = re.search(r'(\d{1,3})%', block_html)
-    if rating_m:
-        rating = f"{rating_m.group(1)}%"
-
-    # Quality (HD, 720p, 1080p, 4K)
+    # کیفیت از mvhdico
     quality = ""
-    qual_m = re.search(r'(4[kK]|1080p|720p|[hH][dD])', block_html)
+    qual_m = re.search(
+        r'class="mvhdico"[^>]*>\s*<span>([^<]+)</span>', block_html
+    )
     if qual_m:
-        quality = qual_m.group(1).upper()
+        quality = qual_m.group(1).strip()
+
+    # Duration از mbtim
+    duration = ""
+    dur_m = re.search(
+        r'class="mbtim"[^>]*>([^<]+)</span>', block_html
+    )
+    if dur_m:
+        duration = dur_m.group(1).strip()
+
+    # Rating از mbrate
+    rating = ""
+    rate_m = re.search(
+        r'class="mbrate"[^>]*>([^<]+)</span>', block_html
+    )
+    if rate_m:
+        rating = rate_m.group(1).strip()
+
+    # Views از mbvie
+    views = ""
+    views_m = re.search(
+        r'class="mbvie"[^>]*>([^<]+)</span>', block_html
+    )
+    if views_m:
+        views = views_m.group(1).strip()
+
+    # Uploader
+    uploader = ""
+    up_m = re.search(
+        r'class="mb-uploader"[^>]*>\s*<a[^>]*>([^<]+)</a>', block_html
+    )
+    if up_m:
+        uploader = up_m.group(1).strip()
 
     return EpornerVideo(
         title=title,
@@ -410,6 +403,7 @@ def _parse_single_block(block_id: str, block_html: str) -> Optional[EpornerVideo
         rating=rating,
         quality=quality,
         video_id=video_id,
+        uploader=uploader,
     )
 
 
@@ -432,7 +426,7 @@ async def _test():
         print(f"      Thumb:    {v['thumbnail'][:80]}")
         print(f"      Duration: {v['duration']} | Views: {v['views']} | "
               f"Rating: {v['rating']} | Quality: {v['quality']}")
-        print(f"      ID:       {v['video_id']}")
+        print(f"      Uploader: {v['uploader']} | ID: {v['video_id']}")
         print()
 
     await asyncio.sleep(1)
@@ -442,7 +436,7 @@ async def _test():
     results2 = await search_eporner("step sister", page=2, limit=3)
     print(f"Found {len(results2)} results (page 2)\n")
     for v in results2:
-        print(f"  • {v['title'][:60]} [{v['duration']}]")
+        print(f"  - {v['title'][:60]} [{v['duration']}] {v['quality']}")
 
     await asyncio.sleep(1)
 
@@ -451,7 +445,7 @@ async def _test():
     results3 = await search_eporner("japanese", sort="new", limit=3)
     print(f"Found {len(results3)} results (newest)\n")
     for v in results3:
-        print(f"  • {v['title'][:60]} [{v['duration']}]")
+        print(f"  - {v['title'][:60]} [{v['duration']}] {v['quality']}")
 
     await asyncio.sleep(1)
 
@@ -467,7 +461,7 @@ async def _test():
     ]
     for q in test_queries:
         parsed = parse_inline_query(q)
-        print(f"  '{q}' → query='{parsed['query']}' page={parsed['page']} sort={parsed['sort']}")
+        print(f"  '{q}' -> query='{parsed['query']}' page={parsed['page']} sort={parsed['sort']}")
 
     await asyncio.sleep(1)
 
@@ -476,7 +470,7 @@ async def _test():
     results5 = await search_eporner_multi_page("teen", pages=2, limit=10)
     print(f"Found {len(results5)} unique results from 2 pages\n")
     for i, v in enumerate(results5):
-        print(f"  [{i+1}] {v['title'][:60]} [{v['duration']}] {v['quality']}")
+        print(f"  [{i+1}] {v['title'][:55]} [{v['duration']}] {v['quality']} | {v['views']}")
 
     print("\n" + "=" * 60)
     print("  ALL TESTS DONE")
