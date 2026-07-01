@@ -56,6 +56,7 @@ from xnxx_handler import (
 from searcher.xnxx_search import search_xnxx, parse_inline_query
 from searcher.pornhub_search import search_pornhub
 from searcher.xvideos_search import search_xvideos
+from searcher.eporner_search import search_eporner
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -6695,14 +6696,18 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, بقیه → XNXX
+        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, بقیه → XNXX
         is_ph = raw.lower().startswith("ph:")
         is_xv = raw.lower().startswith("xv:")
+        is_ep = raw.lower().startswith("ep:")
         if is_ph:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
             ph_sort = PH_SORT_MAP.get(parsed["sort"], "")
         elif is_xv:
+            inner = raw[3:].strip()
+            parsed = parse_inline_query(inner)
+        elif is_ep:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
         else:
@@ -6712,7 +6717,7 @@ async def xnxx_inline_handler(event):
         page = parsed["page"]
         sort = parsed["sort"]
 
-        source = "XV" if is_xv else ("PH" if is_ph else "XNXX")
+        source = "EP" if is_ep else ("XV" if is_xv else ("PH" if is_ph else "XNXX"))
         logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
         if is_ph:
@@ -6722,6 +6727,10 @@ async def xnxx_inline_handler(event):
             )
         elif is_xv:
             results = await search_xvideos(
+                query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+            )
+        elif is_ep:
+            results = await search_eporner(
                 query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
             )
         else:
@@ -6755,6 +6764,10 @@ async def xnxx_inline_handler(event):
                 quality = video.get("quality", "")
                 hd_tag = ""
                 source_tag = "XV"
+            elif is_ep:
+                quality = video.get("quality", "")
+                hd_tag = f" | 🏆 {video.get('rating', '')}" if video.get("rating") else ""
+                source_tag = "EP"
             else:
                 quality = video.get("quality", "")
                 hd_tag = ""
