@@ -1,10 +1,10 @@
 """
-xanimu_handler.py (Cloudflare Bypass Edition)
-──────────────────────────────────────────────
-با curl_cffi برای bypass واقعی Cloudflare
-fallback به cloudscraper و playwright
+xanimu_handler.py (Playwright Edition)
+───────────────────────────────────────
+Cloudflare bypass واقعی با مرورگر headless
 
-pip install curl_cffi cloudscraper
+pip install playwright aiofiles aiohttp
+playwright install chromium
 """
 
 import asyncio
@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional, Tuple
@@ -30,20 +29,17 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-_DEFAULT_HEADERS = {
-    "User-Agent": _USER_AGENT,
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
 MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
-CURL_TIMEOUT = 30
 MIN_FILE_SIZE = 1024
 CHUNK_SIZE = 256 * 1024
 PROGRESS_INTERVAL = 2.0
 MAX_SPEED_DISPLAY = 99999
+
+# صبر برای حل شدن Cloudflare challenge (ثانیه)
+CF_WAIT_TIMEOUT = 45
+CF_CHECK_INTERVAL = 2
 
 _ALLOWED_HOSTS = frozenset({"xanimu.com", "www.xanimu.com"})
 
@@ -96,6 +92,44 @@ class DebugLog:
         return result
 
 
+# ─── Cookie Store ───────────────────────────────────────────
+
+
+class CloudflareCookieStore:
+    """
+    ذخیره cf_clearance cookies برای استفاده مجدد.
+    هر cookie حدود 30 دقیقه اعتبار داره.
+    """
+
+    def __init__(self):
+        self._cookies: dict[str, dict] = {}  # domain -> {cookies, timestamp, user_agent}
+        self._lock = asyncio.Lock()
+        self._ttl = 25 * 60  # 25 دقیقه (کمتر از 30 دقیقه واقعی)
+
+    async def get(self, domain: str) -> Optional[dict]:
+        async with self._lock:
+            entry = self._cookies.get(domain)
+            if entry and time.time() - entry["timestamp"] < self._ttl:
+                logger.debug("Cookie cache hit for %s", domain)
+                return entry
+            if entry:
+                del self._cookies[domain]
+            return None
+
+    async def put(self, domain: str, cookies: list, user_agent: str) -> None:
+        async with self._lock:
+            self._cookies[domain] = {
+                "cookies": cookies,
+                "user_agent": user_agent,
+                "timestamp": time.time(),
+            }
+            logger.debug("Cookie cached for %s", domain)
+
+
+# Global cookie store
+_cookie_store = CloudflareCookieStore()
+
+
 # ─── Utility ────────────────────────────────────────────────
 
 
@@ -134,291 +168,334 @@ def _format_size(size_bytes: int) -> str:
     return f"{size_bytes / 1024 / 1024 / 1024:.2f} GB"
 
 
-def _check_curl() -> bool:
-    return shutil.which("curl") is not None
+# ─── Playwright: Cloudflare Bypass ──────────────────────────
 
 
-# ─── HTTP Fetchers (Cloudflare Bypass) ──────────────────────
-
-
-async def _fetch_with_curl_cffi(url: str, dbg: DebugLog) -> Tuple[Optional[str], int]:
+async def _solve_cloudflare(
+    url: str,
+    dbg: DebugLog,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> Tuple[Optional[str], list, str]:
     """
-    روش 1: curl_cffi - شبیه‌سازی TLS fingerprint Chrome واقعی.
-    این بهترین روش bypass Cloudflare هست.
-    """
-    try:
-        from curl_cffi.requests import AsyncSession
-    except ImportError:
-        dbg.warn("curl_cffi نصب نیست: `pip install curl_cffi`")
-        return None, 0
+    باز کردن صفحه با Playwright و حل Cloudflare challenge.
 
-    dbg.step("تلاش با curl_cffi (Chrome impersonate)...")
-
-    # لیست browser fingerprints برای امتحان
-    impersonates = ["chrome124", "chrome120", "chrome110", "chrome107"]
-
-    for browser in impersonates:
-        dbg.info(f"امتحان fingerprint: {browser}")
-        try:
-            async with AsyncSession(impersonate=browser) as session:
-                resp = await asyncio.wait_for(
-                    session.get(
-                        url,
-                        headers={
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        },
-                        allow_redirects=True,
-                    ),
-                    timeout=CURL_TIMEOUT,
-                )
-
-                dbg.info(f"curl_cffi [{browser}] status: {resp.status_code}")
-                dbg.info(f"curl_cffi [{browser}] size: {len(resp.text)} chars")
-
-                if resp.status_code == 200 and len(resp.text) > 2000:
-                    if "Just a moment" not in resp.text:
-                        dbg.ok(f"curl_cffi [{browser}] موفق!")
-                        return resp.text, 200
-                    else:
-                        dbg.warn(f"curl_cffi [{browser}] هنوز Cloudflare challenge")
-                elif resp.status_code == 403:
-                    dbg.warn(f"curl_cffi [{browser}] → 403")
-                else:
-                    dbg.warn(f"curl_cffi [{browser}] → {resp.status_code}")
-
-        except asyncio.TimeoutError:
-            dbg.warn(f"curl_cffi [{browser}] timeout")
-        except Exception as e:
-            dbg.warn(f"curl_cffi [{browser}] error: {type(e).__name__}: {e}")
-
-    dbg.err("curl_cffi: تمام fingerprints فیل شد")
-    return None, 0
-
-
-async def _fetch_with_cloudscraper(url: str, dbg: DebugLog) -> Tuple[Optional[str], int]:
-    """
-    روش 2: cloudscraper - حل JS challenge ساده Cloudflare.
-    """
-    try:
-        import cloudscraper
-    except ImportError:
-        dbg.warn("cloudscraper نصب نیست: `pip install cloudscraper`")
-        return None, 0
-
-    dbg.step("تلاش با cloudscraper...")
-
-    try:
-        # cloudscraper sync هست، توی thread اجرا می‌کنیم
-        def _do_request():
-            scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False},
-            )
-            resp = scraper.get(url, timeout=CURL_TIMEOUT)
-            return resp.text, resp.status_code
-
-        loop = asyncio.get_event_loop()
-        html, status = await asyncio.wait_for(
-            loop.run_in_executor(None, _do_request),
-            timeout=CURL_TIMEOUT + 15,
-        )
-
-        dbg.info(f"cloudscraper status: {status}")
-        dbg.info(f"cloudscraper size: {len(html)} chars")
-
-        if status == 200 and len(html) > 2000 and "Just a moment" not in html:
-            dbg.ok("cloudscraper موفق!")
-            return html, 200
-
-        dbg.warn(f"cloudscraper ناموفق: status={status}, cf={'Yes' if 'Just a moment' in html else 'No'}")
-
-    except asyncio.TimeoutError:
-        dbg.warn("cloudscraper timeout")
-    except Exception as e:
-        dbg.warn(f"cloudscraper error: {type(e).__name__}: {e}")
-
-    return None, 0
-
-
-async def _fetch_with_playwright(url: str, dbg: DebugLog) -> Tuple[Optional[str], int]:
-    """
-    روش 3: Playwright - مرورگر واقعی headless.
-    سنگین‌ترین ولی مطمئن‌ترین.
+    Returns:
+        (html, cookies, user_agent) یا (None, [], "")
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        dbg.warn("playwright نصب نیست: `pip install playwright && playwright install chromium`")
-        return None, 0
+        dbg.err("playwright نصب نیست!")
+        dbg.err("اجرا کن: pip install playwright && playwright install chromium")
+        return None, [], ""
 
-    dbg.step("تلاش با Playwright (headless browser)...")
+    domain = urlparse(url).hostname or ""
+
+    # چک cache
+    cached = await _cookie_store.get(domain)
+    if cached:
+        dbg.ok(f"Cookie cache hit برای {domain}")
+        # با cookie ذخیره شده HTML بگیر
+        html = await _fetch_with_cookies(url, cached["cookies"], cached["user_agent"], dbg)
+        if html and "Just a moment" not in html and len(html) > 2000:
+            dbg.ok("صفحه با cookie cache دریافت شد")
+            return html, cached["cookies"], cached["user_agent"]
+        dbg.warn("Cookie cache منقضی شده، مرورگر باز میشه")
+
+    dbg.step("باز کردن مرورگر Chromium...")
+    if progress_cb:
+        await progress_cb("🌐 **در حال باز کردن مرورگر برای bypass Cloudflare...**")
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+
             context = await browser.new_context(
                 user_agent=_USER_AGENT,
                 viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
             )
+
+            # حذف نشانه‌های automation
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """)
+
             page = await context.new_page()
+            dbg.ok("مرورگر باز شد")
 
-            dbg.info("مرورگر باز شد، در حال بارگذاری صفحه...")
+            # رفتن به صفحه
+            dbg.step(f"بارگذاری: {url}")
+            if progress_cb:
+                await progress_cb("🔄 **در حال حل Cloudflare challenge...**\n⏳ ممکنه تا 30 ثانیه طول بکشه")
 
-            resp = await page.goto(url, wait_until="networkidle", timeout=45000)
-            status = resp.status if resp else 0
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                dbg.warn(f"goto initial error (ادامه میدیم): {e}")
 
-            # صبر اضافی برای JS
-            await page.wait_for_timeout(3000)
+            # صبر برای حل شدن Cloudflare
+            html = ""
+            solved = False
+            start = time.time()
 
-            html = await page.content()
+            while time.time() - start < CF_WAIT_TIMEOUT:
+                await asyncio.sleep(CF_CHECK_INTERVAL)
+                elapsed = time.time() - start
 
-            dbg.info(f"Playwright status: {status}")
-            dbg.info(f"Playwright size: {len(html)} chars")
-            dbg.info(f"Playwright title: {await page.title()}")
+                try:
+                    html = await page.content()
+                    page_title = await page.title()
+                except Exception:
+                    continue
+
+                dbg.info(f"[{elapsed:.0f}s] title='{page_title}', size={len(html)}")
+
+                # چک کن Cloudflare حل شده
+                if "Just a moment" not in html and len(html) > 3000:
+                    dbg.ok(f"Cloudflare حل شد! ({elapsed:.1f}s)")
+                    solved = True
+                    break
+
+                if progress_cb and int(elapsed) % 5 == 0:
+                    await progress_cb(
+                        f"🔄 **حل Cloudflare challenge...**\n"
+                        f"⏳ {elapsed:.0f}/{CF_WAIT_TIMEOUT}s"
+                    )
+
+            if not solved:
+                dbg.err(f"Cloudflare بعد از {CF_WAIT_TIMEOUT}s حل نشد")
+                # آخرین تلاش: صبر بیشتر
+                dbg.step("تلاش آخر: 15 ثانیه صبر اضافی...")
+                await asyncio.sleep(15)
+                html = await page.content()
+                if "Just a moment" in html or len(html) < 3000:
+                    await browser.close()
+                    return None, [], ""
+                dbg.ok("Cloudflare با صبر اضافی حل شد!")
+
+            # گرفتن cookies
+            cookies = await context.cookies()
+            user_agent = await page.evaluate("navigator.userAgent")
+
+            dbg.info(f"Cookies: {len(cookies)}")
+            cf_cookies = [c for c in cookies if "cf_clearance" in c.get("name", "")]
+            if cf_cookies:
+                dbg.ok(f"cf_clearance cookie پیدا شد!")
+                for c in cf_cookies:
+                    dbg.info(f"  {c['name']}={c['value'][:30]}... domain={c.get('domain')}")
+            else:
+                dbg.warn("cf_clearance cookie پیدا نشد")
+                dbg.info(f"تمام cookies: {[c['name'] for c in cookies]}")
+
+            # ذخیره در cache
+            await _cookie_store.put(domain, cookies, user_agent)
+
+            # ذخیره cookies برای CDN هم
+            for cdn_host in _CDN_HOSTS:
+                cdn_cached = await _cookie_store.get(cdn_host)
+                if not cdn_cached:
+                    # CDN cookies رو جداگانه باید بگیریم
+                    pass
 
             await browser.close()
+            dbg.ok("مرورگر بسته شد")
 
-            if len(html) > 2000 and "Just a moment" not in html:
-                dbg.ok("Playwright موفق!")
-                return html, 200
+            return html, cookies, user_agent
 
-            dbg.warn("Playwright: هنوز Cloudflare challenge")
-
-    except asyncio.TimeoutError:
-        dbg.warn("Playwright timeout")
     except Exception as e:
-        dbg.warn(f"Playwright error: {type(e).__name__}: {e}")
+        dbg.err(f"Playwright error: {type(e).__name__}: {e}")
+        return None, [], ""
 
-    return None, 0
+
+async def _fetch_with_cookies(
+    url: str, cookies: list, user_agent: str, dbg: DebugLog
+) -> Optional[str]:
+    """دریافت HTML با cookies ذخیره شده (بدون مرورگر)."""
+    try:
+        jar = aiohttp.CookieJar(unsafe=True)
+        timeout = ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(
+            cookie_jar=jar, timeout=timeout
+        ) as session:
+            # تنظیم cookies
+            for cookie in cookies:
+                session.cookie_jar.update_cookies(
+                    {cookie["name"]: cookie["value"]},
+                    response_url=aiohttp.client.URL(
+                        f"https://{cookie.get('domain', '').lstrip('.')}"
+                    ),
+                )
+
+            headers = {
+                "User-Agent": user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+
+            async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+                dbg.warn(f"Cookie fetch: HTTP {resp.status}")
+
+    except Exception as e:
+        dbg.warn(f"Cookie fetch error: {e}")
+
+    return None
 
 
-async def _fetch_with_system_curl(url: str, dbg: DebugLog) -> Tuple[Optional[str], int]:
+async def _solve_cdn_cloudflare(
+    video_url: str,
+    page_cookies: list,
+    user_agent: str,
+    dbg: DebugLog,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> Tuple[list, str]:
     """
-    روش 4: curl سیستم با TLS options اضافی.
+    حل Cloudflare challenge روی CDN.
+    CDN هم ممکنه challenge بده، پس باید مرورگر رو بفرستیم اونجا هم.
+
+    Returns:
+        (cdn_cookies, user_agent)
     """
-    if not _check_curl():
-        dbg.warn("curl سیستم پیدا نشد")
-        return None, 0
+    cdn_host = urlparse(video_url).hostname or ""
 
-    dbg.step("تلاش با curl سیستم (TLS tweaks)...")
+    # اول با cookie صفحه اصلی امتحان کن
+    cached = await _cookie_store.get(cdn_host)
+    if cached:
+        dbg.ok(f"CDN cookie cache hit: {cdn_host}")
+        return cached["cookies"], cached["user_agent"]
 
-    # تنظیمات مختلف TLS
-    tls_configs = [
-        # Config 1: cipher list مشابه Chrome
-        [
-            "--ciphers",
-            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:"
-            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256",
-            "--tlsv1.2",
-        ],
-        # Config 2: ساده
-        ["--tlsv1.3"],
-        # Config 3: بدون تنظیم خاص
-        [],
-    ]
+    dbg.step(f"حل Cloudflare برای CDN: {cdn_host}")
+    if progress_cb:
+        await progress_cb(f"🔄 **حل Cloudflare برای CDN ({cdn_host})...**")
 
-    for i, tls_opts in enumerate(tls_configs):
-        dbg.info(f"curl config {i+1}/{len(tls_configs)}")
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        dbg.err("playwright نصب نیست")
+        return page_cookies, user_agent
 
-        cmd = [
-            "curl", "-s",
-            "-w", "\n__HTTP_CODE__%{http_code}",
-            "-H", f"User-Agent: {_USER_AGENT}",
-            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "-H", "Accept-Language: en-US,en;q=0.9",
-            "-H", "sec-ch-ua: \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
-            "-H", "sec-ch-ua-mobile: ?0",
-            "-H", "sec-ch-ua-platform: \"Windows\"",
-            "-H", "Sec-Fetch-Dest: document",
-            "-H", "Sec-Fetch-Mode: navigate",
-            "-H", "Sec-Fetch-Site: none",
-            "-H", "Sec-Fetch-User: ?1",
-            "-H", "Upgrade-Insecure-Requests: 1",
-            "-L",
-            "--compressed",
-            "--max-time", str(CURL_TIMEOUT),
-            *tls_opts,
-            url,
-        ]
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=CURL_TIMEOUT + 10,
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
             )
 
-            output = stdout.decode(errors="replace")
-            code_marker = "__HTTP_CODE__"
-            if code_marker in output:
-                parts = output.rsplit(code_marker, 1)
-                html = parts[0]
+            context = await browser.new_context(
+                user_agent=user_agent,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = {runtime: {}};
+            """)
+
+            # اضافه کردن cookies صفحه اصلی
+            valid_cookies = []
+            for c in page_cookies:
                 try:
-                    status = int(parts[1].strip())
-                except (ValueError, IndexError):
-                    status = 0
-            else:
-                html = output
-                status = 200 if process.returncode == 0 else 0
+                    cookie_data = {
+                        "name": c["name"],
+                        "value": c["value"],
+                        "domain": c.get("domain", ""),
+                        "path": c.get("path", "/"),
+                    }
+                    if c.get("expires") and c["expires"] > 0:
+                        cookie_data["expires"] = c["expires"]
+                    valid_cookies.append(cookie_data)
+                except (KeyError, TypeError):
+                    continue
 
-            dbg.info(f"curl config {i+1}: status={status}, size={len(html)}")
+            if valid_cookies:
+                await context.add_cookies(valid_cookies)
 
-            if status == 200 and len(html) > 2000 and "Just a moment" not in html:
-                dbg.ok(f"curl config {i+1} موفق!")
-                return html, 200
+            page = await context.new_page()
 
-        except asyncio.TimeoutError:
-            dbg.warn(f"curl config {i+1} timeout")
-        except Exception as e:
-            dbg.warn(f"curl config {i+1} error: {e}")
+            # رفتن به URL ویدیو (Cloudflare challenge میاد)
+            dbg.step(f"بارگذاری CDN URL...")
+            try:
+                await page.goto(video_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                dbg.warn(f"CDN goto error (ادامه میدیم): {e}")
 
-    dbg.err("curl سیستم: تمام configs فیل شد")
-    return None, 0
+            # صبر برای حل challenge
+            start = time.time()
+            solved = False
+
+            while time.time() - start < CF_WAIT_TIMEOUT:
+                await asyncio.sleep(CF_CHECK_INTERVAL)
+                elapsed = time.time() - start
+
+                try:
+                    content = await page.content()
+                    resp_url = page.url
+                except Exception:
+                    continue
+
+                dbg.info(f"CDN [{elapsed:.0f}s] url={resp_url[:80]}, size={len(content)}")
+
+                # اگه challenge حل شد، redirect به فایل واقعی میشه
+                # یا content-type تغییر می‌کنه
+                if "Just a moment" not in content:
+                    dbg.ok(f"CDN Cloudflare حل شد! ({elapsed:.1f}s)")
+                    solved = True
+                    break
+
+                if progress_cb and int(elapsed) % 5 == 0:
+                    await progress_cb(
+                        f"🔄 **حل Cloudflare CDN...**\n"
+                        f"⏳ {elapsed:.0f}/{CF_WAIT_TIMEOUT}s"
+                    )
+
+            if not solved:
+                dbg.warn("CDN Cloudflare حل نشد، ادامه با cookies موجود")
+
+            cookies = await context.cookies()
+            cdn_ua = await page.evaluate("navigator.userAgent")
+
+            cdn_cf = [c for c in cookies if "cf_clearance" in c.get("name", "")]
+            if cdn_cf:
+                dbg.ok(f"CDN cf_clearance پیدا شد!")
+
+            await _cookie_store.put(cdn_host, cookies, cdn_ua)
+            await browser.close()
+
+            return cookies, cdn_ua
+
+    except Exception as e:
+        dbg.err(f"CDN Playwright error: {e}")
+        return page_cookies, user_agent
 
 
-async def _fetch_page(url: str, dbg: DebugLog) -> Tuple[Optional[str], int]:
-    """
-    تلاش با تمام روش‌ها به ترتیب اولویت.
-    """
-    dbg.step("══ شروع دریافت صفحه ══")
-
-    # روش 1: curl_cffi (سریع‌ترین و بهترین)
-    html, status = await _fetch_with_curl_cffi(url, dbg)
-    if html:
-        return html, status
-
-    # روش 2: cloudscraper
-    html, status = await _fetch_with_cloudscraper(url, dbg)
-    if html:
-        return html, status
-
-    # روش 3: curl سیستم با TLS tweaks
-    html, status = await _fetch_with_system_curl(url, dbg)
-    if html:
-        return html, status
-
-    # روش 4: Playwright (آخرین چاره)
-    html, status = await _fetch_with_playwright(url, dbg)
-    if html:
-        return html, status
-
-    dbg.err("══ تمام روش‌ها فیل شد! ══")
-    dbg.err("پیشنهاد: `pip install curl_cffi cloudscraper`")
-    return None, 0
+# ─── Extraction ─────────────────────────────────────────────
 
 
-# ─── Extraction (بدون تغییر از نسخه قبلی) ──────────────────
-
-
-def _extract_from_html(html: str, page_url: str, dbg: DebugLog) -> Tuple[List[dict], str]:
+def _extract_from_html(html: str, dbg: DebugLog) -> Tuple[List[dict], str]:
     title = _extract_title(html, dbg)
     qualities: List[dict] = []
     seen_urls: set = set()
 
-    dbg.step("── شروع استخراج کیفیت‌ها ──")
+    dbg.step("── استخراج کیفیت‌ها ──")
 
     _extract_js_vars(html, qualities, seen_urls, dbg)
     _extract_video_tags(html, qualities, seen_urls, dbg)
@@ -428,21 +505,19 @@ def _extract_from_html(html: str, page_url: str, dbg: DebugLog) -> Tuple[List[di
 
     qualities.sort(key=lambda q: q.get("height", 0), reverse=True)
 
-    dbg.info(f"مجموع کیفیت‌های پیدا شده: {len(qualities)}")
+    dbg.info(f"مجموع: {len(qualities)} کیفیت")
     for i, q in enumerate(qualities):
-        dbg.ok(f"  کیفیت {i+1}: {q['label']} → `{q['url'][:80]}...`")
+        dbg.ok(f"  {i+1}. {q['label']} → `{q['url'][:80]}...`")
 
     return qualities, title
 
 
 def _extract_title(html: str, dbg: DebugLog) -> str:
-    dbg.step("استخراج عنوان...")
-
     ts_m = re.search(r'"title"\s*:\s*"([^"]+)"', html)
     if ts_m:
         title = ts_m.group(1).strip()
         if len(title) > 3:
-            dbg.ok(f"عنوان از JSON: `{title[:60]}`")
+            dbg.ok(f"عنوان: `{title[:60]}`")
             return html_lib.unescape(title)
 
     t_m = re.search(r"<title>([^<]+)</title>", html, re.I)
@@ -450,109 +525,65 @@ def _extract_title(html: str, dbg: DebugLog) -> str:
         title = t_m.group(1).strip()
         title = re.sub(r"\s*[-|]\s*XAnimu\.com\s*$", "", title, flags=re.I).strip()
         if title:
-            dbg.ok(f"عنوان از <title>: `{title[:60]}`")
+            dbg.ok(f"عنوان: `{title[:60]}`")
             return html_lib.unescape(title)
 
     og_m = re.search(r'property=["\']og:title["\']\s+content=["\']([^"\']+)', html, re.I)
     if og_m:
-        title = html_lib.unescape(og_m.group(1).strip())
-        dbg.ok(f"عنوان از og:title: `{title[:60]}`")
-        return title
+        return html_lib.unescape(og_m.group(1).strip())
 
     h1_m = re.search(r"<h1[^>]*>([^<]+)</h1>", html, re.I)
     if h1_m:
-        title = html_lib.unescape(h1_m.group(1).strip())
-        dbg.ok(f"عنوان از h1: `{title[:60]}`")
-        return title
+        return html_lib.unescape(h1_m.group(1).strip())
 
     dbg.warn("عنوان پیدا نشد")
     return "Untitled"
 
 
-def _extract_js_vars(
-    html: str, qualities: List[dict], seen_urls: set, dbg: DebugLog
-) -> None:
+def _extract_js_vars(html: str, qualities: List[dict], seen: set, dbg: DebugLog) -> None:
     all_vars = re.findall(r'var\s+(\w*[Vv]ideo\w*)\s*=\s*"([^"]*)"', html)
     if all_vars:
         dbg.info(f"JS video vars: {len(all_vars)}")
         for name, val in all_vars:
-            dbg.info(f"  var {name} = `{val[:100]}`")
+            dbg.info(f"  {name} = `{val[:100]}`")
     else:
-        dbg.warn("هیچ JS video var پیدا نشد")
-        any_vars = re.findall(r'var\s+(\w+)\s*=\s*"(https?://[^"]+)"', html)
-        if any_vars:
-            dbg.info(f"سایر JS vars با URL: {len(any_vars)}")
-            for name, val in any_vars[:10]:
-                dbg.info(f"  var {name} = `{val[:100]}`")
-
+        dbg.warn("JS video vars پیدا نشد")
+        # let/const
         let_vars = re.findall(r'(?:let|const)\s+(\w*[Vv]ideo\w*)\s*=\s*["\']([^"\']*)["\']', html)
         if let_vars:
             dbg.info(f"let/const video vars: {len(let_vars)}")
             for name, val in let_vars:
                 dbg.info(f"  {name} = `{val[:100]}`")
 
-    # videoHigh
-    high_m = re.search(r'var\s+videoHigh\s*=\s*"([^"]+)"', html)
-    if high_m:
-        url = high_m.group(1).strip()
-        dbg.ok(f"videoHigh: `{url[:80]}`")
-        if not _is_valid_cdn_url(url):
-            dbg.err(f"videoHigh CDN نامعتبر: {urlparse(url).hostname}")
-        elif url in seen_urls:
-            dbg.warn("videoHigh تکراری")
+    for var_name, quality_key, default_height in [
+        ("videoHigh", "high", 720),
+        ("videoLow", "low", 360),
+    ]:
+        m = re.search(rf'var\s+{var_name}\s*=\s*"([^"]+)"', html)
+        if m:
+            url = m.group(1).strip()
+            dbg.ok(f"{var_name}: `{url[:80]}`")
+            if url not in seen:
+                seen.add(url)
+                title_m = re.search(rf'var\s+{var_name}Title\s*=\s*"([^"]+)"', html)
+                label = title_m.group(1) if title_m else quality_key.title()
+                height = _parse_height(label) or default_height
+                qualities.append({
+                    "label": f"📺 {label} ({quality_key.title()} Quality)",
+                    "url": url, "method": "direct",
+                    "height": height, "quality_key": quality_key,
+                })
         else:
-            seen_urls.add(url)
-            high_title_m = re.search(r'var\s+videoHighTitle\s*=\s*"([^"]+)"', html)
-            label_text = high_title_m.group(1) if high_title_m else "High"
-            height = _parse_height(label_text) or 720
-            qualities.append({
-                "label": f"📺 {label_text} (High Quality)",
-                "url": url, "method": "direct",
-                "height": height, "quality_key": "high",
-            })
-    else:
-        dbg.warn("videoHigh پیدا نشد")
-
-    # videoLow
-    low_m = re.search(r'var\s+videoLow\s*=\s*"([^"]+)"', html)
-    if low_m:
-        url = low_m.group(1).strip()
-        dbg.ok(f"videoLow: `{url[:80]}`")
-        if not _is_valid_cdn_url(url):
-            dbg.err(f"videoLow CDN نامعتبر: {urlparse(url).hostname}")
-        elif url in seen_urls:
-            dbg.warn("videoLow تکراری")
-        else:
-            seen_urls.add(url)
-            low_title_m = re.search(r'var\s+videoLowTitle\s*=\s*"([^"]+)"', html)
-            label_text = low_title_m.group(1) if low_title_m else "Low"
-            height = _parse_height(label_text) or 360
-            qualities.append({
-                "label": f"📺 {label_text} (Low Quality)",
-                "url": url, "method": "direct",
-                "height": height, "quality_key": "low",
-            })
-    else:
-        dbg.warn("videoLow پیدا نشد")
+            dbg.warn(f"{var_name} پیدا نشد")
 
 
-def _extract_video_tags(
-    html: str, qualities: List[dict], seen_urls: set, dbg: DebugLog
-) -> None:
-    video_tags = re.findall(r"<video[^>]*>", html, re.I)
-    dbg.info(f"<video> tags: {len(video_tags)}")
-
-    source_tags = re.findall(r"<source[^>]*>", html, re.I)
-    dbg.info(f"<source> tags: {len(source_tags)}")
-
-    video_src_m = re.search(
-        r"<video[^>]+src=[\"']([^\"']+\.mp4[^\"']*)[\"']", html, re.I
-    )
-    if video_src_m:
-        url = html_lib.unescape(video_src_m.group(1).strip())
+def _extract_video_tags(html: str, qualities: List[dict], seen: set, dbg: DebugLog) -> None:
+    video_src = re.search(r"<video[^>]+src=[\"']([^\"']+\.mp4[^\"']*)[\"']", html, re.I)
+    if video_src:
+        url = html_lib.unescape(video_src.group(1).strip())
         dbg.ok(f"video src: `{url[:80]}`")
-        if url not in seen_urls and _is_valid_cdn_url(url):
-            seen_urls.add(url)
+        if url not in seen:
+            seen.add(url)
             is_high = "_high" in url
             qualities.append({
                 "label": f"📺 {'High' if is_high else 'Low'} (Video Tag)",
@@ -560,39 +591,30 @@ def _extract_video_tags(
                 "height": 720 if is_high else 360,
                 "quality_key": "high" if is_high else "low",
             })
-    else:
-        dbg.warn("video src با mp4 پیدا نشد")
 
     for m in re.finditer(r"<source[^>]+src=[\"']([^\"']+\.mp4[^\"']*)[\"']", html, re.I):
         url = html_lib.unescape(m.group(1).strip())
-        if url in seen_urls or not _is_valid_cdn_url(url):
-            continue
-        seen_urls.add(url)
-        is_high = "_high" in url
-        qualities.append({
-            "label": f"📺 {'High' if is_high else 'Low'} (Source Tag)",
-            "url": url, "method": "direct",
-            "height": 720 if is_high else 360,
-            "quality_key": "high" if is_high else "low",
-        })
+        if url not in seen:
+            seen.add(url)
+            is_high = "_high" in url
+            qualities.append({
+                "label": f"📺 {'High' if is_high else 'Low'} (Source)",
+                "url": url, "method": "direct",
+                "height": 720 if is_high else 360,
+                "quality_key": "high" if is_high else "low",
+            })
+            dbg.ok(f"source: `{url[:80]}`")
 
 
-def _extract_direct_mp4(
-    html: str, qualities: List[dict], seen_urls: set, dbg: DebugLog
-) -> None:
-    mp4_pattern = re.compile(
-        r'(https?://[^\s"\'<>]*nosofiles\.com/[^\s"\'<>]+\.mp4[^\s"\'<>]*)'
-    )
-    matches = mp4_pattern.findall(html)
-    dbg.info(f"MP4 URLs (nosofiles): {len(matches)}")
-
+def _extract_direct_mp4(html: str, qualities: List[dict], seen: set, dbg: DebugLog) -> None:
+    pattern = re.compile(r'(https?://[^\s"\'<>]*nosofiles\.com/[^\s"\'<>]+\.mp4[^\s"\'<>]*)')
+    matches = pattern.findall(html)
+    dbg.info(f"nosofiles MP4: {len(matches)}")
     for url in matches:
         url = url.strip()
-        if "/trailer.mp4" in url or "preview" in url:
+        if "/trailer.mp4" in url or "preview" in url or url in seen:
             continue
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
+        seen.add(url)
         is_high = "_high" in url
         qualities.append({
             "label": f"📺 {'High' if is_high else 'Low'} (Direct)",
@@ -600,22 +622,18 @@ def _extract_direct_mp4(
             "height": 720 if is_high else 360,
             "quality_key": "high" if is_high else "low",
         })
+        dbg.ok(f"direct: `{url[:80]}`")
 
 
-def _extract_any_mp4(
-    html: str, qualities: List[dict], seen_urls: set, dbg: DebugLog
-) -> None:
-    mp4_pattern = re.compile(r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)')
-    matches = mp4_pattern.findall(html)
-    dbg.info(f"تمام MP4 URLs: {len(matches)}")
-
+def _extract_any_mp4(html: str, qualities: List[dict], seen: set, dbg: DebugLog) -> None:
+    matches = re.findall(r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)', html)
+    dbg.info(f"تمام MP4: {len(matches)}")
     for url in matches:
         url = url.strip()
-        host = urlparse(url).hostname or "unknown"
-        dbg.info(f"  mp4: host={host} → `{url[:120]}`")
-        if url in seen_urls or "/trailer.mp4" in url or "preview" in url:
+        host = urlparse(url).hostname or "?"
+        if url in seen or "/trailer.mp4" in url or "preview" in url:
             continue
-        seen_urls.add(url)
+        seen.add(url)
         is_high = "_high" in url
         qualities.append({
             "label": f"📺 {'High' if is_high else 'Low'} ({host})",
@@ -623,51 +641,35 @@ def _extract_any_mp4(
             "height": 720 if is_high else 360,
             "quality_key": f"{'high' if is_high else 'low'}_{host}",
         })
-        dbg.ok(f"  → اضافه شد ({host})")
+        dbg.ok(f"mp4 ({host}): `{url[:80]}`")
 
 
-def _extract_json_sources(
-    html: str, qualities: List[dict], seen_urls: set, dbg: DebugLog
-) -> None:
-    sources_m = re.findall(r'sources\s*:\s*\[([^\]]+)\]', html)
-    if sources_m:
-        dbg.info(f"JS sources arrays: {len(sources_m)}")
-        for block in sources_m:
-            urls = re.findall(r'src["\']?\s*:\s*["\']([^"\']+)["\']', block)
-            for url in urls:
-                if url not in seen_urls and ".mp4" in url:
-                    seen_urls.add(url)
-                    qualities.append({
-                        "label": "📺 From JS sources",
-                        "url": url, "method": "direct",
-                        "height": 480, "quality_key": f"js_{url[-20:]}",
-                    })
-
-    file_m = re.findall(r'file\s*:\s*["\']([^"\']+\.mp4[^"\']*)["\']', html)
-    if file_m:
-        dbg.info(f"JS file vars: {len(file_m)}")
-        for url in file_m:
-            if url not in seen_urls:
-                seen_urls.add(url)
+def _extract_json_sources(html: str, qualities: List[dict], seen: set, dbg: DebugLog) -> None:
+    for block in re.findall(r'sources\s*:\s*\[([^\]]+)\]', html):
+        for url in re.findall(r'src["\']?\s*:\s*["\']([^"\']+)["\']', block):
+            if url not in seen and ".mp4" in url:
+                seen.add(url)
                 qualities.append({
-                    "label": "📺 From JS file",
-                    "url": url, "method": "direct",
-                    "height": 480, "quality_key": f"file_{url[-20:]}",
+                    "label": "📺 JS sources", "url": url, "method": "direct",
+                    "height": 480, "quality_key": f"js_{len(seen)}",
                 })
+
+    for url in re.findall(r'file\s*:\s*["\']([^"\']+\.mp4[^"\']*)["\']', html):
+        if url not in seen:
+            seen.add(url)
+            qualities.append({
+                "label": "📺 JS file", "url": url, "method": "direct",
+                "height": 480, "quality_key": f"file_{len(seen)}",
+            })
 
     ts_m = re.search(r"const\s+toStore\s*=\s*(\{[^;]+\})", html)
     if ts_m:
-        dbg.info("toStore object پیدا شد")
+        dbg.info("toStore پیدا شد")
         try:
             data = json.loads(ts_m.group(1))
             dbg.info(f"toStore keys: {list(data.keys())}")
-            for key, val in data.items():
-                if isinstance(val, str) and (".mp4" in val or "http" in val):
-                    dbg.info(f"  toStore[{key}] = `{val[:100]}`")
         except (json.JSONDecodeError, ValueError) as e:
             dbg.warn(f"toStore parse error: {e}")
-    else:
-        dbg.warn("toStore پیدا نشد")
 
 
 def _parse_height(text: str) -> Optional[int]:
@@ -688,102 +690,67 @@ def _extract_video_info(html: str, dbg: DebugLog) -> dict:
             info["likes"] = data.get("likes", "")
             info["thumbnail"] = data.get("thumbnail", "")
             info["post_id"] = data.get("postId", 0)
-            dbg.ok(f"Video info: views={info.get('views')}, duration={info.get('duration')}")
         except (json.JSONDecodeError, ValueError):
             pass
-
-    if "thumbnail" not in info:
-        poster_m = re.search(r"poster=[\"']([^\"']+)[\"']", html)
-        if poster_m:
-            info["thumbnail"] = poster_m.group(1)
-
     return info
 
 
 def _debug_html_structure(html: str, dbg: DebugLog) -> None:
-    dbg.step("── آنالیز ساختار HTML ──")
-
     scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.I | re.S)
-    dbg.info(f"<script> tags: {len(scripts)}")
-    for i, script in enumerate(scripts):
-        if any(kw in script.lower() for kw in ["video", "mp4", "source", "player", "cdn", "noso"]):
-            preview = script.replace("\n", " ").strip()[:300]
-            dbg.info(f"  script[{i}] (video): `{preview}`")
-
-    iframes = re.findall(r"<iframe[^>]+src=[\"']([^\"']+)[\"']", html, re.I)
-    if iframes:
-        dbg.info(f"iframes: {len(iframes)}")
-        for src in iframes:
-            dbg.info(f"  iframe: `{src[:100]}`")
-
-    data_attrs = re.findall(r'data-(?:src|url|video|file)\s*=\s*["\']([^"\']+)["\']', html, re.I)
-    if data_attrs:
-        dbg.info(f"data-* attrs: {len(data_attrs)}")
-        for val in data_attrs:
-            dbg.info(f"  data-*: `{val[:100]}`")
+    dbg.info(f"Scripts: {len(scripts)}")
+    for i, s in enumerate(scripts):
+        if any(kw in s.lower() for kw in ["video", "mp4", "player", "cdn", "noso"]):
+            dbg.info(f"  script[{i}]: `{s.replace(chr(10), ' ')[:200]}`")
 
     all_hosts = set(re.findall(r'https?://([a-zA-Z0-9.-]+)', html))
-    dbg.info(f"Hostnames ({len(all_hosts)}):")
-    for host in sorted(all_hosts):
-        marker = ""
-        if host in _CDN_HOSTS:
-            marker = " ← CDN"
-        if host in _ALLOWED_HOSTS:
-            marker = " ← ALLOWED"
-        dbg.info(f"  {host}{marker}")
+    dbg.info(f"Hosts: {sorted(all_hosts)}")
 
 
-# ─── Main extraction ───────────────────────────────────────
+# ─── Main API ──────────────────────────────────────────────
 
 
 async def extract_xanimu_qualities(
     url: str,
     debug_callback: Optional[ProgressCallback] = None,
 ) -> Tuple[List[dict], str, dict, DebugLog]:
+    """
+    استخراج کیفیت‌ها با Playwright bypass.
+
+    Returns:
+        (qualities, title, info, debug_log)
+    """
     dbg = DebugLog()
     dbg.step(f"URL: `{url}`")
 
-    parsed = urlparse(url)
-    dbg.info(f"Host: {parsed.hostname}, Path: {parsed.path}")
-
     if not is_xanimu_url(url):
-        dbg.err(f"URL نامعتبر: {parsed.hostname}")
+        dbg.err("URL نامعتبر")
         if debug_callback:
             await debug_callback(dbg.build_short())
         return [], "Invalid URL", {}, dbg
 
     dbg.ok("URL معتبر")
 
-    if debug_callback:
-        await debug_callback("🔄 **در حال bypass کردن Cloudflare...**")
+    # مرحله 1: حل Cloudflare و گرفتن HTML
+    html, cookies, user_agent = await _solve_cloudflare(url, dbg, debug_callback)
 
-    # دریافت HTML با تمام روش‌ها
-    html, status = await _fetch_page(url, dbg)
-
-    if not html:
-        dbg.err(f"دریافت HTML ناموفق (status={status})")
-        if debug_callback:
-            await debug_callback(dbg.build_short())
-        return [], "Failed to fetch page", {}, dbg
-
-    cf_indicators = ["Just a moment", "cf-browser-verification", "challenge-platform"]
-    cf_found = [ind for ind in cf_indicators if ind in html]
-    if cf_found or len(html) < 2000:
-        dbg.err(f"Cloudflare block: {cf_found}, size={len(html)}")
+    if not html or "Just a moment" in html or len(html) < 2000:
+        dbg.err("Cloudflare bypass ناموفق")
         if debug_callback:
             await debug_callback(dbg.build_short())
         return [], "Cloudflare blocked", {}, dbg
 
-    dbg.ok("Cloudflare bypass موفق!")
+    dbg.ok(f"HTML دریافت شد: {len(html)} chars")
 
+    # مرحله 2: آنالیز و استخراج
     _debug_html_structure(html, dbg)
 
     if debug_callback:
-        await debug_callback("🔄 **در حال استخراج لینک‌ها...**")
+        await debug_callback("🔄 **استخراج لینک‌ها...**")
 
-    qualities, title = _extract_from_html(html, url, dbg)
+    qualities, title = _extract_from_html(html, dbg)
     info = _extract_video_info(html, dbg)
 
+    # حذف تکراری
     unique = {}
     for q in qualities:
         key = q.get("quality_key", q.get("url"))
@@ -791,11 +758,15 @@ async def extract_xanimu_qualities(
             unique[key] = q
     qualities = sorted(unique.values(), key=lambda q: q.get("height", 0), reverse=True)
 
-    dbg.step("── نتیجه ──")
+    # ذخیره cookies و user_agent در هر quality برای دانلود
+    for q in qualities:
+        q["_cookies"] = cookies
+        q["_user_agent"] = user_agent
+
     if qualities:
-        dbg.ok(f"{len(qualities)} کیفیت پیدا شد: {title[:60]}")
+        dbg.ok(f"✅ {len(qualities)} کیفیت: {title[:60]}")
     else:
-        dbg.err("هیچ کیفیتی پیدا نشد!")
+        dbg.err("❌ هیچ کیفیتی پیدا نشد")
 
     if debug_callback:
         await debug_callback(dbg.build_short())
@@ -803,7 +774,7 @@ async def extract_xanimu_qualities(
     return qualities, title, info, dbg
 
 
-# ─── Download ───────────────────────────────────────────────
+# ─── Download (با Cloudflare cookies) ──────────────────────
 
 
 async def download_xanimu_video(
@@ -811,43 +782,107 @@ async def download_xanimu_video(
     video_url: str,
     filepath: str,
     progress_cb: Optional[ProgressCallback] = None,
+    cookies: Optional[list] = None,
+    user_agent: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
+    """
+    دانلود ویدیو.
+    cookies و user_agent از extract_xanimu_qualities میان.
+    """
     if not is_xanimu_url(url):
         return False, "URL not allowed", 0
     if not video_url:
         return False, "Empty video URL", 0
 
-    success, error, size = await _download_direct(
-        video_url, url, filepath, progress_cb,
+    dbg = DebugLog()
+    ua = user_agent or _USER_AGENT
+    cks = cookies or []
+
+    # تلاش 1: دانلود مستقیم با cookies صفحه
+    dbg.step("دانلود مستقیم با cookies...")
+    success, error, size = await _download_with_cookies(
+        video_url, url, filepath, cks, ua, progress_cb, dbg,
     )
     if success:
         return True, "", size
 
-    logger.info("Direct failed: %s, trying curl", error)
-    return await _download_with_curl(video_url, url, filepath, progress_cb)
+    # تلاش 2: حل Cloudflare CDN و دانلود
+    dbg.step("حل Cloudflare CDN...")
+    if progress_cb:
+        await progress_cb("🔄 **CDN هم Cloudflare داره، در حال حل...**")
+
+    cdn_cookies, cdn_ua = await _solve_cdn_cloudflare(
+        video_url, cks, ua, dbg, progress_cb,
+    )
+
+    success, error, size = await _download_with_cookies(
+        video_url, url, filepath, cdn_cookies, cdn_ua, progress_cb, dbg,
+    )
+    if success:
+        return True, "", size
+
+    # تلاش 3: دانلود با Playwright مستقیم
+    dbg.step("دانلود با Playwright...")
+    return await _download_with_playwright(
+        video_url, filepath, progress_cb, dbg,
+    )
 
 
-async def _download_direct(
+async def _download_with_cookies(
     video_url: str,
     referer: str,
     filepath: str,
+    cookies: list,
+    user_agent: str,
     progress_cb: Optional[ProgressCallback],
+    dbg: DebugLog,
 ) -> Tuple[bool, str, int]:
-    headers = {**_DEFAULT_HEADERS, "Referer": referer}
+    """دانلود با aiohttp و Cloudflare cookies."""
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": referer,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            jar = aiohttp.CookieJar(unsafe=True)
             timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(video_url, allow_redirects=True) as resp:
+
+            async with aiohttp.ClientSession(
+                cookie_jar=jar, timeout=timeout
+            ) as session:
+                # تنظیم cookies
+                for cookie in cookies:
+                    domain = cookie.get("domain", "").lstrip(".")
+                    if domain:
+                        session.cookie_jar.update_cookies(
+                            {cookie["name"]: cookie["value"]},
+                            response_url=aiohttp.client.URL(f"https://{domain}"),
+                        )
+
+                async with session.get(
+                    video_url, headers=headers, allow_redirects=True
+                ) as resp:
+                    dbg.info(f"Download attempt {attempt}: HTTP {resp.status}")
+                    dbg.info(f"Content-Type: {resp.headers.get('Content-Type', '?')}")
+
+                    content_type = resp.headers.get("Content-Type", "")
+
+                    # اگه HTML برگشت = Cloudflare challenge
+                    if "text/html" in content_type:
+                        body_preview = await resp.content.read(500)
+                        dbg.warn(f"HTML response (CF challenge): `{body_preview.decode(errors='replace')[:200]}`")
+                        return False, "Cloudflare challenge on CDN", 0
+
                     if resp.status != 200:
-                        error = f"HTTP {resp.status}"
                         if 400 <= resp.status < 500:
-                            return False, error, 0
+                            return False, f"HTTP {resp.status}", 0
                         if attempt < MAX_RETRIES:
                             await asyncio.sleep(RETRY_DELAY * attempt)
                             continue
-                        return False, error, 0
+                        return False, f"HTTP {resp.status}", 0
 
                     content_length = int(resp.headers.get("Content-Length", 0))
                     if content_length > MAX_DOWNLOAD_SIZE:
@@ -862,6 +897,7 @@ async def _download_direct(
                         async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                             await f.write(chunk)
                             downloaded += len(chunk)
+
                             if downloaded > MAX_DOWNLOAD_SIZE:
                                 _cleanup_file(filepath)
                                 return False, "Exceeded size limit", 0
@@ -878,13 +914,15 @@ async def _download_direct(
             if size < MIN_FILE_SIZE:
                 _cleanup_file(filepath)
                 return False, f"Too small ({size} bytes)", 0
+
+            dbg.ok(f"دانلود موفق: {_format_size(size)}")
             return True, "", size
 
         except asyncio.CancelledError:
             _cleanup_file(filepath)
             raise
         except Exception as e:
-            logger.warning("Download attempt %d/%d: %s", attempt, MAX_RETRIES, e)
+            dbg.warn(f"Download attempt {attempt}: {e}")
             _cleanup_file(filepath)
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(RETRY_DELAY * attempt)
@@ -892,56 +930,96 @@ async def _download_direct(
     return False, f"Failed after {MAX_RETRIES} attempts", 0
 
 
-async def _download_with_curl(
+async def _download_with_playwright(
     video_url: str,
-    referer: str,
     filepath: str,
     progress_cb: Optional[ProgressCallback],
+    dbg: DebugLog,
 ) -> Tuple[bool, str, int]:
-    if not _check_curl():
-        return False, "curl not found", 0
+    """
+    آخرین چاره: دانلود مستقیم با Playwright.
+    مرورگر خودش challenge رو حل می‌کنه و فایل رو دانلود می‌کنه.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return False, "playwright not installed", 0
 
-    cmd = [
-        "curl", "-L",
-        "-o", filepath,
-        "-H", f"User-Agent: {_USER_AGENT}",
-        "-H", f"Referer: {referer}",
-        "-H", "Accept: */*",
-        "--compressed",
-        "--max-time", "3600",
-        "--retry", str(MAX_RETRIES),
-        video_url,
-    ]
+    dbg.step("دانلود با Playwright browser...")
+    if progress_cb:
+        await progress_cb("📥 **دانلود با مرورگر (آخرین روش)...**\n⏳ ممکنه کند باشه")
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        if progress_cb:
-            await progress_cb("📥 **Downloading with curl...**")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
 
-        _, stderr_data = await asyncio.wait_for(process.communicate(), timeout=3600)
+            context = await browser.new_context(
+                user_agent=_USER_AGENT,
+                accept_downloads=True,
+            )
 
-        if process.returncode == 0 and os.path.exists(filepath):
-            size = os.path.getsize(filepath)
-            if size < MIN_FILE_SIZE:
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = {runtime: {}};
+            """)
+
+            page = await context.new_page()
+
+            # روش 1: intercept network response
+            video_data_chunks = []
+            total_size = 0
+            download_started = asyncio.Event()
+
+            async def handle_response(response):
+                nonlocal total_size
+                url = response.url
+                content_type = response.headers.get("content-type", "")
+
+                if "video" in content_type or url.endswith(".mp4"):
+                    dbg.ok(f"Video response intercepted: {url[:80]}")
+                    download_started.set()
+
+                    try:
+                        body = await response.body()
+                        total_size = len(body)
+                        dbg.ok(f"Video size: {_format_size(total_size)}")
+
+                        async with aiofiles.open(filepath, "wb") as f:
+                            await f.write(body)
+                    except Exception as e:
+                        dbg.warn(f"Response body error: {e}")
+
+            page.on("response", handle_response)
+
+            # رفتن به URL
+            try:
+                await page.goto(video_url, wait_until="networkidle", timeout=120000)
+            except Exception as e:
+                dbg.warn(f"Playwright goto: {e}")
+
+            # صبر برای دانلود
+            try:
+                await asyncio.wait_for(download_started.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                dbg.warn("Video response intercepted نشد")
+
+            await browser.close()
+
+            if os.path.exists(filepath):
+                size = os.path.getsize(filepath)
+                if size >= MIN_FILE_SIZE:
+                    dbg.ok(f"Playwright download: {_format_size(size)}")
+                    return True, "", size
                 _cleanup_file(filepath)
                 return False, f"Too small ({size} bytes)", 0
-            return True, "", size
 
-        error = stderr_data.decode(errors="replace").strip()[:200]
-        _cleanup_file(filepath)
-        return False, f"curl failed: {error}", 0
+            return False, "File not created", 0
 
-    except asyncio.TimeoutError:
-        _cleanup_file(filepath)
-        return False, "curl timeout", 0
-    except asyncio.CancelledError:
-        _cleanup_file(filepath)
-        raise
     except Exception as e:
+        dbg.err(f"Playwright download error: {e}")
         _cleanup_file(filepath)
         return False, str(e)[:200], 0
 
@@ -977,10 +1055,17 @@ async def _report_progress(
         )
 
 
+# ─── Wrapper ────────────────────────────────────────────────
+
+
 async def download_xanimu_direct(
     url: str,
     filepath: str,
     progress_cb: Optional[ProgressCallback] = None,
     video_url: str = "",
+    cookies: Optional[list] = None,
+    user_agent: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
-    return await download_xanimu_video(url, video_url, filepath, progress_cb)
+    return await download_xanimu_video(
+        url, video_url, filepath, progress_cb, cookies, user_agent,
+    )
