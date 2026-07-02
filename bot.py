@@ -6988,6 +6988,8 @@ async def xanimu_quality_callback(event):
             video_url=chosen.get("url", ""),
             filepath=filepath,
             progress_cb=progress_cb,
+            cookies=chosen.get("_cookies"),
+            user_agent=chosen.get("_user_agent"),
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
