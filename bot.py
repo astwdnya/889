@@ -4934,11 +4934,18 @@ async def video_receive_handler(event):
 
     filename = fname_attr or f"video_{event.id}{ext or '.mp4'}"
 
-    # batch key یکتا برای هر ویدیو
-    batch_key = f"vbatch_{event.chat_id}_{event.id}"
+    # batch key برای همه ویدیوهای همزمان (تا ۳ ثانیه)
+    batch_key = f"vbatch_{event.chat_id}"
 
-    # batch جدید
-    video_send_pending[batch_key] = {
+    # اگه batch قبلی هنوز بازه (تایمر تموم نشده)، فایل جدید اضافه کن
+    if batch_key in video_send_pending:
+        video_send_pending[batch_key]["files"].append({
+            "message_id": event.id,
+            "file_size": file_size,
+            "filename": filename,
+        })
+    else:
+        video_send_pending[batch_key] = {
             "chat_id": event.chat_id,
             "reply_to_id": event.id,
             "files": [
@@ -4951,6 +4958,8 @@ async def video_receive_handler(event):
         }
 
     # شروع (یا ریست) تایمر ۳ ثانیه‌ای
+    if batch_key in video_send_timers:
+        video_send_timers[batch_key].cancel()
     task = asyncio.get_event_loop().create_task(
         _flush_video_send_batch(batch_key, event.client, event.chat_id, event.id)
     )
