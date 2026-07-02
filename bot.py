@@ -252,8 +252,7 @@ video_send_pending: Dict[str, Dict] = {}
 video_send_timers: Dict[str, asyncio.Task] = {}
 
 # اشتراک‌گذاری ویدیو با لینک از طریق آرکایو کانال تلگرام
-ARCHIVE_CHANNEL_LINK = os.getenv("ARCHIVE_CHANNEL_LINK", "")
-ARCHIVE_CHANNEL_ID: int = 0
+ARCHIVE_CHANNEL_ID: int = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))
 BOT_USERNAME: str = ""
 sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
 pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
@@ -7812,36 +7811,6 @@ async def main():
     else:
         logger.critical("[BOOT] Could not connect after 5 FloodWait retries. Exiting.")
         return
-
-    # ===== Resolve archive channel =====
-    global ARCHIVE_CHANNEL_ID
-    if ARCHIVE_CHANNEL_LINK:
-        link = ARCHIVE_CHANNEL_LINK.strip()
-        # استخراج hash از لینک دعوت خصوصی: https://t.me/+cAfY3SwI6P43NmI0
-        import re as _re
-        m = _re.search(r"\+([a-zA-Z0-9_-]+)", link)
-        invite_hash = m.group(1) if m else ""
-        try:
-            if invite_hash:
-                from telethon import functions as _f, types as _t
-                result = await client(_f.messages.CheckChatInviteRequest(invite_hash))
-                if isinstance(result, _t.ChatInviteAlready):
-                    ARCHIVE_CHANNEL_ID = result.chat.id
-                    logger.info(f"[BOOT] Archive channel resolved: {result.chat.id} ({getattr(result.chat, 'title', '?')})")
-                else:
-                    result2 = await client(_f.messages.ImportChatInviteRequest(invite_hash))
-                    for chat in result2.chats:
-                        ARCHIVE_CHANNEL_ID = chat.id
-                        logger.info(f"[BOOT] Joined & resolved archive channel: {chat.id}")
-                        break
-            else:
-                entity = await client.get_entity(link)
-                ARCHIVE_CHANNEL_ID = entity.id
-                logger.info(f"[BOOT] Archive channel resolved: {entity.id}")
-        except Exception as e:
-            logger.error(f"[BOOT] Failed to resolve archive channel: {e}")
-        if not ARCHIVE_CHANNEL_ID:
-            logger.warning("[BOOT] Archive channel NOT configured — share links will not work.")
 
     # ===== CallbackQuery handlers =====
     client.add_event_handler(
