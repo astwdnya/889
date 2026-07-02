@@ -2706,6 +2706,7 @@ async def admin_input_handler(event):
             chat_id = txt
             link = txt
         sponsors.append({"name": name, "chat_id": chat_id, "link": link})
+        asyncio.ensure_future(_save_sponsors(event.client))
         await event.reply(
             f"✅ **اسپانسر اضافه شد!**\n📢 `{name}` — `{chat_id}`",
             parse_mode="markdown",
@@ -3243,6 +3244,54 @@ async def admin_cancel_callback(event):
         pass
 
 
+# ====================== SPONSOR MANIFEST (persist in archive) ======================
+
+
+async def _save_sponsors(client):
+    """ذخیره لیست اسپانسرها توی آرکایو کانال (ویرایش پیام manifest)."""
+    if not ARCHIVE_CHANNEL_ID:
+        return
+    if sponsors:
+        lines = [f"{s['name']}|{s['chat_id']}|{s['link']}" for s in sponsors]
+        text = "SPONSORS_MANIFEST\n" + "\n".join(lines)
+    else:
+        text = "SPONSORS_MANIFEST"
+    try:
+        msgs = await client.get_messages(ARCHIVE_CHANNEL_ID, limit=20)
+        for msg in msgs:
+            if msg.text and msg.text.startswith("SPONSORS_MANIFEST"):
+                await msg.edit(text)
+                return
+        await client.send_message(ARCHIVE_CHANNEL_ID, text)
+    except Exception as e:
+        logger.error(f"[SPONSOR] Failed to save manifest: {e}")
+
+
+async def _load_sponsors(client):
+    """بازیابی لیست اسپانسرها از آرکایو کانال."""
+    global sponsors
+    if not ARCHIVE_CHANNEL_ID:
+        return
+    try:
+        msgs = await client.get_messages(ARCHIVE_CHANNEL_ID, limit=20)
+        for msg in msgs:
+            if msg.text and msg.text.startswith("SPONSORS_MANIFEST"):
+                sponsors = []
+                lines = msg.text.split("\n")[1:]
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split("|", 2)
+                    if len(parts) == 3:
+                        sponsors.append({"name": parts[0], "chat_id": parts[1], "link": parts[2]})
+                logger.info(f"[BOOT] Restored {len(sponsors)} sponsors from archive")
+                return
+        logger.info("[BOOT] No sponsors manifest found in archive")
+    except Exception as e:
+        logger.error(f"[BOOT] Failed to load sponsors: {e}")
+
+
 # ====================== SPONSOR HANDLERS ======================
 
 
@@ -3289,6 +3338,7 @@ async def admin_sponsor_rm_callback(event):
     try:
         idx = int(idx_str)
         removed = sponsors.pop(idx)
+        asyncio.ensure_future(_save_sponsors(event.client))
         await event.answer(f"✅ {removed['name']} حذف شد!", alert=False)
     except (IndexError, ValueError):
         await event.answer("❌ خطا در حذف.", alert=True)
@@ -8105,6 +8155,11 @@ async def main():
     me = await client.get_me()
     global BOT_USERNAME
     BOT_USERNAME = me.username
+
+    # بازیابی اسپانسرها از آرکایو کانال
+    if ARCHIVE_CHANNEL_ID:
+        await _load_sponsors(client)
+
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
     logger.info(
