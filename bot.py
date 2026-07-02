@@ -251,8 +251,9 @@ video_send_pending: Dict[str, Dict] = {}
 # تسک‌های تایمر batch ویدیو
 video_send_timers: Dict[str, asyncio.Task] = {}
 
-# اشتراک‌گذاری ویدیو با لینک (جهت کاربرای غیرمجاز)
-share_links: Dict[str, dict] = {}
+# اشتراک‌گذاری ویدیو با لینک از طریق آرکایو کانال تلگرام
+ARCHIVE_CHANNEL_LINK = os.getenv("ARCHIVE_CHANNEL_LINK", "")
+ARCHIVE_CHANNEL_ID: int = 0
 BOT_USERNAME: str = ""
 sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
 pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
@@ -3303,17 +3304,20 @@ async def sponsor_join_check_callback(event):
     parts = data.split("_", 3)
     if len(parts) < 4:
         return await event.answer("❌ خطا", alert=True)
-    key = parts[2]
+    try:
+        manifest_msg_id = int(parts[2])
+    except ValueError:
+        return await event.answer("❌ خطا", alert=True)
     original_user_id = int(parts[3])
     if event.sender_id != original_user_id:
         return await event.answer("⛔ این دکمه مال شما نیست.", alert=True)
-    info = share_links.get(key)
-    if not info:
-        return await event.answer("❌ لینک منقضی شده.", alert=True)
+
+    if not ARCHIVE_CHANNEL_ID:
+        return await event.answer("❌ آرکایو کانال تنظیم نشده.", alert=True)
 
     if not sponsors:
         await event.answer("", alert=False)
-        await _forward_share_videos(event, key, info)
+        await _forward_share_videos(event, manifest_msg_id)
         return
 
     user_id = event.sender_id
@@ -3334,22 +3338,20 @@ async def sponsor_join_check_callback(event):
         await event.delete()
     except Exception:
         pass
-    await _forward_share_videos(event, key, info)
+    await _forward_share_videos(event, manifest_msg_id)
 
 
-async def _forward_share_videos(event, key: str, info: dict):
-    """فوروارد ویدیوها به کاربر و حذف بعد ۲۰ ثانیه."""
-    messages = info.get("messages", [])
-    if not messages:
+async def _forward_share_videos(event, manifest_msg_id: int):
+    """فوروارد ویدیوها از آرکایو کانال به کاربر و حذف بعد ۲۰ ثانیه."""
+    msg_ids = await _get_manifest_msg_ids(event.client, manifest_msg_id)
+    if not msg_ids:
         await event.reply("❌ ویدیویی وجود نداره.")
         return
 
     forwarded_msgs = []
-    for m in messages:
-        chat_id = m["chat_id"]
-        msg_id = m["message_id"]
+    for msg_id in msg_ids:
         try:
-            msg = await event.client.get_messages(chat_id, ids=msg_id)
+            msg = await event.client.get_messages(ARCHIVE_CHANNEL_ID, ids=msg_id)
             if msg:
                 fwd_list = await event.client.forward_messages(event.sender_id, msg)
                 fwd = fwd_list[0] if isinstance(fwd_list, list) else fwd_list
@@ -3369,7 +3371,7 @@ async def _forward_share_videos(event, key: str, info: dict):
             pass
 
     try:
-        refresh_link = f"https://t.me/{BOT_USERNAME}?start=share_{key}"
+        refresh_link = f"https://t.me/{BOT_USERNAME}?start=share_{manifest_msg_id}"
         await event.client.send_message(
             event.sender_id,
             "⏰ ویدیو بعد از ۲۰ ثانیه حذف شد.\n"
@@ -3565,10 +3567,14 @@ async def start_cmd(event):
     if len(parts) > 1:
         param = parts[1].strip()
         if param.startswith("share_"):
-            key = param[6:].strip()
-            info = share_links.get(key)
-            if not info:
-                return await event.reply("❌ این لینک منقضی شده یا معتبر نیست.")
+            manifest_str = param[6:].strip()
+            try:
+                manifest_msg_id = int(manifest_str)
+            except ValueError:
+                return await event.reply("❌ لینک نامعتبر.")
+
+            if not ARCHIVE_CHANNEL_ID:
+                return await event.reply("❌ آرکایو کانال تنظیم نشده.")
 
             # بررسی اسپانسرها
             if sponsors:
@@ -3589,7 +3595,7 @@ async def start_cmd(event):
                         row.append(Button.url(s["name"], link))
                     buttons.append(row)
                     buttons.append(
-                        [Button.inline("✅ عضو شدم", f"sponsor_ok_{key}_{user_id}")]
+                        [Button.inline("✅ عضو شدم", f"sponsor_ok_{manifest_msg_id}_{user_id}")]
                     )
 
                     await event.reply(
@@ -3600,7 +3606,7 @@ async def start_cmd(event):
                     )
                     return
 
-            await _forward_share_videos(event, key, info)
+            await _forward_share_videos(event, manifest_msg_id)
             return
 
     if event.sender_id not in AUTHORIZED_USERS:
@@ -5088,6 +5094,23 @@ async def vsend_callback(event):
 # ====================== SHARE LINK ======================
 
 
+async def _get_manifest_msg_ids(client, manifest_msg_id: int) -> list:
+    """خوندن لیست message_idهای ویدیو از پیام manifes توی آرکایو."""
+    try:
+        msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=manifest_msg_id)
+        if not msg:
+            return []
+        text = msg.text or ""
+        if not text.startswith("SHARE_MANIFEST:"):
+            return []
+        parts = text.split(":", 2)
+        if len(parts) < 3:
+            return []
+        return [int(x) for x in parts[2].split(",") if x]
+    except Exception:
+        return []
+
+
 async def sharelink_callback(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.answer("⛔ Unauthorized", alert=True)
@@ -5099,19 +5122,38 @@ async def sharelink_callback(event):
 
     files = batch["files"]
     chat_id = batch["chat_id"]
-    messages = [{"chat_id": chat_id, "message_id": f["message_id"]} for f in files]
+
+    if not ARCHIVE_CHANNEL_ID:
+        return await event.answer("❌ آرکایو کانال تنظیم نشده.", alert=True)
+
+    # فوروارد ویدیوها به آرکایو کانال
+    manifest_ids = []
+    for f in files:
+        try:
+            msg = await event.client.get_messages(chat_id, ids=f["message_id"])
+            if msg:
+                fwd = await event.client.forward_messages(ARCHIVE_CHANNEL_ID, msg)
+                fwd_msg = fwd[0] if isinstance(fwd, list) else fwd
+                manifest_ids.append(str(fwd_msg.id))
+        except Exception as e:
+            logger.error(f"[SHARE] Forward to archive failed: {e}")
+
+    if not manifest_ids:
+        return await event.answer("❌ خطا در فوروارد به آرکایو.", alert=True)
 
     import uuid
-
     key = uuid.uuid4().hex[:12]
-    share_links[key] = {
-        "messages": messages,
-        "chat_id": chat_id,
-    }
+    manifest_text = f"SHARE_MANIFEST:{key}:{','.join(manifest_ids)}"
+    try:
+        manifest = await event.client.send_message(ARCHIVE_CHANNEL_ID, manifest_text)
+        manifest_msg_id = manifest.id
+    except Exception as e:
+        logger.error(f"[SHARE] Failed to send manifest: {e}")
+        return await event.answer("❌ خطا در ذخیره آرکایو.", alert=True)
 
-    link = f"https://t.me/{BOT_USERNAME}?start=share_{key}"
+    link = f"https://t.me/{BOT_USERNAME}?start=share_{manifest_msg_id}"
     await event.answer("✅ لینک ساخته شد!", alert=False)
-    count = len(messages)
+    count = len(manifest_ids)
     try:
         await event.edit(
             f"🔗 **لینک اشتراک‌گذاری ({count} ویدیو):**\n`{link}`\n\n"
@@ -7770,6 +7812,16 @@ async def main():
     else:
         logger.critical("[BOOT] Could not connect after 5 FloodWait retries. Exiting.")
         return
+
+    # ===== Resolve archive channel =====
+    global ARCHIVE_CHANNEL_ID
+    if ARCHIVE_CHANNEL_LINK:
+        try:
+            entity = await client.get_entity(ARCHIVE_CHANNEL_LINK)
+            ARCHIVE_CHANNEL_ID = entity.id
+            logger.info(f"[BOOT] Archive channel resolved: {entity.id}")
+        except Exception as e:
+            logger.error(f"[BOOT] Failed to resolve archive channel: {e}")
 
     # ===== CallbackQuery handlers =====
     client.add_event_handler(
