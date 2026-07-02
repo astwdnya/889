@@ -3247,48 +3247,32 @@ async def admin_cancel_callback(event):
 # ====================== SPONSOR MANIFEST (persist in archive) ======================
 
 
-async def _save_sponsors(client):
-    """ذخیره لیست اسپانسرها توی آرکایو کانال (ویرایش پیام manifest)."""
-    if not ARCHIVE_CHANNEL_ID:
-        return
-    if sponsors:
-        lines = [f"{s['name']}|{s['chat_id']}|{s['link']}" for s in sponsors]
-        text = "SPONSORS_MANIFEST\n" + "\n".join(lines)
-    else:
-        text = "SPONSORS_MANIFEST"
-    try:
-        msgs = await client.get_messages(ARCHIVE_CHANNEL_ID, limit=20)
-        for msg in msgs:
-            if msg.text and msg.text.startswith("SPONSORS_MANIFEST"):
-                await msg.edit(text)
-                return
-        await client.send_message(ARCHIVE_CHANNEL_ID, text)
-    except Exception as e:
-        logger.error(f"[SPONSOR] Failed to save manifest: {e}")
+SPONSORS_FILE = "sponsors.json"
 
 
-async def _load_sponsors(client):
-    """بازیابی لیست اسپانسرها از آرکایو کانال."""
+async def _save_sponsors(client=None):
+    """ذخیره لیست اسپانسرها توی فایل sponsors.json."""
     global sponsors
-    if not ARCHIVE_CHANNEL_ID:
-        return
     try:
-        msgs = await client.get_messages(ARCHIVE_CHANNEL_ID, limit=20)
-        for msg in msgs:
-            if msg.text and msg.text.startswith("SPONSORS_MANIFEST"):
-                sponsors = []
-                lines = msg.text.split("\n")[1:]
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split("|", 2)
-                    if len(parts) == 3:
-                        sponsors.append({"name": parts[0], "chat_id": parts[1], "link": parts[2]})
-                logger.info(f"[BOOT] Restored {len(sponsors)} sponsors from archive")
-                return
-        logger.info("[BOOT] No sponsors manifest found in archive")
+        with open(SPONSORS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sponsors, f, ensure_ascii=False)
     except Exception as e:
+        logger.error(f"[SPONSOR] Failed to save sponsors file: {e}")
+
+
+async def _load_sponsors(client=None):
+    """بازیابی لیست اسپانسرها از فایل sponsors.json."""
+    global sponsors
+    try:
+        if not os.path.exists(SPONSORS_FILE):
+            sponsors = []
+            logger.info("[BOOT] No sponsors file found")
+            return
+        with open(SPONSORS_FILE, "r", encoding="utf-8") as f:
+            sponsors = json.load(f)
+        logger.info(f"[BOOT] Restored {len(sponsors)} sponsors from file")
+    except Exception as e:
+        sponsors = []
         logger.error(f"[BOOT] Failed to load sponsors: {e}")
 
 
@@ -6903,9 +6887,18 @@ rule34video_sessions: Dict[str, dict] = {}
 
 
 async def process_xanimu_request(event, url: str, status_msg):
-    qualities, title, info = await extract_xanimu_qualities(url)
+    async def debug_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info, dbg = await extract_xanimu_qualities(
+        url,
+        debug_callback=debug_cb,
+    )
     if not qualities:
-        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد.\n\n{dbg.build_short()}")
         return
     session_id = f"xa_{event.chat_id}_{event.id}_{int(time.time())}"
     xanimu_sessions[session_id] = {
