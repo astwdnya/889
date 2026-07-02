@@ -28,6 +28,7 @@ from playwright.async_api import async_playwright
 from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
+from telethon import functions
 from telethon.tl.types import (
     Message,
     DocumentAttributeVideo,
@@ -3247,49 +3248,50 @@ async def admin_cancel_callback(event):
 # ====================== SPONSOR MANIFEST (persist in archive) ======================
 
 
-SPONSORS_MSGID_FILE = "sponsor_msg_id.txt"
-
-
 async def _save_sponsors(client):
-    """ذخیره لیست اسپانسرها توی آرکایو کانال."""
+    """ذخیره لیست اسپانسرها توی آرکایو کانال + ذخیره message ID توی about بات."""
     global sponsors
     if not ARCHIVE_CHANNEL_ID or not client:
         return
     text = json.dumps(sponsors, ensure_ascii=False)
     try:
-        # آیا از قبل message ID داریم؟
-        known_id = None
-        if os.path.exists(SPONSORS_MSGID_FILE):
-            with open(SPONSORS_MSGID_FILE, "r") as f:
-                known_id = int(f.read().strip())
-        if known_id:
+        # از about بات message ID قدیمی رو میخونیم
+        full = await client(functions.users.GetFullUserRequest(id='self'))
+        old_id = None
+        if full.about and full.about.startswith("SPMID:"):
+            old_id = int(full.about.replace("SPMID:", ""))
+
+        if old_id:
             try:
-                msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=known_id)
+                msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=old_id)
                 if msg:
                     await msg.edit(text)
                     return
             except Exception:
                 pass
-        # اگه نه، یکی جدید بفرست
+
+        # اولین بار — پیام جدید بفرست و message ID رو توی about بات ذخیره کن
         msg = await client.send_message(ARCHIVE_CHANNEL_ID, text)
-        with open(SPONSORS_MSGID_FILE, "w") as f:
-            f.write(str(msg.id))
+        await client(functions.account.UpdateProfileRequest(
+            about=f"SPMID:{msg.id}"
+        ))
     except Exception as e:
         logger.error(f"[SPONSOR] Failed to save to archive: {e}")
 
 
 async def _load_sponsors(client):
-    """بازیابی لیست اسپانسرها از آرکایو کانال با استفاده از message ID ذخیره شده."""
+    """بازیابی لیست اسپانسرها از آرکایو کانال با استفاده از about بات."""
     global sponsors
     sponsors = []
     if not ARCHIVE_CHANNEL_ID or not client:
         return
     try:
-        if not os.path.exists(SPONSORS_MSGID_FILE):
-            logger.info("[BOOT] No sponsor message ID file found")
+        full = await client(functions.users.GetFullUserRequest(id='self'))
+        about = full.about or ""
+        if not about.startswith("SPMID:"):
+            logger.info("[BOOT] No SPMID found in bot about")
             return
-        with open(SPONSORS_MSGID_FILE, "r") as f:
-            msg_id = int(f.read().strip())
+        msg_id = int(about.replace("SPMID:", ""))
         msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=msg_id)
         if msg and msg.text:
             sponsors = json.loads(msg.text)
