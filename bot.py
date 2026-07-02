@@ -3247,30 +3247,55 @@ async def admin_cancel_callback(event):
 # ====================== SPONSOR MANIFEST (persist in archive) ======================
 
 
-SPONSORS_FILE = "sponsors.json"
+SPONSORS_MSGID_FILE = "sponsor_msg_id.txt"
 
 
-async def _save_sponsors(client=None):
-    """ذخیره لیست اسپانسرها توی فایل sponsors.json."""
+async def _save_sponsors(client):
+    """ذخیره لیست اسپانسرها توی آرکایو کانال."""
     global sponsors
+    if not ARCHIVE_CHANNEL_ID or not client:
+        return
+    text = json.dumps(sponsors, ensure_ascii=False)
     try:
-        with open(SPONSORS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sponsors, f, ensure_ascii=False)
+        # آیا از قبل message ID داریم؟
+        known_id = None
+        if os.path.exists(SPONSORS_MSGID_FILE):
+            with open(SPONSORS_MSGID_FILE, "r") as f:
+                known_id = int(f.read().strip())
+        if known_id:
+            try:
+                msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=known_id)
+                if msg:
+                    await msg.edit(text)
+                    return
+            except Exception:
+                pass
+        # اگه نه، یکی جدید بفرست
+        msg = await client.send_message(ARCHIVE_CHANNEL_ID, text)
+        with open(SPONSORS_MSGID_FILE, "w") as f:
+            f.write(str(msg.id))
     except Exception as e:
-        logger.error(f"[SPONSOR] Failed to save sponsors file: {e}")
+        logger.error(f"[SPONSOR] Failed to save to archive: {e}")
 
 
-async def _load_sponsors(client=None):
-    """بازیابی لیست اسپانسرها از فایل sponsors.json."""
+async def _load_sponsors(client):
+    """بازیابی لیست اسپانسرها از آرکایو کانال با استفاده از message ID ذخیره شده."""
     global sponsors
+    sponsors = []
+    if not ARCHIVE_CHANNEL_ID or not client:
+        return
     try:
-        if not os.path.exists(SPONSORS_FILE):
-            sponsors = []
-            logger.info("[BOOT] No sponsors file found")
+        if not os.path.exists(SPONSORS_MSGID_FILE):
+            logger.info("[BOOT] No sponsor message ID file found")
             return
-        with open(SPONSORS_FILE, "r", encoding="utf-8") as f:
-            sponsors = json.load(f)
-        logger.info(f"[BOOT] Restored {len(sponsors)} sponsors from file")
+        with open(SPONSORS_MSGID_FILE, "r") as f:
+            msg_id = int(f.read().strip())
+        msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=msg_id)
+        if msg and msg.text:
+            sponsors = json.loads(msg.text)
+            logger.info(f"[BOOT] Restored {len(sponsors)} sponsors from archive msg {msg_id}")
+        else:
+            logger.warning(f"[BOOT] Sponsor msg {msg_id} not found in archive")
     except Exception as e:
         sponsors = []
         logger.error(f"[BOOT] Failed to load sponsors: {e}")
