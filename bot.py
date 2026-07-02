@@ -7816,12 +7816,32 @@ async def main():
     # ===== Resolve archive channel =====
     global ARCHIVE_CHANNEL_ID
     if ARCHIVE_CHANNEL_LINK:
+        link = ARCHIVE_CHANNEL_LINK.strip()
+        # استخراج hash از لینک دعوت خصوصی: https://t.me/+cAfY3SwI6P43NmI0
+        import re as _re
+        m = _re.search(r"\+([a-zA-Z0-9_-]+)", link)
+        invite_hash = m.group(1) if m else ""
         try:
-            entity = await client.get_entity(ARCHIVE_CHANNEL_LINK)
-            ARCHIVE_CHANNEL_ID = entity.id
-            logger.info(f"[BOOT] Archive channel resolved: {entity.id}")
+            if invite_hash:
+                from telethon import functions as _f, types as _t
+                result = await client(_f.messages.CheckChatInviteRequest(invite_hash))
+                if isinstance(result, _t.ChatInviteAlready):
+                    ARCHIVE_CHANNEL_ID = result.chat.id
+                    logger.info(f"[BOOT] Archive channel resolved: {result.chat.id} ({getattr(result.chat, 'title', '?')})")
+                else:
+                    result2 = await client(_f.messages.ImportChatInviteRequest(invite_hash))
+                    for chat in result2.chats:
+                        ARCHIVE_CHANNEL_ID = chat.id
+                        logger.info(f"[BOOT] Joined & resolved archive channel: {chat.id}")
+                        break
+            else:
+                entity = await client.get_entity(link)
+                ARCHIVE_CHANNEL_ID = entity.id
+                logger.info(f"[BOOT] Archive channel resolved: {entity.id}")
         except Exception as e:
             logger.error(f"[BOOT] Failed to resolve archive channel: {e}")
+        if not ARCHIVE_CHANNEL_ID:
+            logger.warning("[BOOT] Archive channel NOT configured — share links will not work.")
 
     # ===== CallbackQuery handlers =====
     client.add_event_handler(
