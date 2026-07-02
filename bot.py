@@ -258,6 +258,10 @@ video_send_timers: Dict[str, asyncio.Task] = {}
 
 # اشتراک‌گذاری ویدیو با لینک از طریق آرکایو کانال تلگرام
 ARCHIVE_CHANNEL_ID: int = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))
+# GitHub sponsor persistence
+SPONSOR_REPO: str = os.getenv("SPONSOR_REPO", "astwdnya/data")
+SPONSOR_BRANCH: str = os.getenv("SPONSOR_BRANCH", "main")
+SPONSOR_FILE: str = os.getenv("SPONSOR_FILE", "data.txt")
 BOT_USERNAME: str = ""
 sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
 pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
@@ -2711,7 +2715,7 @@ async def admin_input_handler(event):
             chat_id = txt
             link = txt
         sponsors.append({"name": name, "chat_id": chat_id, "link": link})
-        asyncio.ensure_future(_save_sponsors(event.client))
+        asyncio.ensure_future(_save_sponsors())
         await event.reply(
             f"✅ **اسپانسر اضافه شد!**\n📢 `{name}` — `{chat_id}`",
             parse_mode="markdown",
@@ -3249,59 +3253,54 @@ async def admin_cancel_callback(event):
         pass
 
 
-# ====================== SPONSOR MANIFEST (persist in archive) ======================
+# ====================== SPONSOR PERSIST (GitHub) ======================
 
 
 async def _save_sponsors(client=None):
-    """ذخیره اسپانسرها توی bot description (Bot API) + ارسال به کانال آرکایو."""
     global sponsors
-    text = json.dumps(sponsors, ensure_ascii=False)
-    if len(text) > 500:
-        logger.warning(f"[SPONSOR] Data too large ({len(text)} chars), truncating")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
         return
-    # ذخیره در bot description از طریق Bot API HTTP
+    text = json.dumps(sponsors, ensure_ascii=False)
+    content_b64 = base64.b64encode(text.encode()).decode()
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/setMyDescription",
-                data={"description": f"SPONSORS:{text}"}
-            ) as resp:
-                r = await resp.json()
-                if not r.get("ok"):
-                    logger.error(f"[SPONSOR] setMyDescription failed: {r}")
+            api_url = f"https://api.github.com/repos/{SPONSOR_REPO}/contents/{SPONSOR_FILE}"
+            sha = None
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            async with session.get(api_url, headers=headers) as check:
+                if check.status == 200:
+                    data = await check.json()
+                    sha = data.get("sha")
+            payload = {"message": "update sponsors", "content": content_b64, "branch": SPONSOR_BRANCH}
+            if sha:
+                payload["sha"] = sha
+            async with session.put(api_url, json=payload, headers=headers) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    logger.error(f"[SPONSOR] GitHub save failed: {resp.status} {body[:200]}")
     except Exception as e:
-        logger.error(f"[SPONSOR] Failed to save via Bot API: {e}")
-    # همچنین پیام به کانال آرکایو (صرفاً برای نمایش)
-    if not ARCHIVE_CHANNEL_ID or not client:
-        return
-    try:
-        await client.send_message(ARCHIVE_CHANNEL_ID, text)
-    except Exception:
-        pass
+        logger.error(f"[SPONSOR] GitHub save error: {e}")
 
 
 async def _load_sponsors(client=None):
-    """بازیابی اسپانسرها از bot description از طریق Bot API HTTP."""
     global sponsors
     sponsors = []
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        logger.info("[BOOT] No GITHUB_TOKEN, skipping sponsor load")
+        return
     try:
+        url = f"https://raw.githubusercontent.com/{SPONSOR_REPO}/{SPONSOR_BRANCH}/{SPONSOR_FILE}"
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getMyDescription"
-            ) as resp:
-                data = await resp.json()
-        if data.get("ok"):
-            desc = data["result"].get("description", "")
-            if desc.startswith("SPONSORS:"):
-                sponsors = json.loads(desc[len("SPONSORS:"):])
-                logger.info(f"[BOOT] Restored {len(sponsors)} sponsors via Bot API")
-            else:
-                logger.info("[BOOT] No SPONSORS prefix in bot description")
-        else:
-            logger.warning(f"[BOOT] getMyDescription failed: {data}")
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    sponsors = json.loads(text)
+                    logger.info(f"[BOOT] Loaded {len(sponsors)} sponsors from GitHub")
     except Exception as e:
         sponsors = []
-        logger.error(f"[BOOT] Failed to load sponsors via Bot API: {e}")
+        logger.error(f"[BOOT] GitHub sponsor load failed: {e}")
 
 
 # ====================== SPONSOR HANDLERS ======================
@@ -3350,7 +3349,7 @@ async def admin_sponsor_rm_callback(event):
     try:
         idx = int(idx_str)
         removed = sponsors.pop(idx)
-        asyncio.ensure_future(_save_sponsors(event.client))
+        asyncio.ensure_future(_save_sponsors())
         await event.answer(f"✅ {removed['name']} حذف شد!", alert=False)
     except (IndexError, ValueError):
         await event.answer("❌ خطا در حذف.", alert=True)
@@ -8324,9 +8323,7 @@ async def main():
     global BOT_USERNAME
     BOT_USERNAME = me.username
 
-    # بازیابی اسپانسرها از آرکایو کانال
-    if ARCHIVE_CHANNEL_ID:
-        await _load_sponsors(client)
+    await _load_sponsors()
 
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
