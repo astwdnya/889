@@ -3352,8 +3352,10 @@ async def _forward_share_videos(event, manifest_msg_id: int):
         try:
             msg = await event.client.get_messages(ARCHIVE_CHANNEL_ID, ids=msg_id)
             if msg:
-                fwd_list = await event.client.forward_messages(event.sender_id, msg)
-                fwd = fwd_list[0] if isinstance(fwd_list, list) else fwd_list
+                fwd = await event.client.send_file(
+                    event.sender_id,
+                    file=msg.media,
+                )
                 forwarded_msgs.append(fwd)
         except Exception as e:
             logger.error(f"[SHARE] Forward error: {e}")
@@ -4862,25 +4864,11 @@ async def video_receive_handler(event):
 
     filename = fname_attr or f"video_{event.id}{ext or '.mp4'}"
 
-    # batch key برای این چت
-    batch_key = f"vbatch_{event.chat_id}"
+    # batch key یکتا برای هر ویدیو
+    batch_key = f"vbatch_{event.chat_id}_{event.id}"
 
-    if batch_key in video_send_pending:
-        # اضافه کردن به batch موجود
-        video_send_pending[batch_key]["files"].append(
-            {
-                "message_id": event.id,
-                "file_size": file_size,
-                "filename": filename,
-            }
-        )
-        # ریست تایمر
-        old_task = video_send_timers.pop(batch_key, None)
-        if old_task and not old_task.done():
-            old_task.cancel()
-    else:
-        # batch جدید
-        video_send_pending[batch_key] = {
+    # batch جدید
+    video_send_pending[batch_key] = {
             "chat_id": event.chat_id,
             "reply_to_id": event.id,
             "files": [
@@ -5131,9 +5119,11 @@ async def sharelink_callback(event):
         try:
             msg = await event.client.get_messages(chat_id, ids=f["message_id"])
             if msg:
-                fwd = await event.client.forward_messages(ARCHIVE_CHANNEL_ID, msg)
-                fwd_msg = fwd[0] if isinstance(fwd, list) else fwd
-                manifest_ids.append(str(fwd_msg.id))
+                fwd = await event.client.send_file(
+                    ARCHIVE_CHANNEL_ID,
+                    file=msg.media,
+                )
+                manifest_ids.append(str(fwd.id))
         except Exception as e:
             logger.error(f"[SHARE] Forward to archive failed: {e}")
 
