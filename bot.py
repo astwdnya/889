@@ -3257,9 +3257,10 @@ async def _save_sponsors(client):
     try:
         # از about بات message ID قدیمی رو میخونیم
         full = await client(functions.users.GetFullUserRequest(id='self'))
+        about = full.full_user.about or ""
         old_id = None
-        if full.about and full.about.startswith("SPMID:"):
-            old_id = int(full.about.replace("SPMID:", ""))
+        if about.startswith("SPMID:"):
+            old_id = int(about.replace("SPMID:", ""))
 
         if old_id:
             try:
@@ -3287,7 +3288,7 @@ async def _load_sponsors(client):
         return
     try:
         full = await client(functions.users.GetFullUserRequest(id='self'))
-        about = full.about or ""
+        about = full.full_user.about or ""
         if not about.startswith("SPMID:"):
             logger.info("[BOOT] No SPMID found in bot about")
             return
