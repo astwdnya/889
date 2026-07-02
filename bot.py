@@ -6910,18 +6910,18 @@ rule34video_sessions: Dict[str, dict] = {}
 
 
 async def process_xanimu_request(event, url: str, status_msg):
-    async def debug_cb(text):
+    async def progress_cb(text):
         try:
             await status_msg.edit(text, parse_mode="markdown")
         except Exception:
             pass
 
-    qualities, title, info, dbg = await extract_xanimu_qualities(
+    qualities, title, info = await extract_xanimu_qualities(
         url,
-        debug_callback=debug_cb,
+        progress_cb=progress_cb,
     )
     if not qualities:
-        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد.\n\n{dbg.build_short()}")
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد.")
         return
     session_id = f"xa_{event.chat_id}_{event.id}_{int(time.time())}"
     xanimu_sessions[session_id] = {
@@ -6984,12 +6984,10 @@ async def xanimu_quality_callback(event):
 
     try:
         success, error, file_size = await download_xanimu_video(
-            url=url,
+            page_url=url,
             video_url=chosen.get("url", ""),
             filepath=filepath,
             progress_cb=progress_cb,
-            cookies=chosen.get("_cookies"),
-            user_agent=chosen.get("_user_agent"),
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
