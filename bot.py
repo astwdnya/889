@@ -28,7 +28,6 @@ from playwright.async_api import async_playwright
 from telethon import TelegramClient, events, Button, utils
 from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
-from telethon import functions
 from telethon.tl.types import (
     Message,
     DocumentAttributeVideo,
@@ -3248,60 +3247,56 @@ async def admin_cancel_callback(event):
 # ====================== SPONSOR MANIFEST (persist in archive) ======================
 
 
-async def _save_sponsors(client):
-    """ذخیره لیست اسپانسرها توی آرکایو کانال + ذخیره message ID توی about بات."""
+async def _save_sponsors(client=None):
+    """ذخیره اسپانسرها توی bot description (Bot API) + ارسال به کانال آرکایو."""
     global sponsors
+    text = json.dumps(sponsors, ensure_ascii=False)
+    if len(text) > 500:
+        logger.warning(f"[SPONSOR] Data too large ({len(text)} chars), truncating")
+        return
+    # ذخیره در bot description از طریق Bot API HTTP
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setMyDescription",
+                data={"description": f"SPONSORS:{text}"}
+            ) as resp:
+                r = await resp.json()
+                if not r.get("ok"):
+                    logger.error(f"[SPONSOR] setMyDescription failed: {r}")
+    except Exception as e:
+        logger.error(f"[SPONSOR] Failed to save via Bot API: {e}")
+    # همچنین پیام به کانال آرکایو (صرفاً برای نمایش)
     if not ARCHIVE_CHANNEL_ID or not client:
         return
-    text = json.dumps(sponsors, ensure_ascii=False)
     try:
-        # از about بات message ID قدیمی رو میخونیم
-        full = await client(functions.users.GetFullUserRequest(id='self'))
-        about = full.full_user.about or ""
-        old_id = None
-        if about.startswith("SPMID:"):
-            old_id = int(about.replace("SPMID:", ""))
-
-        if old_id:
-            try:
-                msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=old_id)
-                if msg:
-                    await msg.edit(text)
-                    return
-            except Exception:
-                pass
-
-        # اولین بار — پیام جدید بفرست و message ID رو توی about بات ذخیره کن
-        msg = await client.send_message(ARCHIVE_CHANNEL_ID, text)
-        await client(functions.account.UpdateProfileRequest(
-            about=f"SPMID:{msg.id}"
-        ))
-    except Exception as e:
-        logger.error(f"[SPONSOR] Failed to save to archive: {e}")
+        await client.send_message(ARCHIVE_CHANNEL_ID, text)
+    except Exception:
+        pass
 
 
-async def _load_sponsors(client):
-    """بازیابی لیست اسپانسرها از آرکایو کانال با استفاده از about بات."""
+async def _load_sponsors(client=None):
+    """بازیابی اسپانسرها از bot description از طریق Bot API HTTP."""
     global sponsors
     sponsors = []
-    if not ARCHIVE_CHANNEL_ID or not client:
-        return
     try:
-        full = await client(functions.users.GetFullUserRequest(id='self'))
-        about = full.full_user.about or ""
-        if not about.startswith("SPMID:"):
-            logger.info("[BOOT] No SPMID found in bot about")
-            return
-        msg_id = int(about.replace("SPMID:", ""))
-        msg = await client.get_messages(ARCHIVE_CHANNEL_ID, ids=msg_id)
-        if msg and msg.text:
-            sponsors = json.loads(msg.text)
-            logger.info(f"[BOOT] Restored {len(sponsors)} sponsors from archive msg {msg_id}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getMyDescription"
+            ) as resp:
+                data = await resp.json()
+        if data.get("ok"):
+            desc = data["result"].get("description", "")
+            if desc.startswith("SPONSORS:"):
+                sponsors = json.loads(desc[len("SPONSORS:"):])
+                logger.info(f"[BOOT] Restored {len(sponsors)} sponsors via Bot API")
+            else:
+                logger.info("[BOOT] No SPONSORS prefix in bot description")
         else:
-            logger.warning(f"[BOOT] Sponsor msg {msg_id} not found in archive")
+            logger.warning(f"[BOOT] getMyDescription failed: {data}")
     except Exception as e:
         sponsors = []
-        logger.error(f"[BOOT] Failed to load sponsors: {e}")
+        logger.error(f"[BOOT] Failed to load sponsors via Bot API: {e}")
 
 
 # ====================== SPONSOR HANDLERS ======================
