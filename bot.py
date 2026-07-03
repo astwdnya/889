@@ -827,6 +827,7 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
         await safe_edit(status_msg, "🌐 Downloading via curl_cffi (chrome)...", buttons=dl_buttons_cancel)
 
         # ابتدا HEAD request برای گرفتن حجم و نام فایل
+        # timeout کوتاه (5 ثانیه) چون فقط برای metadata هست
         content_length = 0
         content_type = ""
         accept_ranges = ""
@@ -837,7 +838,7 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
                     impersonate="chrome",
                     headers={"Accept": "*/*"},
                     allow_redirects=True,
-                    timeout=15,
+                    timeout=5,
                 )
                 if head_resp.status_code in (200, 206):
                     content_length = int(head_resp.headers.get("Content-Length", 0))
@@ -923,6 +924,9 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
         # به جای ۱۶ segment ثابت، فایل رو به chunk های کوچیک (5MB) تقسیم می‌کنیم
         # و ۱۶ worker همزمان از یه queue می‌خورن. اینطوری همیشه ۱۶ connection
         # فعال هستن تا آخر دانلود و سرعت ثابت می‌مونه.
+        #
+        # بهینه‌سازی: از یه session اشتراکی استفاده می‌کنیم تا TLS handshake
+        # فقط یه بار انجام بشه (به جای هر chunk).
         # ═══════════════════════════════════════════════════════════════════
         NUM_WORKERS = 16
         CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
@@ -944,17 +948,7 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
             total_chunks = len(chunks)
             logger.info(f"[DL-CFFI] Work-queue download: {total_chunks} chunks × {CHUNK_SIZE//1024//1024}MB, {NUM_WORKERS} workers, total={content_length}")
 
-            await safe_edit(
-                status_msg,
-                f"📥 **Work-Queue Download**\n"
-                f"🔗 Workers: {NUM_WORKERS}\n"
-                f"📦 Chunks: {total_chunks}\n"
-                f"💾 Size: {human_readable_size(content_length)}",
-                buttons=dl_buttons_cancel,
-            )
-
             # فایل خروجی رو همون اول با حجم نهایی بساز (sparse file)
-            # اینطوری هر worker می‌تونه با seek به offset خودش بنویسه
             try:
                 with open(final_path, "wb") as f:
                     f.truncate(content_length)
@@ -974,6 +968,39 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
             last_update = [0.0]
             progress_lock = asyncio.Lock()
             file_write_lock = asyncio.Lock()
+            first_chunk_started = [False]
+
+            # session اشتراکی برای همه worker ها (جلوگیری از TLS handshake مکرر)
+            shared_session = AsyncSession()
+
+            async def _update_progress(force: bool = False):
+                """گزارش progress به کاربر."""
+                now = time.time()
+                if not force and now - last_update[0] < 1.5:
+                    return
+                last_update[0] = now
+                total_dl = sum(downloaded_bytes)
+                elapsed = now - start_time
+                speed = total_dl / elapsed if elapsed > 0 else 0
+                dl_mb = total_dl / 1024 / 1024
+                total_mb = content_length / 1024 / 1024
+                pct = (total_dl / content_length * 100) if content_length > 0 else 0
+                filled = int(pct / 5)
+                bar = "█" * filled + "░" * (20 - filled)
+                speed_mb = min(speed / 1024 / 1024, 999)
+                eta_secs = int((content_length - total_dl) / speed) if speed > 0 else 0
+                eta_m, eta_s = divmod(eta_secs, 60)
+                try:
+                    await safe_edit(
+                        status_msg,
+                        f"📥 **Downloading...**\n`[{bar}]`\n"
+                        f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+                        f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
+                        f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {NUM_WORKERS}x",
+                        buttons=dl_buttons_cancel,
+                    )
+                except Exception:
+                    pass
 
             async def _download_worker(worker_id: int):
                 """هر worker از queue chunk می‌گیره و دانلود می‌کنه."""
@@ -997,73 +1024,52 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
                             return False
 
                         try:
-                            async with AsyncSession() as session:
-                                resp = await session.get(
-                                    url,
-                                    impersonate="chrome",
-                                    headers={
-                                        "Accept": "*/*",
-                                        "Accept-Language": "en-US,en;q=0.9",
-                                        "Range": f"bytes={byte_start}-{byte_end}",
-                                    },
-                                    allow_redirects=True,
-                                    timeout=300,
-                                    stream=True,
-                                )
+                            # استفاده از session اشتراکی (بدون ساخت session جدید)
+                            resp = await shared_session.get(
+                                url,
+                                impersonate="chrome",
+                                headers={
+                                    "Accept": "*/*",
+                                    "Accept-Language": "en-US,en;q=0.9",
+                                    "Range": f"bytes={byte_start}-{byte_end}",
+                                },
+                                allow_redirects=True,
+                                timeout=300,
+                                stream=True,
+                            )
 
-                                if resp.status_code not in (200, 206):
-                                    raise Exception(f"HTTP {resp.status_code}")
+                            if resp.status_code not in (200, 206):
+                                raise Exception(f"HTTP {resp.status_code}")
 
-                                # دانلود chunk به memory (چون کوچیکه - 5MB)
-                                chunk_data = b""
-                                async for piece in resp.aiter_content():
-                                    if not piece:
-                                        continue
-                                    # check cancel
-                                    if active_downloads.get(dl_id, {}).get("cancelled"):
-                                        return False
-                                    chunk_data += piece
+                            # پیام شروع سریع (به محض اولین chunk)
+                            if not first_chunk_started[0]:
+                                first_chunk_started[0] = True
+                                await _update_progress(force=True)
 
-                                if len(chunk_data) != chunk_size:
-                                    raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
+                            # دانلود chunk به memory (چون کوچیکه - 5MB)
+                            chunk_data = b""
+                            async for piece in resp.aiter_content():
+                                if not piece:
+                                    continue
+                                # check cancel
+                                if active_downloads.get(dl_id, {}).get("cancelled"):
+                                    return False
+                                chunk_data += piece
 
-                                # نوشتن به فایل با seek (با lock برای thread safety)
-                                async with file_write_lock:
-                                    async with aiofiles.open(final_path, "r+b") as f:
-                                        await f.seek(byte_start)
-                                        await f.write(chunk_data)
+                            if len(chunk_data) != chunk_size:
+                                raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
 
-                                downloaded_bytes[c_idx] = chunk_size
-                                async with progress_lock:
-                                    completed_chunks[0] += 1
+                            # نوشتن به فایل با seek (با lock برای thread safety)
+                            async with file_write_lock:
+                                async with aiofiles.open(final_path, "r+b") as f:
+                                    await f.seek(byte_start)
+                                    await f.write(chunk_data)
 
-                                    # update progress
-                                    now = time.time()
-                                    if now - last_update[0] >= 2.0:
-                                        last_update[0] = now
-                                        total_dl = sum(downloaded_bytes)
-                                        elapsed = now - start_time
-                                        speed = total_dl / elapsed if elapsed > 0 else 0
-                                        dl_mb = total_dl / 1024 / 1024
-                                        total_mb = content_length / 1024 / 1024
-                                        pct = total_dl / content_length * 100
-                                        filled = int(pct / 5)
-                                        bar = "█" * filled + "░" * (20 - filled)
-                                        speed_mb = min(speed / 1024 / 1024, 999)
-                                        eta_secs = int((content_length - total_dl) / speed) if speed > 0 else 0
-                                        eta_m, eta_s = divmod(eta_secs, 60)
-                                        try:
-                                            await safe_edit(
-                                                status_msg,
-                                                f"📥 **Downloading...**\n`[{bar}]`\n"
-                                                f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
-                                                f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
-                                                f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {NUM_WORKERS}x",
-                                                buttons=dl_buttons_cancel,
-                                            )
-                                        except Exception:
-                                            pass
-                                break  # chunk با موفقیت دانلود شد
+                            downloaded_bytes[c_idx] = chunk_size
+                            async with progress_lock:
+                                completed_chunks[0] += 1
+                                await _update_progress()
+                            break  # chunk با موفقیت دانلود شد
 
                         except asyncio.CancelledError:
                             raise
@@ -1086,6 +1092,12 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
                     *[_download_worker(i) for i in range(NUM_WORKERS)],
                     return_exceptions=True,
                 )
+
+                # بستن session اشتراکی
+                try:
+                    await shared_session.close()
+                except Exception:
+                    pass
 
                 # check cancel
                 if active_downloads.get(dl_id, {}).get("cancelled"):
@@ -1112,6 +1124,10 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
 
             except Exception as e:
                 logger.error(f"[DL-CFFI] Work-queue error: {e}", exc_info=True)
+                try:
+                    await shared_session.close()
+                except Exception:
+                    pass
                 try:
                     os.remove(final_path)
                 except Exception:
