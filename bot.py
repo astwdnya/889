@@ -2215,11 +2215,12 @@ async def send_file_with_progress(
             )
         else:
             attributes, mime_type = utils.get_attributes(filepath)
+            is_video_ext = ext in (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp")
             media = InputMediaUploadedDocument(
                 file=uploaded,
                 mime_type=mime_type,
                 attributes=attributes,
-                force_file=True,
+                force_file=not is_video_ext,
             )
 
         try:
