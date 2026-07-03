@@ -8483,6 +8483,7 @@ async def cartoonporncom_quality_callback(event):
             video_url=chosen.get("url", ""),
             filepath=filepath,
             progress_cb=progress_cb,
+            dl_id=dl_id,
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
