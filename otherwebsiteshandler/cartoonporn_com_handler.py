@@ -778,9 +778,8 @@ async def download_cartoonporn_video(
     دانلود ویدیو از cartoonporn.
 
     استراتژی:
-      1. multi-segment download با curl_cffi (اگه Range پشتیبانی بشه)
-      2. single-connection با curl_cffi (fallback)
-      3. yt-dlp با --impersonate=chrome روی URL صفحه (آخرین fallback)
+      1. single-connection با curl_cffi
+      2. yt-dlp با --impersonate=chrome روی URL صفحه (fallback)
 
     Args:
         page_url: URL صفحه ویدیو (برای Referer)
@@ -811,27 +810,22 @@ async def download_cartoonporn_video(
     if not cookies:
         cookies = {}
 
-    # ── روش 1: multi-segment با curl_cffi ──
+    # ── روش 1: single-connection با curl_cffi ──
+    # NOTE: multi-segment غیرفعال شد چون Range requests روی این CDN خراب کار می‌کنه
     if _check_curl_cffi():
-        logger.info("[DL-CARTOON] Attempt 1: multi-segment curl_cffi")
-        success, error, size = await _download_multi_segment(
+        logger.info("[DL-CARTOON] Attempt 1: single-connection curl_cffi")
+        success, error, size = await _download_single_curl_cffi(
             video_url, filepath, referer, cookies, progress_cb,
-            num_workers=MULTI_SEGMENT_WORKERS,
         )
         if success:
             return True, "", size
-        if error == "Cancelled by user":
-            return False, error, 0
         if error == "HTTP_403":
-            # اگه 403 گرفتیم، یعکه cookies کافی نیست — باید دوباره page رو fetch کنیم
             logger.info("[DL-CARTOON] 403 on CDN, refreshing cookies...")
             if progress_cb:
                 await progress_cb("🔄 **Refreshing session...**")
-            # re-fetch صفحه برای گرفتن کوکی‌های تازه
             _, _, new_cookies, fetch_err = await _fetch_page_curl_cffi(page_url)
             if new_cookies:
                 cookies = new_cookies
-                # اگه URL ویدیو از نوع بدون v-acctoken بود، دوباره extract کن
                 if "v-acctoken" not in video_url:
                     html, _, _, _ = await _fetch_page_curl_cffi(page_url, cookies)
                     if html:
@@ -839,30 +833,17 @@ async def download_cartoonporn_video(
                         if sources:
                             video_url = sources[0]["url"]
                             logger.info("[DL-CARTOON] Got fresh URL with v-acctoken")
-            # retry multi-segment
-            success, error, size = await _download_multi_segment(
+            success, error, size = await _download_single_curl_cffi(
                 video_url, filepath, referer, cookies, progress_cb,
-                num_workers=MULTI_SEGMENT_WORKERS,
             )
             if success:
                 return True, "", size
-        logger.info(f"[DL-CARTOON] Multi-segment failed: {error}")
-        _cleanup_file(filepath)
-
-    # ── روش 2: single-connection با curl_cffi ──
-    if _check_curl_cffi():
-        logger.info("[DL-CARTOON] Attempt 2: single-connection curl_cffi")
-        success, error, size = await _download_single_curl_cffi(
-            video_url, filepath, referer, cookies, progress_cb,
-        )
-        if success:
-            return True, "", size
         logger.info(f"[DL-CARTOON] Single-connection failed: {error}")
         _cleanup_file(filepath)
 
-    # ── روش 3: yt-dlp با --impersonate ──
+    # ── روش 2: yt-dlp با --impersonate ──
     if shutil.which("yt-dlp"):
-        logger.info("[DL-CARTOON] Attempt 3: yt-dlp on page URL")
+        logger.info("[DL-CARTOON] Attempt 2: yt-dlp on page URL")
         if progress_cb:
             await progress_cb("📥 **Fallback: yt-dlp...**")
         success, error, size = await _download_with_ytdlp(
