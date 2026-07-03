@@ -460,7 +460,6 @@ async def _download_multi_segment(
     cookies: dict,
     progress_cb: ProgressCallback,
     num_workers: int = MULTI_SEGMENT_WORKERS,
-    dl_id: str = "",
 ) -> Tuple[bool, str, int]:
     """
     دانلود چند تیکه‌ای با work-queue pattern.
@@ -728,10 +727,6 @@ async def _download_multi_segment(
             except Exception:
                 pass
 
-            # check cancel
-            if active_downloads.get(dl_id, {}).get("cancelled"):
-                _cleanup_file(filepath)
-                return False, "Cancelled by user", 0
 
             worker_failures = [r for r in results if r is not True and isinstance(r, bool) and not r]
             if worker_failures or failed_chunks:
@@ -821,7 +816,7 @@ async def download_cartoonporn_video(
         logger.info("[DL-CARTOON] Attempt 1: multi-segment curl_cffi")
         success, error, size = await _download_multi_segment(
             video_url, filepath, referer, cookies, progress_cb,
-            num_workers=MULTI_SEGMENT_WORKERS, dl_id=dl_id,
+            num_workers=MULTI_SEGMENT_WORKERS,
         )
         if success:
             return True, "", size
@@ -847,7 +842,7 @@ async def download_cartoonporn_video(
             # retry multi-segment
             success, error, size = await _download_multi_segment(
                 video_url, filepath, referer, cookies, progress_cb,
-                num_workers=MULTI_SEGMENT_WORKERS, dl_id=dl_id,
+                num_workers=MULTI_SEGMENT_WORKERS,
             )
             if success:
                 return True, "", size
