@@ -918,207 +918,226 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
                     pass
 
         # ═══════════════════════════════════════════════════════════════════
-        # روش 1: MULTI-SEGMENT (اگه Range پشتیبانی می‌شه و فایل بزرگتر از 5MB)
+        # روش 1: WORK-QUEUE MULTI-SEGMENT (اگه Range پشتیبانی می‌شه و فایل بزرگتر از 5MB)
+        #
+        # به جای ۱۶ segment ثابت، فایل رو به chunk های کوچیک (5MB) تقسیم می‌کنیم
+        # و ۱۶ worker همزمان از یه queue می‌خورن. اینطوری همیشه ۱۶ connection
+        # فعال هستن تا آخر دانلود و سرعت ثابت می‌مونه.
         # ═══════════════════════════════════════════════════════════════════
-        NUM_SEGMENTS = 16
+        NUM_WORKERS = 16
+        CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
         MIN_SIZE_FOR_MULTI = 5 * 1024 * 1024  # 5 MB
 
         if (accept_ranges == "bytes" and content_length >= MIN_SIZE_FOR_MULTI
             and content_length <= MAX_FILE_SIZE_MB * 1024 * 1024):
 
-            logger.info(f"[DL-CFFI] Multi-segment download: {NUM_SEGMENTS} segments, size={content_length}")
+            # ساخت لیست chunk ها
+            chunks = []
+            offset = 0
+            chunk_idx = 0
+            while offset < content_length:
+                end = min(offset + CHUNK_SIZE - 1, content_length - 1)
+                chunks.append((chunk_idx, offset, end))
+                offset = end + 1
+                chunk_idx += 1
+
+            total_chunks = len(chunks)
+            logger.info(f"[DL-CFFI] Work-queue download: {total_chunks} chunks × {CHUNK_SIZE//1024//1024}MB, {NUM_WORKERS} workers, total={content_length}")
+
             await safe_edit(
                 status_msg,
-                f"📥 **Multi-segment Download**\n"
-                f"🔗 Segments: {NUM_SEGMENTS}\n"
+                f"📥 **Work-Queue Download**\n"
+                f"🔗 Workers: {NUM_WORKERS}\n"
+                f"📦 Chunks: {total_chunks}\n"
                 f"💾 Size: {human_readable_size(content_length)}",
                 buttons=dl_buttons_cancel,
             )
 
-            # ساخت segment ها
-            segment_size = content_length // NUM_SEGMENTS
-            segments = []
-            for i in range(NUM_SEGMENTS):
-                start = i * segment_size
-                end = (
-                    content_length - 1
-                    if i == NUM_SEGMENTS - 1
-                    else (i + 1) * segment_size - 1
-                )
-                segments.append((i, start, end))
+            # فایل خروجی رو همون اول با حجم نهایی بساز (sparse file)
+            # اینطوری هر worker می‌تونه با seek به offset خودش بنویسه
+            try:
+                with open(final_path, "wb") as f:
+                    f.truncate(content_length)
+            except Exception as e:
+                logger.warning(f"[DL-CFFI] Could not pre-allocate file: {e}")
 
-            segment_files = [f"{final_path}.part{i}" for i in range(NUM_SEGMENTS)]
-            downloaded_bytes = [0] * NUM_SEGMENTS
+            # Queue از chunk ها
+            chunk_queue = asyncio.Queue()
+            for c in chunks:
+                await chunk_queue.put(c)
+
+            # متغیرهای مشترک
+            downloaded_bytes = [0] * total_chunks
+            completed_chunks = [0]  # count
+            failed_chunks = []
             start_time = time.time()
             last_update = [0.0]
             progress_lock = asyncio.Lock()
+            file_write_lock = asyncio.Lock()
 
-            # پاک کردن segment های قبلی اگه هستن
-            for sf in segment_files:
-                try:
-                    if os.path.exists(sf):
-                        os.remove(sf)
-                except Exception:
-                    pass
-
-            async def _download_segment(seg_idx: int, byte_start: int, byte_end: int):
-                """دانلود یک segment با retry."""
-                seg_file = segment_files[seg_idx]
-                max_retries = 3
-
-                for attempt in range(max_retries):
+            async def _download_worker(worker_id: int):
+                """هر worker از queue chunk می‌گیره و دانلود می‌کنه."""
+                while True:
                     # check cancel
                     if active_downloads.get(dl_id, {}).get("cancelled"):
                         return False
 
                     try:
-                        async with AsyncSession() as session:
-                            resp = await session.get(
-                                url,
-                                impersonate="chrome",
-                                headers={
-                                    "Accept": "*/*",
-                                    "Accept-Language": "en-US,en;q=0.9",
-                                    "Range": f"bytes={byte_start}-{byte_end}",
-                                },
-                                allow_redirects=True,
-                                timeout=600,
-                                stream=True,
-                            )
+                        chunk_info = chunk_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return True  # queue خالی، worker تموم کرد
 
-                            if resp.status_code not in (200, 206):
-                                raise Exception(f"HTTP {resp.status_code}")
+                    c_idx, byte_start, byte_end = chunk_info
+                    chunk_size = byte_end - byte_start + 1
+                    max_retries = 3
 
-                            async with aiofiles.open(seg_file, "wb") as f:
-                                async for chunk in resp.aiter_content():
-                                    if not chunk:
+                    for attempt in range(max_retries):
+                        # check cancel
+                        if active_downloads.get(dl_id, {}).get("cancelled"):
+                            return False
+
+                        try:
+                            async with AsyncSession() as session:
+                                resp = await session.get(
+                                    url,
+                                    impersonate="chrome",
+                                    headers={
+                                        "Accept": "*/*",
+                                        "Accept-Language": "en-US,en;q=0.9",
+                                        "Range": f"bytes={byte_start}-{byte_end}",
+                                    },
+                                    allow_redirects=True,
+                                    timeout=300,
+                                    stream=True,
+                                )
+
+                                if resp.status_code not in (200, 206):
+                                    raise Exception(f"HTTP {resp.status_code}")
+
+                                # دانلود chunk به memory (چون کوچیکه - 5MB)
+                                chunk_data = b""
+                                async for piece in resp.aiter_content():
+                                    if not piece:
                                         continue
                                     # check cancel
                                     if active_downloads.get(dl_id, {}).get("cancelled"):
+                                        return False
+                                    chunk_data += piece
+
+                                if len(chunk_data) != chunk_size:
+                                    raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
+
+                                # نوشتن به فایل با seek (با lock برای thread safety)
+                                async with file_write_lock:
+                                    async with aiofiles.open(final_path, "r+b") as f:
+                                        await f.seek(byte_start)
+                                        await f.write(chunk_data)
+
+                                downloaded_bytes[c_idx] = chunk_size
+                                async with progress_lock:
+                                    completed_chunks[0] += 1
+
+                                    # update progress
+                                    now = time.time()
+                                    if now - last_update[0] >= 2.0:
+                                        last_update[0] = now
+                                        total_dl = sum(downloaded_bytes)
+                                        elapsed = now - start_time
+                                        speed = total_dl / elapsed if elapsed > 0 else 0
+                                        dl_mb = total_dl / 1024 / 1024
+                                        total_mb = content_length / 1024 / 1024
+                                        pct = total_dl / content_length * 100
+                                        filled = int(pct / 5)
+                                        bar = "█" * filled + "░" * (20 - filled)
+                                        speed_mb = min(speed / 1024 / 1024, 999)
+                                        eta_secs = int((content_length - total_dl) / speed) if speed > 0 else 0
+                                        eta_m, eta_s = divmod(eta_secs, 60)
                                         try:
-                                            os.remove(seg_file)
+                                            await safe_edit(
+                                                status_msg,
+                                                f"📥 **Downloading...**\n`[{bar}]`\n"
+                                                f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+                                                f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
+                                                f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {NUM_WORKERS}x",
+                                                buttons=dl_buttons_cancel,
+                                            )
                                         except Exception:
                                             pass
-                                        return False
+                                break  # chunk با موفقیت دانلود شد
 
-                                    await f.write(chunk)
-                                    downloaded_bytes[seg_idx] += len(chunk)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.warning(f"[DL-CFFI] Worker {worker_id} chunk {c_idx} attempt {attempt+1} failed: {e}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 * (attempt + 1))
+                            else:
+                                failed_chunks.append((c_idx, str(e)[:100]))
+                                return False
 
-                                    # update progress (با lock برای جلوگیری از race)
-                                    async with progress_lock:
-                                        total_dl = sum(downloaded_bytes)
-                                        await _report_progress(
-                                            total_dl, content_length, start_time, last_update, NUM_SEGMENTS
-                                        )
-                            return True
+                    # chunk بعدی رو بگیر
+                    chunk_queue.task_done()
 
-                    except asyncio.CancelledError:
-                        try:
-                            os.remove(seg_file)
-                        except Exception:
-                            pass
-                        raise
-                    except Exception as e:
-                        logger.warning(f"[DL-CFFI] Segment {seg_idx} attempt {attempt+1} failed: {e}")
-                        try:
-                            os.remove(seg_file)
-                        except Exception:
-                            pass
-                        downloaded_bytes[seg_idx] = 0
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2 * (attempt + 1))
+                return True
 
-                return False
-
-            # اجرای موازی همه segment ها
+            # اجرای موازی ۱۶ worker
             try:
                 results = await asyncio.gather(
-                    *[_download_segment(idx, start, end) for idx, start, end in segments],
+                    *[_download_worker(i) for i in range(NUM_WORKERS)],
                     return_exceptions=True,
                 )
 
                 # check cancel
                 if active_downloads.get(dl_id, {}).get("cancelled"):
-                    for sf in segment_files:
-                        try:
-                            os.remove(sf)
-                        except Exception:
-                            pass
-                    return None, "Cancelled by user", 0
-
-                # check results
-                failed_segments = [
-                    (idx, r) for idx, r in enumerate(results)
-                    if r is not True or not os.path.exists(segment_files[idx])
-                ]
-                if failed_segments:
-                    logger.warning(f"[DL-CFFI] {len(failed_segments)} segments failed, falling back to single")
-                    for sf in segment_files:
-                        try:
-                            os.remove(sf)
-                        except Exception:
-                            pass
-                    # fallback به single connection
-                    return await _download_single_curl_cffi(
-                        url, final_path, orig_name, content_length, content_type,
-                        status_msg, dl_id, dl_buttons_cancel, AsyncSession
-                    )
-
-                # ترکیب segment ها
-                await safe_edit(status_msg, "🔗 **Merging segments...**", buttons=dl_buttons_cancel)
-
-                async with aiofiles.open(final_path, "wb") as outfile:
-                    for sf in segment_files:
-                        if not os.path.exists(sf):
-                            # اگه یه segment گم شده، fallback
-                            for sf2 in segment_files:
-                                try:
-                                    os.remove(sf2)
-                                except Exception:
-                                    pass
-                            return None, f"Missing segment: {sf}", 0
-                        async with aiofiles.open(sf, "rb") as infile:
-                            while True:
-                                chunk = await infile.read(4 * 1024 * 1024)
-                                if not chunk:
-                                    break
-                                await outfile.write(chunk)
-
-                # پاک کردن segment files
-                for sf in segment_files:
-                    try:
-                        os.remove(sf)
-                    except Exception:
-                        pass
-
-                file_size = os.path.getsize(final_path)
-                if file_size < 1024:
                     try:
                         os.remove(final_path)
                     except Exception:
                         pass
-                    return None, f"File too small ({file_size} B)", 0
+                    return None, "Cancelled by user", 0
 
-                if file_size != content_length:
-                    logger.warning(f"[DL-CFFI] Size mismatch: expected={content_length}, got={file_size}")
-
-                elapsed = time.time() - start_time
-                avg_speed = file_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
-                logger.info(f"[DL-CFFI] Multi-segment DONE | size={human_readable_size(file_size)} | time={elapsed:.1f}s | speed={avg_speed:.1f} MB/s")
-                return final_path, None, file_size
+                # check failures
+                worker_failures = [r for r in results if r is not True and isinstance(r, bool) and not r]
+                if worker_failures or failed_chunks:
+                    logger.warning(f"[DL-CFFI] {len(worker_failures)} workers failed, {len(failed_chunks)} chunks failed")
+                    if failed_chunks:
+                        # fallback به single connection
+                        try:
+                            os.remove(final_path)
+                        except Exception:
+                            pass
+                        return await _download_single_curl_cffi(
+                            url, final_path, orig_name, content_length, content_type,
+                            status_msg, dl_id, dl_buttons_cancel, AsyncSession
+                        )
 
             except Exception as e:
-                logger.error(f"[DL-CFFI] Multi-segment error: {e}", exc_info=True)
-                for sf in segment_files:
-                    try:
-                        os.remove(sf)
-                    except Exception:
-                        pass
-                # fallback به single
+                logger.error(f"[DL-CFFI] Work-queue error: {e}", exc_info=True)
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
                 return await _download_single_curl_cffi(
                     url, final_path, orig_name, content_length, content_type,
                     status_msg, dl_id, dl_buttons_cancel, AsyncSession
                 )
+
+            # بررسی فایل نهایی
+            file_size = os.path.getsize(final_path)
+            if file_size < 1024:
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+                return None, f"File too small ({file_size} B)", 0
+
+            if file_size != content_length:
+                logger.warning(f"[DL-CFFI] Size mismatch: expected={content_length}, got={file_size}")
+
+            elapsed = time.time() - start_time
+            avg_speed = file_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+            logger.info(f"[DL-CFFI] Work-queue DONE | size={human_readable_size(file_size)} | time={elapsed:.1f}s | avg_speed={avg_speed:.1f} MB/s | chunks={total_chunks}")
+            return final_path, None, file_size
+
 
         # ═══════════════════════════════════════════════════════════════════
         # روش 2: SINGLE CONNECTION (fallback یا فایل‌های کوچک)
