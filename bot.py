@@ -801,19 +801,203 @@ def is_direct_file_url(url: str) -> bool:
 
 
 # ====================== DOWNLOAD VIA PLAYWRIGHT (REAL BROWSER) ======================
+async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, dl_id: str) -> Tuple[Optional[str], Optional[str], int]:
+    """
+    لایه 1: دانلود با curl_cffi (با impersonate).
+    سریع‌ترین و قابل اعتمادترین روش برای فایل‌های مستقیم.
+    """
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        return None, "curl_cffi not installed", 0
+
+    try:
+        await safe_edit(status_msg, "🌐 Downloading via curl_cffi (chrome)...")
+
+        # ابتدا HEAD request برای گرفتن حجم و نام فایل
+        content_length = 0
+        content_type = ""
+        try:
+            async with AsyncSession() as session:
+                head_resp = await session.head(
+                    url,
+                    impersonate="chrome",
+                    headers={"Accept": "*/*"},
+                    allow_redirects=True,
+                    timeout=15,
+                )
+                if head_resp.status_code in (200, 206):
+                    content_length = int(head_resp.headers.get("Content-Length", 0))
+                    content_type = head_resp.headers.get("Content-Type", "").lower()
+                elif head_resp.status_code == 403:
+                    return None, "HTTP_403", 0
+        except Exception:
+            pass
+
+        # تشخیص نام فایل از URL
+        url_path = url.split("?")[0].rstrip("/")
+        orig_name = os.path.basename(url_path)
+        if not orig_name:
+            orig_name = f"file_{int(time.time())}"
+        orig_name = re.sub(r"[^\w\.\-\_\(\) ]", "_", orig_name)
+        if len(orig_name) > 80:
+            base, ext = os.path.splitext(orig_name)
+            orig_name = base[:75] + ext
+
+        # اگه content-type مشخصه و پسوندی نداره، اضافه کن
+        if not os.path.splitext(orig_name)[1]:
+            ct_map = {
+                "application/x-ipa": ".ipa",
+                "application/vnd.android.package-archive": ".apk",
+                "application/zip": ".zip",
+                "application/octet-stream": ".bin",
+                "application/pdf": ".pdf",
+                "video/mp4": ".mp4",
+                "audio/mpeg": ".mp3",
+            }
+            for ct_key, ext in ct_map.items():
+                if ct_key in content_type:
+                    orig_name += ext
+                    break
+
+        final_path = os.path.join(OUTPUT_FOLDER, orig_name)
+        counter = 1
+        while os.path.exists(final_path):
+            base, ext = os.path.splitext(orig_name)
+            final_path = os.path.join(OUTPUT_FOLDER, f"{base}_{counter}{ext}")
+            counter += 1
+
+        # GET request با streaming
+        await safe_edit(status_msg, f"📥 Downloading: {orig_name}")
+
+        async with AsyncSession() as session:
+            resp = await session.get(
+                url,
+                impersonate="chrome",
+                headers={
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                allow_redirects=True,
+                timeout=600,
+                stream=True,
+            )
+
+            if resp.status_code == 403:
+                return None, "HTTP_403", 0
+            if resp.status_code not in (200, 206):
+                return None, f"HTTP {resp.status_code}", 0
+
+            # چک content-type
+            ct = (resp.headers.get("Content-Type", "") or "").lower()
+            if "text/html" in ct and not orig_name.endswith((".html", ".htm")):
+                return None, "Got HTML page instead of file", 0
+
+            # اگه content-length از HEAD نیومده، از GET بگیر
+            if content_length == 0:
+                content_length = int(resp.headers.get("Content-Length", 0))
+
+            if content_length > MAX_FILE_SIZE_MB * 1024 * 1024:
+                return None, f"File too large ({human_readable_size(content_length)})", 0
+
+            # دانلود با progress
+            downloaded = 0
+            start_time = time.time()
+            last_update = 0.0
+
+            async with aiofiles.open(final_path, "wb") as f:
+                async for chunk in resp.aiter_content():
+                    if not chunk:
+                        continue
+                    # check cancel
+                    if active_downloads.get(dl_id, {}).get("cancelled"):
+                        try:
+                            os.remove(final_path)
+                        except Exception:
+                            pass
+                        return None, "Cancelled by user", 0
+
+                    await f.write(chunk)
+                    downloaded += len(chunk)
+
+                    # progress report
+                    now = time.time()
+                    if now - last_update >= 2.0:
+                        last_update = now
+                        elapsed = now - start_time
+                        speed = downloaded / elapsed if elapsed > 0 else 0
+                        if content_length > 0:
+                            pct = downloaded / content_length * 100
+                            filled = int(pct / 5)
+                            bar = "█" * filled + "░" * (20 - filled)
+                            dl_mb = downloaded / 1024 / 1024
+                            total_mb = content_length / 1024 / 1024
+                            speed_mb = min(speed / 1024 / 1024, 999)
+                            eta_secs = int((content_length - downloaded) / speed) if speed > 0 else 0
+                            eta_m, eta_s = divmod(eta_secs, 60)
+                            try:
+                                await safe_edit(
+                                    status_msg,
+                                    f"📥 **Downloading...**\n`[{bar}]`\n"
+                                    f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+                                    f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            dl_mb = downloaded / 1024 / 1024
+                            speed_mb = min(speed / 1024 / 1024, 999)
+                            try:
+                                await safe_edit(
+                                    status_msg,
+                                    f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s",
+                                )
+                            except Exception:
+                                pass
+
+            file_size = os.path.getsize(final_path)
+            if file_size < 1024:
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+                return None, f"File too small ({file_size} B)", 0
+
+            logger.info(f"[DL-CFFI] DONE | size={human_readable_size(file_size)} | file={final_path}")
+            return final_path, None, file_size
+
+    except Exception as e:
+        logger.error(f"[DL-CFFI] Error: {e}", exc_info=True)
+        return None, str(e)[:100], 0
+
+
 async def download_with_playwright(
     url: str,
     status_msg: Message,
     dl_id: str,
 ) -> Tuple[Optional[str], Optional[str], int]:
     """
-    Download a file using a real Chromium browser (bypasses TLS fingerprint / Cloudflare blocking).
-    Only suitable for direct file URLs (no video page extraction).
+    Download a file using multiple strategies:
+      1. curl_cffi with chrome impersonate (fastest)
+      2. Real Chromium browser with response body capture
+      3. Fallback to download event trigger
     """
     if dl_id not in active_downloads:
         active_downloads[dl_id] = {"paused": False, "cancelled": False}
 
-    await safe_edit(status_msg, "🌐 Downloading via browser...")
+    # ── لایه 1: curl_cffi ──
+    logger.info(f"[DL-PW] Layer 1: curl_cffi | url={url[:120]}")
+    cf_filepath, cf_error, cf_size = await _download_via_curl_cffi(
+        url, "", status_msg, dl_id
+    )
+    if cf_filepath:
+        return cf_filepath, None, cf_size
+    if cf_error == "Cancelled by user":
+        return None, cf_error, 0
+    logger.info(f"[DL-PW] curl_cffi failed: {cf_error}, trying Playwright...")
+
+    # ── لایه 2: Playwright با response body capture ──
+    await safe_edit(status_msg, "🌐 Downloading via real browser...")
 
     try:
         async with async_playwright() as p:
@@ -821,83 +1005,209 @@ async def download_with_playwright(
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 720},
+                accept_downloads=True,
             )
             page = await context.new_page()
 
+            # تشخیص نام فایل از URL
+            url_path = url.split("?")[0].rstrip("/")
+            orig_name = os.path.basename(url_path)
+            if not orig_name:
+                orig_name = f"file_{int(time.time())}"
+            orig_name = re.sub(r"[^\w\.\-\_\(\) ]", "_", orig_name)
+            if len(orig_name) > 80:
+                base, ext = os.path.splitext(orig_name)
+                orig_name = base[:75] + ext
+
+            final_path = os.path.join(OUTPUT_FOLDER, orig_name)
+            counter = 1
+            while os.path.exists(final_path):
+                base, ext = os.path.splitext(orig_name)
+                final_path = os.path.join(OUTPUT_FOLDER, f"{base}_{counter}{ext}")
+                counter += 1
+
+            # متغیرهای مشترک
             download_promise: asyncio.Future = asyncio.Future()
+            response_promise: asyncio.Future = asyncio.Future()
 
             async def on_download(download):
-                download_promise.set_result(download)
+                if not download_promise.done():
+                    download_promise.set_result(download)
+
+            def on_response(response):
+                if not response_promise.done():
+                    try:
+                        ct = (response.headers.get("content-type", "") or "").lower()
+                        url_check = response.url
+                        if (url_check == url or url_check.rstrip("/") == url.rstrip("/")):
+                            if "text/html" not in ct or url_check.endswith((".ipa", ".apk", ".zip", ".exe", ".mp4", ".mp3")):
+                                response_promise.set_result(response)
+                    except Exception:
+                        pass
 
             page.on("download", on_download)
+            page.on("response", on_response)
 
+            # goto با timeout مناسب
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            except Exception:
-                pass
+                await page.goto(url, wait_until="commit", timeout=30000)
+            except Exception as e:
+                logger.warning(f"[DL-PW] goto warning: {e}")
 
-            # Wait a bit for download to start
-            for _ in range(30):
-                if download_promise.done() or active_downloads.get(dl_id, {}).get(
-                    "cancelled"
-                ):
-                    break
-                await asyncio.sleep(1)
+            # صبر برای download یا response (با timeout 15 ثانیه)
+            try:
+                done, pending = await asyncio.wait(
+                    [asyncio.ensure_future(download_promise),
+                     asyncio.ensure_future(response_promise)],
+                    timeout=15,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-            if active_downloads.get(dl_id, {}).get("cancelled"):
-                await browser.close()
-                return None, "Cancelled by user", 0
+                if active_downloads.get(dl_id, {}).get("cancelled"):
+                    await browser.close()
+                    return None, "Cancelled by user", 0
 
-            if not download_promise.done():
-                # Download didn't start automatically — save page content as fallback
+                # ─── مسیر 1: download event ───
+                if download_promise in done:
+                    logger.info("[DL-PW] Download event triggered")
+                    download = await download_promise
+
+                    suggested = download.suggested_filename or orig_name
+                    suggested = re.sub(r"[^\w\.\-\_\(\) ]", "_", suggested)
+                    if len(suggested) > 100:
+                        base, ext = os.path.splitext(suggested)
+                        suggested = base[:95] + ext
+
+                    final_path = os.path.join(OUTPUT_FOLDER, suggested)
+                    counter = 1
+                    while os.path.exists(final_path):
+                        base, ext = os.path.splitext(suggested)
+                        final_path = os.path.join(OUTPUT_FOLDER, f"{base}_{counter}{ext}")
+                        counter += 1
+
+                    # progress reporting برای download
+                    last_update = 0.0
+                    while True:
+                        if active_downloads.get(dl_id, {}).get("cancelled"):
+                            try:
+                                download.delete()
+                            except Exception:
+                                pass
+                            await browser.close()
+                            return None, "Cancelled by user", 0
+
+                        try:
+                            state = download.state
+                            if state == "finished":
+                                break
+                        except Exception:
+                            break
+
+                        try:
+                            failure = download.failure
+                            if failure:
+                                await browser.close()
+                                return None, f"Download failed: {failure}", 0
+                        except Exception:
+                            pass
+
+                        now = time.time()
+                        if now - last_update >= 2.0:
+                            last_update = now
+                            try:
+                                await safe_edit(status_msg, "📥 Downloading via browser...")
+                            except Exception:
+                                pass
+                        await asyncio.sleep(1)
+
+                    try:
+                        dl_path = await download.path()
+                    except Exception as e:
+                        logger.warning(f"[DL-PW] download.path() error: {e}")
+                        dl_path = None
+
+                    if not dl_path or not os.path.exists(dl_path):
+                        await browser.close()
+                        return None, "Download path not found", 0
+
+                    file_size = os.path.getsize(dl_path)
+                    if file_size < 1024:
+                        await browser.close()
+                        return None, f"File too small ({file_size} B)", 0
+
+                    import shutil
+                    shutil.move(dl_path, final_path)
+
+                    await browser.close()
+                    logger.info(f"[DL-PW] DONE | size={human_readable_size(file_size)} | file={final_path}")
+                    return final_path, None, file_size
+
+                # ─── مسیر 2: response body ───
+                if response_promise in done:
+                    logger.info("[DL-PW] Response captured, reading body...")
+                    response = await response_promise
+
+                    try:
+                        body = await response.body()
+                    except Exception as e:
+                        logger.warning(f"[DL-PW] response.body() error: {e}")
+                        await browser.close()
+                        return None, f"Failed to read response body: {e}", 0
+
+                    if not body or len(body) < 1024:
+                        await browser.close()
+                        return None, f"Response body too small ({len(body) if body else 0} B)", 0
+
+                    file_size = len(body)
+
+                    ct = (response.headers.get("content-type", "") or "").lower()
+                    if not os.path.splitext(orig_name)[1]:
+                        ct_map = {
+                            "application/x-ipa": ".ipa",
+                            "application/vnd.android.package-archive": ".apk",
+                            "application/zip": ".zip",
+                            "application/octet-stream": ".bin",
+                            "application/pdf": ".pdf",
+                            "video/mp4": ".mp4",
+                            "audio/mpeg": ".mp3",
+                        }
+                        for ct_key, ext_val in ct_map.items():
+                            if ct_key in ct:
+                                final_path += ext_val
+                                break
+
+                    counter = 1
+                    while os.path.exists(final_path):
+                        base, ext = os.path.splitext(final_path)
+                        final_path = os.path.join(OUTPUT_FOLDER, f"{os.path.basename(base)}_{counter}{ext}")
+                        counter += 1
+
+                    async with aiofiles.open(final_path, "wb") as f:
+                        await f.write(body)
+
+                    await browser.close()
+                    logger.info(f"[DL-PW] DONE (response body) | size={human_readable_size(file_size)} | file={final_path}")
+                    return final_path, None, file_size
+
+                # ─── هیچ‌کدوم trigger نشد ───
+                logger.warning("[DL-PW] Neither download event nor response captured")
+
                 try:
                     content = await page.content()
                     if content and len(content) > 512:
-                        # Check if it's a binary download by looking at response
-                        await browser.close()
-                        return None, "Browser could not trigger download", 0
+                        if "cloudflare" in content.lower() or "challenge" in content.lower():
+                            await browser.close()
+                            return None, "Cloudflare challenge blocked the download", 0
                 except Exception:
                     pass
+
                 await browser.close()
                 return None, "Download did not start in browser", 0
 
-            download = await download_promise
-
-            # Get suggested filename
-            suggested = download.suggested_filename or f"file_{int(time.time())}"
-            suggested = re.sub(r"[^\w\.\-_\(\) ]", "_", suggested)
-            if len(suggested) > 100:
-                base, ext = os.path.splitext(suggested)
-                suggested = base[:95] + ext
-
-            filepath = os.path.join(OUTPUT_FOLDER, suggested)
-            counter = 1
-            while os.path.exists(filepath):
-                base, ext = os.path.splitext(suggested)
-                filepath = os.path.join(OUTPUT_FOLDER, f"{base}_{counter}{ext}")
-                counter += 1
-
-            # Wait for download to complete
-            dl_path = await download.path()
-            if not dl_path or not os.path.exists(dl_path):
+            except asyncio.TimeoutError:
+                logger.warning("[DL-PW] Timeout waiting for download/response")
                 await browser.close()
-                return None, "Download path not found", 0
-
-            file_size = os.path.getsize(dl_path)
-            if file_size < 1024:
-                await browser.close()
-                return None, f"File too small ({file_size} B)", 0
-
-            # Move to our output folder
-            import shutil
-
-            shutil.move(dl_path, filepath)
-
-            await browser.close()
-            logger.info(
-                f"[DL-PW] DONE | size={human_readable_size(file_size)} | file={filepath}"
-            )
-            return filepath, None, file_size
+                return None, "Browser download timeout (15s)", 0
 
     except Exception as e:
         logger.error(f"[DL-PW] Error: {e}", exc_info=True)
