@@ -3358,7 +3358,6 @@ async def admin_input_handler(event):
         link = txt
         entry = {"name": name, "link": link, "chat_id": txt}
         if txt.startswith("https://t.me/+") or txt.startswith("https://t.me/joinchat/"):
-            # ذخیره invite hash + resolved_id + access_hash برای چک عضویت
             m = re.search(r"(?:joinchat/|\+)([a-zA-Z0-9_-]+)", txt)
             if m:
                 entry["invite_hash"] = m.group(1)
@@ -3367,8 +3366,9 @@ async def admin_input_handler(event):
                     invite = await event.client(CheckChatInviteRequest(entry["invite_hash"]))
                     if hasattr(invite, "chat") and invite.chat:
                         entry["resolved_id"] = invite.chat.id
-                        if hasattr(invite.chat, "access_hash") and invite.chat.access_hash:
-                            entry["access_hash"] = invite.chat.access_hash
+                        # access_hash رو حتماً ذخیره کن (حتی ۰) چون بات میتونه با ۰ کار کنه
+                        ah = invite.chat.access_hash if hasattr(invite.chat, "access_hash") else 0
+                        entry["access_hash"] = ah or 0
                 except Exception:
                     pass
         elif txt.startswith("-") and txt.lstrip("-").isdigit():
@@ -4045,39 +4045,33 @@ async def sponsor_join_check_callback(event):
     not_joined = []
     for s in sponsors:
         try:
-            from telethon.tl.functions.channels import GetParticipantRequest
-            from telethon.tl.types import InputPeerChannel
-
             resolved_id = s.get("resolved_id")
-            access_hash = s.get("access_hash")
-
-            if resolved_id and access_hash:
-                input_channel = InputPeerChannel(resolved_id, access_hash)
-                await event.client(GetParticipantRequest(input_channel, user_id))
-            else:
-                # fallback: سعی کن از invite_hash یا chat_id استفاده کنه
-                raw = s.get("invite_hash") or s.get("chat_id", "")
-                if isinstance(raw, str) and ("joinchat" in raw or "/+" in raw or raw.startswith("https://")):
-                    # استخراج هش و resolve کردن access_hash موقع چک
-                    from telethon.tl.functions.messages import CheckChatInviteRequest
-                    m = re.search(r"(?:joinchat/|\+)([a-zA-Z0-9_-]+)", raw)
-                    if m:
-                        invite = await event.client(CheckChatInviteRequest(m.group(1)))
-                        if hasattr(invite, "chat") and invite.chat:
-                            cid = invite.chat.id
-                            ah = invite.chat.access_hash if hasattr(invite.chat, "access_hash") else None
-                            if ah:
-                                input_channel = InputPeerChannel(cid, ah)
-                                await event.client(GetParticipantRequest(input_channel, user_id))
-                            else:
-                                raise ValueError("No access_hash in invite response")
-                        else:
-                            raise ValueError("Chat not found in invite")
-                    else:
-                        raise ValueError(f"Cannot parse invite link: {raw}")
+            invite_hash = s.get("invite_hash")
+            if resolved_id:
+                # استفاده از resolved_id با access_hash (حتی ۰) — بات میتونه با ۰ کار کنه
+                from telethon.tl.functions.channels import GetParticipantRequest
+                from telethon.tl.types import InputPeerChannel
+                ah = s.get("access_hash", 0) or 0
+                await event.client(GetParticipantRequest(
+                    InputPeerChannel(resolved_id, ah), user_id
+                ))
+            elif invite_hash:
+                # fallback: resolve hash در لحظه
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                invite = await event.client(CheckChatInviteRequest(invite_hash))
+                if hasattr(invite, "chat") and invite.chat:
+                    cid = invite.chat.id
+                    ah = getattr(invite.chat, "access_hash", 0) or 0
+                    from telethon.tl.types import InputPeerChannel
+                    await event.client(GetParticipantRequest(
+                        InputPeerChannel(cid, ah), user_id
+                    ))
                 else:
-                    resolver = await event.client.get_entity(raw)
-                    await event.client.get_permissions(resolver, user_id)
+                    raise ValueError("Chat not found in invite")
+            else:
+                # @username یا عدد
+                resolver = await event.client.get_entity(s["chat_id"])
+                await event.client.get_permissions(resolver, user_id)
         except Exception as e:
             logger.warning(f"[SPONSOR] Check failed for {s.get('name')}: {e}")
             not_joined.append(s)
