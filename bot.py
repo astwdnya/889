@@ -3354,13 +3354,35 @@ async def admin_input_handler(event):
     if action == "sponsor_set_link":
         # مرحله ۲: ذخیره لینک و ساخت اسپانسر
         name = pending_sponsor_name.pop(event.sender_id, "Unknown")
-        txt = raw
+        txt = raw.strip()
         link = txt
         chat_id = txt
+        resolved_id = None
         if txt.startswith("https://t.me/+") or txt.startswith("https://t.me/joinchat/"):
-            chat_id = txt
             link = txt
-        sponsors.append({"name": name, "chat_id": chat_id, "link": link})
+            # تلاش برای resolve کردن invite link به chat ID عددی
+            try:
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                m = re.search(r"(?:joinchat/|\+)([a-zA-Z0-9_-]+)", txt)
+                if m:
+                    invite = await event.client(CheckChatInviteRequest(m.group(1)))
+                    if hasattr(invite, "chat"):
+                        resolved_id = invite.chat.id
+                        chat_id = str(resolved_id)
+            except Exception:
+                pass
+            if not resolved_id:
+                chat_id = txt
+        elif txt.startswith("-") and txt.lstrip("-").isdigit():
+            chat_id = int(txt)
+            resolved_id = chat_id
+        elif txt.isdigit():
+            chat_id = int(txt)
+            resolved_id = chat_id
+        sponsor_entry = {"name": name, "chat_id": chat_id, "link": link}
+        if resolved_id:
+            sponsor_entry["resolved_id"] = resolved_id
+        sponsors.append(sponsor_entry)
         asyncio.ensure_future(_save_sponsors())
         await event.reply(
             f"✅ **اسپانسر اضافه شد!**\n📢 `{name}` — `{chat_id}`",
@@ -4030,7 +4052,25 @@ async def sponsor_join_check_callback(event):
     not_joined = []
     for s in sponsors:
         try:
-            resolver = await event.client.get_entity(s["chat_id"])
+            chat_identifier = s.get("resolved_id") or s["chat_id"]
+            # اگه chat_identifier یه join link هست، هش رو استخراج کن و چت رو resolve کن
+            if isinstance(chat_identifier, str) and (
+                chat_identifier.startswith("https://t.me/+") or chat_identifier.startswith("https://t.me/joinchat/")
+            ):
+                m = re.search(r"(?:joinchat/|\+)([a-zA-Z0-9_-]+)", chat_identifier)
+                if not m:
+                    not_joined.append(s)
+                    continue
+                invite_hash = m.group(1)
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                invite = await event.client(CheckChatInviteRequest(invite_hash))
+                if hasattr(invite, "chat"):
+                    resolver = invite.chat
+                else:
+                    not_joined.append(s)
+                    continue
+            else:
+                resolver = await event.client.get_entity(chat_identifier)
             await event.client.get_permissions(resolver, user_id)
         except Exception:
             not_joined.append(s)
