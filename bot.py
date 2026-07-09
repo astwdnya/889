@@ -319,6 +319,11 @@ from otherwebsiteshandler.sxyprn_handler import (
     extract_sxyprn_qualities,
     download_sxyprn_direct,
 )
+from otherwebsiteshandler.kick_handler import (
+    is_kick_url,
+    get_available_qualities,
+    download_past,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -4912,6 +4917,15 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
             await process_sxyprn_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_kick_url(target_url):
+        logger.info(f"[URL] Kick detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال دریافت کیفیت‌ها...")
+        try:
+            await process_kick_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -10949,6 +10963,150 @@ async def sxyprn_cancel_callback(event):
         pass
 
 
+# ====================== KICK HANDLER ======================
+
+
+async def process_kick_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities = await get_available_qualities(url)
+    if not qualities:
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. (لایو آنلاین نیست؟)")
+        return
+    session_id = f"kc_{event.chat_id}_{event.id}_{int(time.time())}"
+    kick_sessions[session_id] = {
+        "url": url,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "created_at": time.time(),
+    }
+    text = f"🎬 **Kick Live**\n\n🎚 کیفیت مورد نظر رو انتخاب کن (دانلود از ابتدای لایو):"
+    buttons = []
+    for i, q in enumerate(qualities):
+        label = f"{q.get('height', '?')}p ({q.get('resolution', '?')})"
+        buttons.append([Button.inline(label, f"kc_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"kc_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def kick_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in kick_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = kick_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    quality_str = f"{chosen.get('height', '720')}p"
+    await event.answer(f"✅ {quality_str}", alert=False)
+
+    output_dir = os.path.join(OUTPUT_FOLDER, f"kick_{int(time.time())}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    dl_id = f"kc_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود لایو Kick...**\n🎚 {quality_str}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        result = await download_past(
+            url=url,
+            output_dir=output_dir,
+            quality=quality_str,
+            progress_cb=progress_cb,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not result.get("success"):
+            err_msg = result.get("error", "Unknown error")
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+
+        parts = result.get("parts", [])
+        total_size = result.get("total_size", 0)
+
+        if not parts:
+            await safe_edit(status_msg, "❌ هیچ پخشی دانلود نشد.")
+            return
+
+        await safe_edit(status_msg, f"📤 **در حال آپلود {len(parts)} پارت...**")
+        for i, part in enumerate(parts):
+            filepath = part["filepath"]
+            if not os.path.exists(filepath):
+                continue
+            ul_id = f"kc_ul_{event.chat_id}_{event.id}_{i}_{int(time.time())}"
+            caption = f"🎬 **Kick Live {quality_str}**\n📦 پارت {i+1}/{len(parts)}\n💾 {part.get('size', 0) / 1024 / 1024:.0f} MB"
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=entry["chat_id"],
+                filepath=filepath,
+                caption=caption,
+                status_msg=status_msg,
+                buttons=None,
+                supports_streaming=True,
+                ul_id=ul_id,
+            )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[KC] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if os.path.exists(output_dir):
+                for f in os.listdir(output_dir):
+                    fp = os.path.join(output_dir, f)
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+                os.rmdir(output_dir)
+        except Exception:
+            pass
+
+
+async def kick_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("kc_cancel_", "")
+    kick_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 xanimu_sessions: Dict[str, dict] = {}
 porntrex_sessions: Dict[str, dict] = {}
 heavyr_sessions: Dict[str, dict] = {}
@@ -10972,6 +11130,7 @@ mat6tube_sessions: Dict[str, dict] = {}
 peekvids_sessions: Dict[str, dict] = {}
 paradisehill_sessions: Dict[str, dict] = {}
 sxyprn_sessions: Dict[str, dict] = {}
+kick_sessions: Dict[str, dict] = {}
 
 
 # ====================== INLINE SEARCH ======================
@@ -12062,6 +12221,12 @@ async def main():
     )
     client.add_event_handler(
         sxyprn_cancel_callback, events.CallbackQuery(pattern=r"sx_cancel_.+")
+    )
+    client.add_event_handler(
+        kick_quality_callback, events.CallbackQuery(pattern=r"kc_q_.+")
+    )
+    client.add_event_handler(
+        kick_cancel_callback, events.CallbackQuery(pattern=r"kc_cancel_.+")
     )
     client.add_event_handler(
         ytdlp_quality_callback, events.CallbackQuery(pattern=r"ytdlp_q_.+")
