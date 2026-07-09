@@ -254,6 +254,11 @@ from otherwebsiteshandler.bigfuck_handler import (
     extract_bigfuck_qualities,
     download_bigfuck_video,
 )
+from otherwebsiteshandler.babestube_handler import (
+    is_babestube_url,
+    extract_babestube_qualities,
+    download_babestube_video,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -4734,6 +4739,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_babestube_url(target_url):
+        logger.info(f"[URL] BabesTube detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_babestube_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_rule34video_url(target_url):
         logger.info(f"[URL] Rule34Video detected | url={target_url[:120]}")
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
@@ -9040,6 +9054,137 @@ async def bigfuck_cancel_callback(event):
         pass
 
 
+# ====================== BABESTUBE HANDLER ======================
+
+
+async def process_babestube_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_babestube_qualities(
+        url,
+        progress_cb=progress_cb,
+    )
+    if not qualities:
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد.")
+        return
+    session_id = f"bb_{event.chat_id}_{event.id}_{int(time.time())}"
+    babestube_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "created_at": time.time(),
+    }
+    title_display = title[:60] if title else "ویدیو BabesTube"
+    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"bb_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"bb_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def babestube_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in babestube_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = babestube_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "babestube_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "babestube_video"
+
+    filepath = os.path.join(OUTPUT_FOLDER, f"bb_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"bb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, file_size = await download_babestube_video(
+            page_url=url,
+            video_url=chosen.get("url", ""),
+            filepath=filepath,
+            progress_cb=progress_cb,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+
+        ul_id = f"bb_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(file_size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[BB] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def babestube_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("bb_cancel_", "")
+    babestube_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 xanimu_sessions: Dict[str, dict] = {}
 porntrex_sessions: Dict[str, dict] = {}
 heavyr_sessions: Dict[str, dict] = {}
@@ -9050,6 +9195,7 @@ cartoonporncom_sessions: Dict[str, dict] = {}
 hihentaiporn_sessions: Dict[str, dict] = {}
 fetishshrine_sessions: Dict[str, dict] = {}
 bigfuck_sessions: Dict[str, dict] = {}
+babestube_sessions: Dict[str, dict] = {}
 
 
 # ====================== INLINE SEARCH ======================
@@ -10062,6 +10208,12 @@ async def main():
     )
     client.add_event_handler(
         bigfuck_cancel_callback, events.CallbackQuery(pattern=r"bf_cancel_.+")
+    )
+    client.add_event_handler(
+        babestube_quality_callback, events.CallbackQuery(pattern=r"bb_q_.+")
+    )
+    client.add_event_handler(
+        babestube_cancel_callback, events.CallbackQuery(pattern=r"bb_cancel_.+")
     )
     client.add_event_handler(
         ytdlp_quality_callback, events.CallbackQuery(pattern=r"ytdlp_q_.+")
