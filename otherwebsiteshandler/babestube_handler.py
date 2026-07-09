@@ -78,11 +78,11 @@ _DEFAULT_HEADERS = {
 MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (محدودیت تلگرام)
 MIN_VALID_VIDEO_SIZE = 100 * 1024  # 100 KB
 PROGRESS_INTERVAL = 1.5
-CHUNK_SIZE = 1024 * 1024  # 1 MB
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
 MULTI_SEGMENT_MIN_SIZE = 5 * 1024 * 1024  # 5 MB
-MULTI_SEGMENT_WORKERS = 16
+MULTI_SEGMENT_WORKERS = 32
 
 # دامنه‌های مجاز
 _ALLOWED_HOSTS = frozenset({
@@ -751,7 +751,7 @@ async def _download_multi_segment(
         )
 
         # ── Work-queue pattern ──
-        CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB per chunk
+        CHUNK_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB per chunk
         chunks = []
         offset = 0
         chunk_idx = 0
@@ -813,8 +813,9 @@ async def _download_multi_segment(
 
         # session اشتراکی برای همه worker ها
         shared_timeout = ClientTimeout(total=300, connect=30, sock_read=120)
+        shared_connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
         shared_session = aiohttp.ClientSession(
-            timeout=shared_timeout, headers=headers, cookies=cookies
+            connector=shared_connector, timeout=shared_timeout, headers=headers, cookies=cookies
         )
 
         async def _download_worker(worker_id: int):
