@@ -244,6 +244,11 @@ from otherwebsiteshandler.hihentaiporn_handler import (
     extract_hihentaiporn_qualities,
     download_hihentaiporn_video,
 )
+from otherwebsiteshandler.fetishshrine_handler import (
+    is_fetishshrine_url,
+    extract_fetishshrine_qualities,
+    download_fetishshrine_video,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -4019,6 +4024,43 @@ async def admin_sponsor_rm_callback(event):
     await admin_refresh_callback(event)
 
 
+async def _check_invite_membership(client, invite_hash: str, target_user_id: int):
+    """بررسی عضویت کاربر در کانال خصوصی با invite hash.
+
+    استراتژی:
+      1. ImportChatInviteRequest میزنه — اگه بات قبلاً عضو بوده UserAlreadyParticipantError میگیره
+      2. از CheckChatInviteRequest برای گرفتن chatId و access_hash استفاده میکنه
+      3. GetParticipantRequest میزنه برای چک کردن کاربر هدف
+
+      اگه بات دسترسی نداشته باشه (ChatInvite برگرده بدون chat)، استثنا میندازه
+      تا کالر بتونه از ادامه صرفنظر کنه.
+    """
+    from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+    from telethon.tl.functions.channels import GetParticipantRequest
+    from telethon.tl.types import InputPeerChannel
+    from telethon.errors import UserAlreadyParticipantError, UserNotParticipantError
+
+    try:
+        join_result = await client(ImportChatInviteRequest(invite_hash))
+        # بات تازه عضو شد — entity from result.chats[0]
+        if join_result and hasattr(join_result, "chats") and join_result.chats:
+            chat = join_result.chats[0]
+            cid = chat.id
+            ah = getattr(chat, "access_hash", 0) or 0
+            await client(GetParticipantRequest(InputPeerChannel(cid, ah), target_user_id))
+            return
+        raise ValueError("ImportChatInvite returned no chats")
+    except UserAlreadyParticipantError:
+        # بات قبلاً عضو بوده
+        invite = await client(CheckChatInviteRequest(invite_hash))
+        if hasattr(invite, "chat") and invite.chat:
+            cid = invite.chat.id
+            ah = getattr(invite.chat, "access_hash", 0) or 0
+            await client(GetParticipantRequest(InputPeerChannel(cid, ah), target_user_id))
+        else:
+            raise ValueError("ChatInvite without chat field - bot cannot access channel")
+
+
 async def sponsor_join_check_callback(event):
     """کاربر روی ✅ عضو شدم زده — چک میکنه عضو همه اسپانسرها هست یا نه."""
     data = event.data.decode()
@@ -4045,36 +4087,30 @@ async def sponsor_join_check_callback(event):
     not_joined = []
     for s in sponsors:
         try:
-            resolved_id = s.get("resolved_id")
+            from telethon.tl.functions.channels import GetParticipantRequest
+            from telethon.tl.types import InputPeerChannel
+            from telethon.errors import UserNotParticipantError
+
             invite_hash = s.get("invite_hash")
+            resolved_id = s.get("resolved_id")
+            access_hash = s.get("access_hash", 0) or 0
+
             if resolved_id:
-                # استفاده از resolved_id با access_hash (حتی ۰) — بات میتونه با ۰ کار کنه
-                from telethon.tl.functions.channels import GetParticipantRequest
-                from telethon.tl.types import InputPeerChannel
-                ah = s.get("access_hash", 0) or 0
                 await event.client(GetParticipantRequest(
-                    InputPeerChannel(resolved_id, ah), user_id
+                    InputPeerChannel(resolved_id, access_hash), user_id
                 ))
             elif invite_hash:
-                # fallback: resolve hash در لحظه
-                from telethon.tl.functions.messages import CheckChatInviteRequest
-                invite = await event.client(CheckChatInviteRequest(invite_hash))
-                if hasattr(invite, "chat") and invite.chat:
-                    cid = invite.chat.id
-                    ah = getattr(invite.chat, "access_hash", 0) or 0
-                    from telethon.tl.types import InputPeerChannel
-                    await event.client(GetParticipantRequest(
-                        InputPeerChannel(cid, ah), user_id
-                    ))
-                else:
-                    raise ValueError("Chat not found in invite")
+                await _check_invite_membership(event.client, invite_hash, user_id)
             else:
                 # @username یا عدد
                 resolver = await event.client.get_entity(s["chat_id"])
                 await event.client.get_permissions(resolver, user_id)
-        except Exception as e:
-            logger.warning(f"[SPONSOR] Check failed for {s.get('name')}: {e}")
+        except UserNotParticipantError:
             not_joined.append(s)
+        except Exception as e:
+            logger.warning(f"[SPONSOR] Can't verify {s.get('name')}: {type(e).__name__}: {e}")
+            # اگه بات دسترسی نداره، بذار کاربر رد بشه به جای بلاک کاذب
+            continue
 
     if not_joined:
         await event.answer("❌ هنوز عضو همه کانال‌ها نشدید!", alert=True)
@@ -4671,6 +4707,15 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
             await process_hihentaiporn_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_fetishshrine_url(target_url):
+        logger.info(f"[URL] FetishShrine detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_fetishshrine_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -8719,6 +8764,137 @@ async def hihentaiporn_cancel_callback(event):
         pass
 
 
+# ====================== FETISHSHRINE HANDLER ======================
+
+
+async def process_fetishshrine_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_fetishshrine_qualities(
+        url,
+        progress_cb=progress_cb,
+    )
+    if not qualities:
+        await safe_edit(status_msg, "❌ کیفیتی پیدا نشد.")
+        return
+    session_id = f"fs_{event.chat_id}_{event.id}_{int(time.time())}"
+    fetishshrine_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "created_at": time.time(),
+    }
+    title_display = title[:60] if title else "ویدیو FetishShrine"
+    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"fs_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"fs_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def fetishshrine_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in fetishshrine_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = fetishshrine_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "fetishshrine_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "fetishshrine_video"
+
+    filepath = os.path.join(OUTPUT_FOLDER, f"fs_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"fs_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, file_size = await download_fetishshrine_video(
+            page_url=url,
+            video_url=chosen.get("url", ""),
+            filepath=filepath,
+            progress_cb=progress_cb,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+
+        ul_id = f"fs_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(file_size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[FS] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def fetishshrine_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("fs_cancel_", "")
+    fetishshrine_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 xanimu_sessions: Dict[str, dict] = {}
 porntrex_sessions: Dict[str, dict] = {}
 heavyr_sessions: Dict[str, dict] = {}
@@ -8727,6 +8903,7 @@ leaksextape_sessions: Dict[str, dict] = {}
 xxxpublicpornvideos_sessions: Dict[str, dict] = {}
 cartoonporncom_sessions: Dict[str, dict] = {}
 hihentaiporn_sessions: Dict[str, dict] = {}
+fetishshrine_sessions: Dict[str, dict] = {}
 
 
 # ====================== INLINE SEARCH ======================
@@ -9727,6 +9904,12 @@ async def main():
     )
     client.add_event_handler(
         hihentaiporn_cancel_callback, events.CallbackQuery(pattern=r"hh_cancel_.+")
+    )
+    client.add_event_handler(
+        fetishshrine_quality_callback, events.CallbackQuery(pattern=r"fs_q_.+")
+    )
+    client.add_event_handler(
+        fetishshrine_cancel_callback, events.CallbackQuery(pattern=r"fs_cancel_.+")
     )
     client.add_event_handler(
         ytdlp_quality_callback, events.CallbackQuery(pattern=r"ytdlp_q_.+")
