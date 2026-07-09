@@ -1,27 +1,34 @@
 """
-hdtube_handler.py
-─────────────────
-استخراج و دانلود ویدیو از hdtube.porn (با پشتیبانی KT Player + Video.js)
+shameless_handler.py
+────────────────────
+استخراج و دانلود ویدیو از shameless.com (با پشتیبانی ۳ کیفیت + سرعت بالا)
 
-روش کار (بر اساس الگوهای سایت‌های مشابه — نیاز به لاگ واقعی برای تأیید):
-  - سایت ممکنه IP های datacenter رو بلاک کنه (nginx 403)
-  - پشتیبانی از دو نوع player:
-    1. KT Player (flashvars) — مثل babestube، fetishshrine، pornwhite
-       - video_url + video_url_text (کیفیت پایه)
-       - video_alt_url + video_alt_url_text (کیفیت HD)
-       - video_url_hd flag
-       - URL از /get_file/HASH/.../FILEID.mp4/?v-acctoken=TOKEN
-    2. Video.js (<source> tag) — مثل porndroids
-       - URL از <source src="..." type="video/mp4">
+روش کار (بر اساس تحلیل واقعی صفحه):
+  - سایت پشت Cloudflare نیست (aiohttp مستقیم کار می‌کنه)
+  - Player: KT Player (مثل fetishshrine، pornwhite، babestube، sleazyneasy)
+  - URL ویدیو از /get_file/3/HASH/.../FILEID_QUALITY.mp4/?br=BITRATE میان
+  - نکته مهم: URL شامل ?br=BITRATE هست که الزامیه (بدون اون 404)
+  - کوکی kt_acctoken و PHPSESSID برای session persistence لازمه
+  - سرور: nginx (نسخه‌های مختلف)
+  - سرور از Range request پشتیبانی می‌کنه (HTTP 206, Accept-Ranges: bytes)
+  - yt-dlp با extractor=generic کار می‌کنه و هر ۳ کیفیت رو پیدا می‌کنه
 
-  - سرور از Range request پشتیبانی می‌کنه (HTTP 206)
-  - yt-dlp با extractor=generic کار می‌کنه
-  - multi-segment download با 32 workers برای سرعت بالا
+کیفیت‌ها (مهم — ۳ کیفیت):
+  shameless از flashvars با ۳ کیفیت استفاده می‌کنه:
+    - video_url + video_url_text: 'HD 720p'    → 720p (HD)
+      URL: FILEID_hd_720p.mp4?br=1619
+    - video_alt_url + video_alt_url_text: '480p' → 480p (SD)
+      URL: FILEID_sd_480p.mp4?br=913
+    - video_alt_url2 + video_alt_url2_text: '360p' → 360p (SD)
+      URL: FILEID_sd_240p.mp4?br=404
 
-استراتژی دانلود:
+  نکته: video_alt_url2_text می‌گه '360p' ولی فایل واقعی _sd_240p.mp4 هست.
+  ما از video_alt_url2_text برای label استفاده می‌کنیم.
+
+استراتژی دانلود (با focus روی سرعت بالا):
   1. fetch صفحه با aiohttp (سریع)
   2. fallback به curl_cffi با impersonate=chrome
-  3. استخراج URL از flashvars (KT Player) یا <source> tag (Video.js)
+  3. استخراج video_url، video_alt_url، video_alt_url2 از flashvars block
   4. multi-segment download با 32 workers
   5. fallback به single-connection
   6. fallback به yt-dlp روی URL صفحه
@@ -44,7 +51,7 @@ import aiofiles
 import aiohttp
 from aiohttp import ClientTimeout, CookieJar, TCPConnector
 
-logger = logging.getLogger("HDTubeHandler")
+logger = logging.getLogger("ShamelessHandler")
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,9 +73,9 @@ _DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# ─── Constants ────────────────────────────────────────────────────────────
+# ─── Constants ─────────────────────────────────────────────────────────────
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (محدودیت تلگرام)
 MIN_VALID_VIDEO_SIZE = 100 * 1024  # 100 KB
 PROGRESS_INTERVAL = 1.0
 CHUNK_SIZE = 1024 * 1024  # 1 MB
@@ -77,16 +84,21 @@ RETRY_DELAY = 2.0
 MULTI_SEGMENT_MIN_SIZE = 5 * 1024 * 1024  # 5 MB
 
 # ─── تنظیمات سرعت بالا ───────────────────────────────────────────────────
-MULTI_SEGMENT_WORKERS = 32  # برای سرعت بالا
+MULTI_SEGMENT_WORKERS = 32
 MULTI_SEGMENT_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
 CONNECTOR_LIMIT = 50
 CONNECTOR_LIMIT_PER_HOST = 50
 
 # دامنه‌های مجاز
 _ALLOWED_HOSTS = frozenset({
-    "hdtube.porn",
-    "www.hdtube.porn",
-    "m.hdtube.porn",
+    "shameless.com",
+    "www.shameless.com",
+    "m.shameless.com",
+})
+
+# CDN مجاز
+_ALLOWED_CDN_HOSTS = frozenset({
+    "icdn.shameless.com",
 })
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -95,11 +107,11 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 # ─── Utility ──────────────────────────────────────────────────────────────
 
 
-def is_hdtube_url(url: str) -> bool:
-    """بررسی اینکه URL مربوط به hdtube هست."""
+def is_shameless_url(url: str) -> bool:
+    """بررسی اینکه URL مربوط به shameless هست."""
     try:
         host = urlparse(url).hostname or ""
-        return host in _ALLOWED_HOSTS or host.endswith(".hdtube.porn")
+        return host in _ALLOWED_HOSTS or host.endswith(".shameless.com")
     except Exception:
         return False
 
@@ -176,20 +188,22 @@ def _check_curl_cffi() -> bool:
 
 
 def _quality_text_to_height(quality_text: str) -> int:
+    """تبدیل quality_text به height عددی."""
     if not quality_text:
         return 480
     qt = quality_text.lower().strip()
-    m = re.match(r'(\d{3,4})p?', qt)
+    # الگوی عدد + p (مثل 480p, 720p, 1080p)
+    m = re.search(r'(\d{3,4})p?', qt)
     if m:
         return int(m.group(1))
-    if qt in ("hd", "high", "hq"):
+    if "hd" in qt and "720" in qt:
         return 720
-    if qt in ("sd", "low", "lq"):
-        return 480
-    if qt in ("fhd", "fullhd", "full-hd", "full_hd"):
+    if "hd" in qt and "1080" in qt:
         return 1080
-    if qt in ("4k", "2160p", "uhd"):
-        return 2160
+    if "hd" in qt:
+        return 720
+    if "sd" in qt:
+        return 480
     return 480
 
 
@@ -202,7 +216,7 @@ def _extract_title(html: str) -> str:
     flashvars = _extract_flashvars(html)
     if flashvars.get("video_title"):
         title = flashvars["video_title"].strip()
-        title = re.sub(r"\s*[-|@]\s*(?:hdtube\.porn|HDTube|HD Porn Tube)\s*$", "", title, flags=re.IGNORECASE)
+        title = re.sub(r"\s*[-|@]\s*(?:shameless\.com|Shameless)\s*$", "", title, flags=re.IGNORECASE)
         if title:
             return title
 
@@ -212,14 +226,14 @@ def _extract_title(html: str) -> str:
         m = re.search(r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:title["\']', html, re.IGNORECASE)
     if m:
         title = m.group(1).strip()
-        title = re.sub(r"\s*[-|@]\s*(?:hdtube\.porn|HDTube|HD Porn Tube)\s*$", "", title, flags=re.IGNORECASE)
+        title = re.sub(r"\s*[-|@]\s*(?:shameless\.com|Shameless)\s*$", "", title, flags=re.IGNORECASE)
         return title
 
     # روش 3: <title>
     m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
     if m:
         title = m.group(1).strip()
-        title = re.sub(r"\s*[-|@]\s*(?:hdtube\.porn|HDTube|HD Porn Tube)\s*$", "", title, flags=re.IGNORECASE)
+        title = re.sub(r"\s*[-|@]\s*(?:shameless\.com|Shameless)\s*$", "", title, flags=re.IGNORECASE)
         return title or "Untitled"
 
     return "Untitled"
@@ -227,9 +241,6 @@ def _extract_title(html: str) -> str:
 
 def _extract_thumbnail(html: str) -> str:
     m = re.search(r'(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'<video[^>]+poster=["\']([^"\']+)["\']', html, re.IGNORECASE)
     if m:
         return m.group(1).strip()
     return ""
@@ -247,41 +258,11 @@ def _extract_duration(html: str) -> Optional[int]:
         if m_min: total += int(m_min.group(1)) * 60
         if s: total += int(s.group(1))
         return total if total > 0 else None
-    m = re.search(r'data-duration=["\'](\d+)["\']', html, re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            pass
     return None
 
 
-def _strip_kt_function_prefix(url: str) -> str:
-    """
-    حذف prefix `function/N/` از URL (KT Player function call).
-
-    hdtube.porn از الگوی `function/0/https://...` در flashvars استفاده می‌کنه.
-    این prefix به KT Player می‌گه که URL رو با function #0 پردازش کنه.
-    ما فقط URL واقعی رو می‌خوایم.
-
-    مثال:
-        function/0/https://www.hdtube.porn/get_file/6/.../17938_720p.mp4/?br=1790
-        → https://www.hdtube.porn/get_file/6/.../17938_720p.mp4/?br=1790
-    """
-    # الگوی function/N/ در ابتدای URL
-    m = re.match(r'^function/\d+/(.+)$', url)
-    if m:
-        return m.group(1)
-    return url
-
-
 def _extract_flashvars(html: str) -> dict:
-    """استخراج flashvars block از HTML (KT Player).
-
-    نکته: hdtube.porn از `function/0/` prefix در video_url استفاده می‌کنه.
-    ما این prefix رو در _extract_video_sources strip می‌کنیم (نه اینجا) تا
-    اگه کسی خواست raw value رو ببینه، همچنان موجود باشه.
-    """
+    """استخراج flashvars block از HTML (KT Player)."""
     flashvars = {}
     fv_match = re.search(r'var\s+flashvars\s*=\s*\{([^}]+(?:\{[^}]*\}[^{}]*)*)\}', html, re.DOTALL)
     if not fv_match:
@@ -315,49 +296,46 @@ def _extract_video_sources(html: str) -> List[dict]:
     """
     استخراج URL های ویدیو اصلی از HTML.
 
-    اولویت 1: flashvars (KT Player) — video_url + video_alt_url
-    اولویت 2: <source> tag داخل <video> (Video.js)
-    اولویت 3: URL های /get_file/ با v-acctoken
-    اولویت 4: URL های /get_file/ بدون v-acctoken
+    shameless ۳ کیفیت داره:
+      - video_url (HD 720p) — URL: FILEID_hd_720p.mp4?br=1619
+      - video_alt_url (480p) — URL: FILEID_sd_480p.mp4?br=913
+      - video_alt_url2 (360p) — URL: FILEID_sd_240p.mp4?br=404
+
+    نکته: ?br=BITRATE query string الزامیه (بدون اون 404)
 
     Returns:
         list of dicts: [{label, url, height, quality_key, method, is_hd}, ...]
+        مرتب شده بر اساس height (بالاترین اول)
     """
     sources = []
     seen_urls = set()
 
-    # ─── روش 1: flashvars (KT Player) ───
-    # نکته مهم hdtube.porn:
-    #   - video_url شامل prefix `function/0/` هست → باید strip بشه
-    #   - video_url از /get_file/6/ میان (نه /1/ یا /3/)
-    #   - URL شامل query string `?br=BITRATE` هست که الزامیه (بدون اون 404)
-    #   - video_url = HD (720p), video_alt_url = SD (480p) — برعکس babestube!
+    # ─── روش 1: از flashvars (KT Player) ───
     flashvars = _extract_flashvars(html)
 
-    # کیفیت پایه (video_url) — در hdtube این HD هست!
+    # کیفیت اصلی (video_url) — HD 720p
     if flashvars.get("video_url"):
-        # strip function/0/ prefix
-        raw_url = flashvars["video_url"]
-        url = _clean_url(_strip_kt_function_prefix(raw_url))
+        url = _clean_url(flashvars["video_url"])
         if _is_main_video_url(url) and url not in seen_urls:
             seen_urls.add(url)
             quality_text = flashvars.get("video_url_text", "")
             is_hd = flashvars.get("video_url_hd") == "1"
-            postfix = flashvars.get("postfix", "")
-
-            # تشخیص کیفیت از URL، text، یا postfix
+            # تشخیص کیفیت از URL یا text
             url_lower = url.lower()
-            if "_1080p" in url_lower or "1080p" in quality_text.lower():
+            if "_1080p" in url_lower or "1080" in quality_text.lower():
                 quality_text = quality_text or "1080p"
                 height = 1080
                 is_hd = True
-            elif "_720p" in url_lower or "720p" in quality_text.lower() or "_720p" in postfix.lower():
+            elif "_720p" in url_lower or "720" in quality_text.lower():
                 quality_text = quality_text or "720p"
                 height = 720
                 is_hd = True
-            elif "_480p" in url_lower or "480p" in quality_text.lower():
+            elif "_480p" in url_lower or "480" in quality_text.lower():
                 quality_text = quality_text or "480p"
                 height = 480
+            elif "_360p" in url_lower or "_240p" in url_lower or "360" in quality_text.lower():
+                quality_text = quality_text or "360p"
+                height = 360
             elif quality_text:
                 height = _quality_text_to_height(quality_text)
             else:
@@ -379,18 +357,18 @@ def _extract_video_sources(html: str) -> List[dict]:
             })
             logger.info("Found video_url from flashvars (%s): %s", quality_text, url[:100])
 
-    # کیفیت‌های alt (video_alt_url) — در hdtube این SD هست
+    # کیفیت‌های alt (video_alt_url, video_alt_url2, ...)
     alt_keys_patterns = [
         ("video_alt_url", "video_alt_url_text", "video_alt_url_hd"),
         ("video_alt_url2", "video_alt_url2_text", "video_alt_url2_hd"),
         ("video_alt_url3", "video_alt_url3_text", "video_alt_url3_hd"),
+        ("video_alt_url4", "video_alt_url4_text", "video_alt_url4_hd"),
     ]
     for url_key, text_key, hd_key in alt_keys_patterns:
-        alt_url_raw = flashvars.get(url_key)
-        if not alt_url_raw:
+        alt_url = flashvars.get(url_key)
+        if not alt_url:
             continue
-        # strip function/0/ prefix
-        url = _clean_url(_strip_kt_function_prefix(alt_url_raw))
+        url = _clean_url(alt_url)
         if not _is_main_video_url(url) or url in seen_urls:
             continue
         seen_urls.add(url)
@@ -410,6 +388,11 @@ def _extract_video_sources(html: str) -> List[dict]:
         elif "_480p" in url_lower:
             quality_text = quality_text or "480p"
             height = 480
+        elif "_360p" in url_lower or "_240p" in url_lower:
+            # نکته: فایل ممکنه _sd_240p.mp4 باشه ولی text بگه '360p'
+            # ما از text استفاده می‌کنیم چون کاربر '360p' رو می‌بینه
+            quality_text = quality_text or "360p"
+            height = _quality_text_to_height(quality_text) if quality_text else 360
         elif quality_text:
             height = _quality_text_to_height(quality_text)
         else:
@@ -428,80 +411,13 @@ def _extract_video_sources(html: str) -> List[dict]:
         })
         logger.info("Found %s from flashvars (%s): %s", url_key, quality_text, url[:100])
 
-    # ─── روش 2: <source> tag داخل <video> (Video.js) ───
-    # پیدا کردن video tag اصلی (نه logo)
-    video_blocks = []
-    for vm in re.finditer(
-        r'<video\b[^>]*(?:id=["\']video[^"\']*["\']|class=["\'][^"\']*video[^"\']*["\'])[^>]*>(.*?)</video>',
-        html, re.IGNORECASE | re.DOTALL,
-    ):
-        video_blocks.append(vm.group(0))
-    if not video_blocks:
-        for vm in re.finditer(r'<video\b[^>]*>(.*?)</video>', html, re.IGNORECASE | re.DOTALL):
-            block = vm.group(0)
-            if 'display: none' in block.lower():
-                continue
-            if '<source' in block and 'src=' in block:
-                video_blocks.append(block)
-
-    for video_block in video_blocks:
-        for sm in re.finditer(r'<source\b([^>]*)>', video_block, re.IGNORECASE):
-            attrs_str = sm.group(1)
-            attrs = {}
-            for am in re.finditer(r'([\w-]+)\s*=\s*"([^"]*)"', attrs_str):
-                attrs[am.group(1).lower()] = am.group(2)
-
-            src = attrs.get("src", "")
-            if not src:
-                continue
-            srcset = attrs.get("srcset", "")
-            media = attrs.get("media", "")
-            if srcset or media:
-                continue
-
-            url = _clean_url(src)
-            if not _is_main_video_url(url) or url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            url_lower = url.lower()
-            if "_1080p" in url_lower:
-                label = "📺 MP4 1080p"
-                height = 1080
-                quality_key = "1080p"
-                is_hd = True
-            elif "_720p" in url_lower:
-                label = "📺 MP4 720p"
-                height = 720
-                quality_key = "720p"
-                is_hd = True
-            elif "_480p" in url_lower:
-                label = "📺 MP4 480p"
-                height = 480
-                quality_key = "480p"
-                is_hd = False
-            else:
-                label = "📺 MP4 (default)"
-                height = 720
-                quality_key = "default"
-                is_hd = False
-
-            sources.append({
-                "label": label,
-                "url": url,
-                "height": height,
-                "quality_key": quality_key,
-                "method": "source_tag",
-                "is_hd": is_hd,
-            })
-            logger.info("Found video URL from <source> tag: %s", url[:100])
-
-    # ─── روش 3: URL های /get_file/ با v-acctoken ───
-    vacctoken_pattern = re.compile(
-        r'(https?://[^\s"\'<>\)\]]+?/get_file/[^\s"\'<>\)\]]+?\.mp4[^\s"\'<>\)\]]*?\?v-acctoken=[a-zA-Z0-9+/=_-]+)',
+    # ─── روش 2: URL های /get_file/ با ?br= (از HTML) ───
+    # shameless از ?br=BITRATE استفاده می‌کنه (نه v-acctoken)
+    br_pattern = re.compile(
+        r'(https?://[^\s"\'<>\)\]]+?/get_file/[^\s"\'<>\)\]]+?\.mp4[^\s"\'<>\)\]]*?\?br=\d+)',
         re.IGNORECASE,
     )
-    for m in vacctoken_pattern.finditer(html):
+    for m in br_pattern.finditer(html):
         url = _clean_url(m.group(1))
         if not _is_main_video_url(url) or url in seen_urls:
             continue
@@ -513,14 +429,20 @@ def _extract_video_sources(html: str) -> List[dict]:
             label, height, quality_key, is_hd = "📺 MP4 720p", 720, "720p", True
         elif "_480p" in url_lower:
             label, height, quality_key, is_hd = "📺 MP4 480p", 480, "480p", False
+        elif "_360p" in url_lower or "_240p" in url_lower:
+            label, height, quality_key, is_hd = "📺 MP4 360p", 360, "360p", False
         else:
             label, height, quality_key, is_hd = "📺 MP4 (default)", 480, "default", False
         sources.append({
             "label": label, "url": url, "height": height,
-            "quality_key": quality_key, "method": "v-acctoken", "is_hd": is_hd,
+            "quality_key": quality_key, "method": "br_query", "is_hd": is_hd,
         })
 
-    # ─── روش 4: URL های /get_file/ بدون v-acctoken ───
+    # ─── روش 3: URL های /get_file/ بدون query ───
+    # نکته: فقط URL هایی که video_id همون ویدیوی اصلی هستن رو نگه می‌داریم
+    # برای این کار، video_id از flashvars می‌گیریم
+    video_id = flashvars.get("video_id", "")
+    
     getfile_pattern = re.compile(
         r'(https?://[^\s"\'<>\)\]]+?/get_file/[^\s"\'<>\)\]]+?\.mp4)(?:[/?\s"\'<>\)\]]|$)',
         re.IGNORECASE,
@@ -529,6 +451,20 @@ def _extract_video_sources(html: str) -> List[dict]:
         url = _clean_url(m.group(1))
         if not _is_main_video_url(url) or url in seen_urls:
             continue
+        # فقط از host مجاز
+        try:
+            host = urlparse(url).hostname or ""
+            if host not in _ALLOWED_HOSTS and not host.endswith(".shameless.com"):
+                continue
+        except Exception:
+            continue
+        # اگه video_id داریم، فقط URL هایی که همون video_id رو دارن نگه دار
+        # (برای فیلتر کردن preview ویدیوهای مرتبط)
+        if video_id:
+            # URL pattern: /get_file/N/HASH/VIDEOID000/VIDEOID/VIDEOID_QUALITY.mp4
+            # چک می‌کنیم که video_id تو URL باشه
+            if f"/{video_id}/" not in url and f"/{video_id}_" not in url:
+                continue
         seen_urls.add(url)
         url_lower = url.lower()
         if "_1080p" in url_lower:
@@ -537,37 +473,13 @@ def _extract_video_sources(html: str) -> List[dict]:
             label, height, quality_key, is_hd = "📺 MP4 720p", 720, "720p", True
         elif "_480p" in url_lower:
             label, height, quality_key, is_hd = "📺 MP4 480p", 480, "480p", False
+        elif "_360p" in url_lower or "_240p" in url_lower:
+            label, height, quality_key, is_hd = "📺 MP4 360p", 360, "360p", False
         else:
             label, height, quality_key, is_hd = "📺 MP4 (default)", 480, "default", False
         sources.append({
             "label": label, "url": url, "height": height,
             "quality_key": quality_key, "method": "get_file", "is_hd": is_hd,
-        })
-
-    # ─── روش 5: سایر MP4 URLs ───
-    mp4_pattern = re.compile(
-        r'(https?://[^\s"\'<>\)\]]+?\.mp4(?:\?[^\s"\'<>\)\]]*)?)',
-        re.IGNORECASE,
-    )
-    for m in mp4_pattern.finditer(html):
-        url = _clean_url(m.group(1))
-        if not _is_main_video_url(url) or url in seen_urls:
-            continue
-        # فقط از host مجاز
-        try:
-            host = urlparse(url).hostname or ""
-            if host not in _ALLOWED_HOSTS and not host.endswith(".hdtube.porn"):
-                continue
-        except Exception:
-            continue
-        seen_urls.add(url)
-        sources.append({
-            "label": "📺 MP4 (default)",
-            "url": url,
-            "height": 720,
-            "quality_key": "default",
-            "method": "mp4_generic",
-            "is_hd": False,
         })
 
     # مرتب‌سازی: بالاترین کیفیت اول
@@ -579,14 +491,25 @@ def _extract_video_sources(html: str) -> List[dict]:
 
 
 async def _fetch_page(url, jar=None):
-    """
-    fetch صفحه. اول curl_cffi (چون aiohttp timeout می‌خوره)، بعد aiohttp (fallback).
+    """fetch صفحه. اول aiohttp (سریع)، بعد curl_cffi (fallback)."""
+    # ── روش 1: aiohttp ──
+    try:
+        local_jar = jar or CookieJar(unsafe=True)
+        timeout = ClientTimeout(total=30, connect=15)
+        async with aiohttp.ClientSession(timeout=timeout, headers=_DEFAULT_HEADERS, cookie_jar=local_jar) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    html = await resp.text(errors="replace")
+                    if "video_url" in html or "flashvars" in html:
+                        logger.info("Page fetched via aiohttp, size=%d", len(html))
+                        return html, local_jar, ""
+                    else:
+                        logger.warning("aiohttp: 200 ولی video_url پیدا نشد")
+                logger.warning("aiohttp fetch: HTTP %s", resp.status)
+    except Exception as e:
+        logger.warning(f"aiohttp fetch error: {e}")
 
-    نکته: hdtube.porn IP های datacenter رو بلاک می‌کنه — aiohttp connection timeout
-    می‌خوره. curl_cffi با impersonate=chrome کار می‌کنه چون TLS fingerprint واقعی
-    مرورگر رو شبیه‌سازی می‌کنه.
-    """
-    # ── روش 1: curl_cffi (اول — چون aiohttp timeout می‌خوره) ──
+    # ── روش 2: curl_cffi (fallback) ──
     if _check_curl_cffi():
         try:
             from curl_cffi.requests import AsyncSession
@@ -594,9 +517,9 @@ async def _fetch_page(url, jar=None):
                 resp = await session.get(url, impersonate="chrome", headers=_DEFAULT_HEADERS, allow_redirects=True, timeout=30)
                 if resp.status_code == 200 and resp.text:
                     text = resp.text
-                    if "video_url" in text or "flashvars" in text or "<source" in text or "cdnst" in text:
+                    if "video_url" in text or "flashvars" in text:
                         logger.info("Page fetched via curl_cffi, size=%d", len(text))
-                        # استخراج کوکی‌ها از session
+                        # استخراج کوکی‌ها
                         cookies_dict = {}
                         try:
                             for cookie in session.cookies.jar:
@@ -608,7 +531,6 @@ async def _fetch_page(url, jar=None):
                                         cookies_dict[cookie.name] = cookie.value
                             except Exception:
                                 pass
-                        # ساخت یه aiohttp CookieJar با همون کوکی‌ها
                         local_jar = CookieJar(unsafe=True)
                         for k, v in cookies_dict.items():
                             try:
@@ -617,27 +539,10 @@ async def _fetch_page(url, jar=None):
                                 pass
                         return text, local_jar, ""
                     else:
-                        logger.warning("curl_cffi: 200 ولی video content پیدا نشد")
+                        logger.warning("curl_cffi: 200 ولی video_url پیدا نشد")
                 logger.warning("curl_cffi fetch: HTTP %s", resp.status_code)
         except Exception as e:
             logger.warning(f"curl_cffi fetch error: {e}")
-
-    # ── روش 2: aiohttp (fallback) ──
-    try:
-        local_jar = jar or CookieJar(unsafe=True)
-        timeout = ClientTimeout(total=30, connect=10)
-        async with aiohttp.ClientSession(timeout=timeout, headers=_DEFAULT_HEADERS, cookie_jar=local_jar) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    html = await resp.text(errors="replace")
-                    if "video_url" in html or "flashvars" in html or "<source" in html or "cdnst" in html:
-                        logger.info("Page fetched via aiohttp, size=%d", len(html))
-                        return html, local_jar, ""
-                    else:
-                        logger.warning("aiohttp: 200 ولی video content پیدا نشد")
-                logger.warning("aiohttp fetch: HTTP %s", resp.status)
-    except Exception as e:
-        logger.warning(f"aiohttp fetch error: {e}")
 
     return None, jar, "Failed to fetch page"
 
@@ -645,9 +550,9 @@ async def _fetch_page(url, jar=None):
 # ─── Main API: extract qualities ──────────────────────────────────────────
 
 
-async def extract_hdtube_qualities(url, progress_cb=None):
+async def extract_shameless_qualities(url, progress_cb=None):
     """استخراج کیفیت‌های ویدیو."""
-    if not is_hdtube_url(url):
+    if not is_shameless_url(url):
         return [], "Invalid URL", {}
 
     if progress_cb:
@@ -689,7 +594,7 @@ async def extract_hdtube_qualities(url, progress_cb=None):
         "page_url": url,
         "cookies": cookies,
         "duration": duration,
-        "fetch_method": "curl_cffi" if _check_curl_cffi() else "aiohttp",
+        "fetch_method": "aiohttp",
         "flashvars": _extract_flashvars(html),
     }
 
@@ -701,81 +606,43 @@ active_downloads: dict = {}
 
 
 async def _download_multi_segment(direct_url, filepath, referer, cookies, progress_cb, dl_id="", num_workers=MULTI_SEGMENT_WORKERS):
-    """
-    دانلود چند تیکه‌ای با work-queue pattern — OPTIMIZED برای سرعت بالا.
-
-    نکته مهم hdtube.porn:
-    - aiohttp timeout می‌خوره → باید از curl_cffi استفاده کنیم
-    - URL شامل query string `?br=BITRATE` هست که الزامیه
-    - کوکی‌های PHPSESSID و kt_qparams لازمه
-    """
+    """دانلود چند تیکه‌ای با work-queue pattern — OPTIMIZED برای سرعت بالا."""
     try:
         headers = {**_DEFAULT_HEADERS, "Referer": referer, "Accept": "*/*"}
+        timeout = ClientTimeout(total=10, connect=5)
         content_length = 0
         accept_ranges = ""
 
-        # ── HEAD request با curl_cffi (aiohttp timeout می‌خوره) ──
-        if _check_curl_cffi():
-            try:
-                from curl_cffi.requests import AsyncSession
-                async with AsyncSession() as session:
-                    # set cookies
-                    for name, val in cookies.items():
-                        try:
-                            session.cookies.set(name, val)
-                        except Exception:
-                            pass
-                    try:
-                        resp = await session.head(direct_url, impersonate="chrome", headers=headers, allow_redirects=True, timeout=15)
-                        if resp.status_code in (200, 206):
-                            content_length = int(resp.headers.get("Content-Length", 0))
-                            accept_ranges = resp.headers.get("Accept-Ranges", "").lower()
-                            ct = resp.headers.get("Content-Type", "")
-                            if ct and not ct.startswith("video/"):
-                                logger.warning("HEAD returned non-video content-type: %s", ct)
-                        elif resp.status_code == 403:
-                            return False, "HTTP_403", 0
-                    except Exception as e:
-                        logger.warning(f"curl_cffi HEAD failed: {e}")
-            except Exception as e:
-                logger.warning(f"curl_cffi HEAD error: {e}")
-
-        # fallback به aiohttp برای HEAD (اگه curl_cffi نبود)
-        if content_length == 0:
-            try:
-                timeout = ClientTimeout(total=15, connect=8)
-                async with aiohttp.ClientSession(timeout=timeout, headers=headers, cookies=cookies) as s:
-                    async with s.head(direct_url, allow_redirects=True) as r:
-                        if r.status in (200, 206):
-                            content_length = int(r.headers.get("Content-Length", 0))
-                            accept_ranges = r.headers.get("Accept-Ranges", "").lower()
-                        elif r.status == 403:
-                            return False, "HTTP_403", 0
-            except Exception as e:
-                logger.warning(f"aiohttp HEAD failed: {e}")
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, cookies=cookies) as s:
+                async with s.head(direct_url, allow_redirects=True) as r:
+                    if r.status in (200, 206):
+                        content_length = int(r.headers.get("Content-Length", 0))
+                        accept_ranges = r.headers.get("Accept-Ranges", "").lower()
+                        ct = r.headers.get("Content-Type", "")
+                        if ct and not ct.startswith("video/"):
+                            logger.warning("HEAD returned non-video content-type: %s", ct)
+                    elif r.status == 403:
+                        return False, "HTTP_403", 0
+        except Exception as e:
+            logger.warning(f"HEAD request failed: {e}")
 
         # probe با Range اگه HEAD کار نکرد
         if content_length == 0:
-            if _check_curl_cffi():
-                try:
-                    from curl_cffi.requests import AsyncSession
-                    async with AsyncSession() as session:
-                        for name, val in cookies.items():
-                            try:
-                                session.cookies.set(name, val)
-                            except Exception:
-                                pass
-                        resp = await session.get(direct_url, impersonate="chrome", headers={**headers, "Range": "bytes=0-0"}, allow_redirects=True, timeout=15)
-                        if resp.status_code in (200, 206):
-                            content_length = int(resp.headers.get("Content-Length", 0))
-                            if resp.status_code == 206:
+            try:
+                timeout = ClientTimeout(total=10, connect=5)
+                async with aiohttp.ClientSession(timeout=timeout, headers={**headers, "Range": "bytes=0-0"}) as s:
+                    async with s.get(direct_url, allow_redirects=True) as r:
+                        if r.status in (200, 206):
+                            content_length = int(r.headers.get("Content-Length", 0))
+                            if r.status == 206:
                                 accept_ranges = "bytes"
-                                cr = resp.headers.get("Content-Range", "")
+                                cr = r.headers.get("Content-Range", "")
                                 m = re.search(r"/(\d+)", cr)
                                 if m:
                                     content_length = int(m.group(1))
-                except Exception as e:
-                    logger.warning(f"curl_cffi probe failed: {e}")
+            except Exception as e:
+                logger.warning(f"Probe request failed: {e}")
 
         if content_length == 0:
             return False, "Cannot determine file size", 0
@@ -798,7 +665,7 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
             chunk_idx += 1
 
         total_chunks = len(chunks)
-        logger.info(f"[DL-HDTUBE] Work-queue: {total_chunks} chunks, {num_workers} workers, total={content_length}")
+        logger.info(f"[DL-SHAMELESS] Work-queue: {total_chunks} chunks, {num_workers} workers, total={content_length}")
 
         try:
             with open(filepath, "wb") as f:
@@ -845,145 +712,69 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
             except Exception:
                 pass
 
-        # انتخاب روش دانلود: curl_cffi (اول) یا aiohttp (fallback)
-        use_curl_cffi = _check_curl_cffi()
+        shared_timeout = ClientTimeout(total=600, connect=30, sock_read=120)
+        connector = TCPConnector(limit=CONNECTOR_LIMIT, limit_per_host=CONNECTOR_LIMIT_PER_HOST, keepalive_timeout=60, enable_cleanup_closed=True)
+        shared_session = aiohttp.ClientSession(timeout=shared_timeout, headers=headers, cookies=cookies, connector=connector)
 
-        if use_curl_cffi:
-            # ── دانلود با curl_cffi (هر worker یه session جداگانه) ──
-            from curl_cffi.requests import AsyncSession
+        async def _download_worker(worker_id):
+            while True:
+                if active_downloads.get(dl_id, {}).get("cancelled"):
+                    return False
+                try:
+                    chunk_info = chunk_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return True
 
-            async def _download_worker(worker_id):
-                while True:
+                c_idx, byte_start, byte_end = chunk_info
+                chunk_size = byte_end - byte_start + 1
+                max_retries = 3
+
+                for attempt in range(max_retries):
                     if active_downloads.get(dl_id, {}).get("cancelled"):
                         return False
                     try:
-                        chunk_info = chunk_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return True
-
-                    c_idx, byte_start, byte_end = chunk_info
-                    chunk_size = byte_end - byte_start + 1
-                    max_retries = 3
-
-                    for attempt in range(max_retries):
-                        if active_downloads.get(dl_id, {}).get("cancelled"):
+                        async with shared_session.get(direct_url, headers={"Range": f"bytes={byte_start}-{byte_end}"}, allow_redirects=True) as resp:
+                            if resp.status not in (200, 206):
+                                raise Exception(f"HTTP {resp.status}")
+                            if not first_chunk_started[0]:
+                                first_chunk_started[0] = True
+                                await _update_progress(force=True)
+                            chunk_data = bytearray()
+                            async for piece in resp.content.iter_chunked(CHUNK_SIZE):
+                                if not piece:
+                                    continue
+                                if active_downloads.get(dl_id, {}).get("cancelled"):
+                                    return False
+                                chunk_data.extend(piece)
+                            if len(chunk_data) != chunk_size:
+                                raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
+                            async with file_write_lock:
+                                async with aiofiles.open(filepath, "r+b") as f:
+                                    await f.seek(byte_start)
+                                    await f.write(bytes(chunk_data))
+                            downloaded_bytes[c_idx] = chunk_size
+                            async with progress_lock:
+                                completed_chunks[0] += 1
+                                await _update_progress()
+                            break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"[DL-SHAMELESS] W{worker_id} c{c_idx} attempt {attempt+1} failed: {e}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 * (attempt + 1))
+                        else:
+                            failed_chunks.append((c_idx, str(e)[:100]))
                             return False
-                        try:
-                            async with AsyncSession() as session:
-                                # set cookies
-                                for name, val in cookies.items():
-                                    try:
-                                        session.cookies.set(name, val)
-                                    except Exception:
-                                        pass
-                                resp = await session.get(
-                                    direct_url,
-                                    impersonate="chrome",
-                                    headers={**headers, "Range": f"bytes={byte_start}-{byte_end}"},
-                                    allow_redirects=True,
-                                    timeout=300,
-                                )
-                                if resp.status_code not in (200, 206):
-                                    raise Exception(f"HTTP {resp.status_code}")
-
-                                if not first_chunk_started[0]:
-                                    first_chunk_started[0] = True
-                                    await _update_progress(force=True)
-
-                                chunk_data = resp.content if hasattr(resp, "content") else resp.body
-                                if isinstance(chunk_data, str):
-                                    chunk_data = chunk_data.encode("utf-8", errors="replace")
-
-                                if len(chunk_data) != chunk_size:
-                                    raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
-
-                                async with file_write_lock:
-                                    async with aiofiles.open(filepath, "r+b") as f:
-                                        await f.seek(byte_start)
-                                        await f.write(chunk_data)
-
-                                downloaded_bytes[c_idx] = chunk_size
-                                async with progress_lock:
-                                    completed_chunks[0] += 1
-                                    await _update_progress()
-                                break
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            logger.warning(f"[DL-HDTUBE] W{worker_id} c{c_idx} attempt {attempt+1} failed: {e}")
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(2 * (attempt + 1))
-                            else:
-                                failed_chunks.append((c_idx, str(e)[:100]))
-                                return False
-                    chunk_queue.task_done()
-                return True
-        else:
-            # ── دانلود با aiohttp (fallback) ──
-            shared_timeout = ClientTimeout(total=600, connect=30, sock_read=120)
-            connector = TCPConnector(limit=CONNECTOR_LIMIT, limit_per_host=CONNECTOR_LIMIT_PER_HOST, keepalive_timeout=60, enable_cleanup_closed=True)
-            shared_session = aiohttp.ClientSession(timeout=shared_timeout, headers=headers, cookies=cookies, connector=connector)
-
-            async def _download_worker(worker_id):
-                while True:
-                    if active_downloads.get(dl_id, {}).get("cancelled"):
-                        return False
-                    try:
-                        chunk_info = chunk_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return True
-
-                    c_idx, byte_start, byte_end = chunk_info
-                    chunk_size = byte_end - byte_start + 1
-                    max_retries = 3
-
-                    for attempt in range(max_retries):
-                        if active_downloads.get(dl_id, {}).get("cancelled"):
-                            return False
-                        try:
-                            async with shared_session.get(direct_url, headers={"Range": f"bytes={byte_start}-{byte_end}"}, allow_redirects=True) as resp:
-                                if resp.status not in (200, 206):
-                                    raise Exception(f"HTTP {resp.status}")
-                                if not first_chunk_started[0]:
-                                    first_chunk_started[0] = True
-                                    await _update_progress(force=True)
-                                chunk_data = bytearray()
-                                async for piece in resp.content.iter_chunked(CHUNK_SIZE):
-                                    if not piece:
-                                        continue
-                                    if active_downloads.get(dl_id, {}).get("cancelled"):
-                                        return False
-                                    chunk_data.extend(piece)
-                                if len(chunk_data) != chunk_size:
-                                    raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
-                                async with file_write_lock:
-                                    async with aiofiles.open(filepath, "r+b") as f:
-                                        await f.seek(byte_start)
-                                        await f.write(bytes(chunk_data))
-                                downloaded_bytes[c_idx] = chunk_size
-                                async with progress_lock:
-                                    completed_chunks[0] += 1
-                                    await _update_progress()
-                                break
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            logger.warning(f"[DL-HDTUBE] W{worker_id} c{c_idx} attempt {attempt+1} failed: {e}")
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(2 * (attempt + 1))
-                            else:
-                                failed_chunks.append((c_idx, str(e)[:100]))
-                                return False
-                    chunk_queue.task_done()
-                return True
+                chunk_queue.task_done()
+            return True
 
         try:
             results = await asyncio.gather(*[_download_worker(i) for i in range(num_workers)], return_exceptions=True)
-            if not use_curl_cffi:
-                try:
-                    await shared_session.close()
-                except Exception:
-                    pass
+            try:
+                await shared_session.close()
+            except Exception:
+                pass
 
             if active_downloads.get(dl_id, {}).get("cancelled"):
                 _cleanup_file(filepath)
@@ -991,17 +782,16 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
 
             worker_failures = [r for r in results if r is not True and isinstance(r, bool) and not r]
             if worker_failures or failed_chunks:
-                logger.warning(f"[DL-HDTUBE] {len(worker_failures)} workers failed, {len(failed_chunks)} chunks failed")
+                logger.warning(f"[DL-SHAMELESS] {len(worker_failures)} workers failed, {len(failed_chunks)} chunks failed")
                 _cleanup_file(filepath)
                 return False, f"Multi-segment failed: {len(failed_chunks)} chunks", 0
 
         except Exception as e:
-            logger.error(f"[DL-HDTUBE] Work-queue error: {e}", exc_info=True)
-            if not use_curl_cffi:
-                try:
-                    await shared_session.close()
-                except Exception:
-                    pass
+            logger.error(f"[DL-SHAMELESS] Work-queue error: {e}", exc_info=True)
+            try:
+                await shared_session.close()
+            except Exception:
+                pass
             _cleanup_file(filepath)
             return False, str(e)[:200], 0
 
@@ -1012,11 +802,11 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
 
         elapsed = time.time() - start_time
         avg_speed = file_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
-        logger.info(f"[DL-HDTUBE] Multi-segment DONE | size={_format_size(file_size)} | time={elapsed:.1f}s | avg_speed={avg_speed:.1f} MB/s")
+        logger.info(f"[DL-SHAMELESS] Multi-segment DONE | size={_format_size(file_size)} | time={elapsed:.1f}s | avg_speed={avg_speed:.1f} MB/s")
         return True, "", file_size
 
     except Exception as e:
-        logger.error(f"[DL-HDTUBE] Multi-segment error: {e}", exc_info=True)
+        logger.error(f"[DL-SHAMELESS] Multi-segment error: {e}", exc_info=True)
         _cleanup_file(filepath)
         return False, str(e)[:200], 0
 
@@ -1025,55 +815,7 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
 
 
 async def _download_single_aiohttp(url, filepath, referer, cookies, progress_cb, dl_id=""):
-    """
-    دانلود با single connection — با curl_cffi (اول) یا aiohttp (fallback).
-
-    نکته: hdtube.porn با aiohttp timeout می‌خوره، پس curl_cffi اول امتحان می‌شه.
-    """
-    headers = {**_DEFAULT_HEADERS, "Referer": referer, "Accept": "*/*"}
-
-    # ── روش 1: curl_cffi (اول — چون aiohttp timeout می‌خوره) ──
-    if _check_curl_cffi():
-        try:
-            from curl_cffi.requests import AsyncSession
-            async with AsyncSession() as session:
-                # set cookies
-                for name, val in cookies.items():
-                    try:
-                        session.cookies.set(name, val)
-                    except Exception:
-                        pass
-
-                t0 = time.time()
-                resp = await session.get(url, impersonate="chrome", headers=headers, allow_redirects=True, timeout=3600)
-
-                if resp.status_code not in (200, 206):
-                    _cleanup_file(filepath)
-                    return False, f"HTTP {resp.status_code}", 0
-
-                data = resp.content if hasattr(resp, "content") else resp.body
-                if isinstance(data, str):
-                    data = data.encode("utf-8", errors="replace")
-
-                if len(data) < MIN_VALID_VIDEO_SIZE:
-                    _cleanup_file(filepath)
-                    return False, f"File too small ({len(data)} bytes)", 0
-                if len(data) > MAX_DOWNLOAD_SIZE:
-                    _cleanup_file(filepath)
-                    return False, f"File too large: {_format_size(len(data))}", 0
-
-                # نوشتن به فایل
-                async with aiofiles.open(filepath, "wb") as f:
-                    await f.write(data)
-
-                elapsed = time.time() - t0
-                logger.info(f"[DL-HDTUBE] Single (curl_cffi) DONE | size={_format_size(len(data))} | time={elapsed:.1f}s")
-                return True, "", len(data)
-        except Exception as e:
-            logger.warning(f"[DL-HDTUBE] Single (curl_cffi) error: {e}")
-            _cleanup_file(filepath)
-
-    # ── روش 2: aiohttp (fallback) ──
+    headers = {**_DEFAULT_HEADERS, "Referer": referer}
     error = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -1129,8 +871,12 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
     has_curl_cffi = _check_curl_cffi()
     await progress_cb("📥 **Fallback: yt-dlp...**")
     format_selector = "best"
-    if quality_key in ("720p", "480p", "1080p", "360p"):
-        format_selector = f"{quality_key}/best"
+    if quality_key in ("720p", "480p", "1080p", "360p", "hd_720p"):
+        # yt-dlp از format_id استفاده می‌کنه: HD_720p, 480p, 360p
+        if quality_key == "hd_720p":
+            format_selector = "HD_720p/best"
+        else:
+            format_selector = f"{quality_key}/best"
     try:
         cmd = [
             "yt-dlp", "--no-warnings", "--progress", "--newline",
@@ -1140,7 +886,7 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
             "--buffer-size", "16K",
             "--max-filesize", str(MAX_DOWNLOAD_SIZE),
             "--add-header", f"User-Agent:{_USER_AGENT}",
-            "--add-header", f"Referer:https://hdtube.porn/",
+            "--add-header", f"Referer:https://shameless.com/",
             "-o", filepath,
         ]
         if has_curl_cffi:
@@ -1186,13 +932,13 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
                 os.rename(actual_path, filepath)
             except OSError:
                 pass
-        logger.info(f"[DL-HDTUBE] yt-dlp DONE | size={_format_size(size)}")
+        logger.info(f"[DL-SHAMELESS] yt-dlp DONE | size={_format_size(size)}")
         return True, "", size
     except asyncio.CancelledError:
         _cleanup_file(filepath)
         raise
     except Exception as e:
-        logger.error(f"[DL-HDTUBE] yt-dlp error: {e}", exc_info=True)
+        logger.error(f"[DL-SHAMELESS] yt-dlp error: {e}", exc_info=True)
         _cleanup_file(filepath)
         return False, str(e)[:200], 0
 
@@ -1242,9 +988,9 @@ def _find_output_file(filepath):
 # ─── Public API ────────────────────────────────────────────────────────────
 
 
-async def download_hdtube_video(page_url, video_url, filepath, progress_cb=None, cookies=None, dl_id=""):
-    """دانلود ویدیو از hdtube.porn."""
-    if not is_hdtube_url(page_url):
+async def download_shameless_video(page_url, video_url, filepath, progress_cb=None, cookies=None, dl_id=""):
+    """دانلود ویدیو از shameless."""
+    if not is_shameless_url(page_url):
         return False, "URL host not allowed", 0
     if not video_url:
         return False, "Empty video URL", 0
@@ -1258,14 +1004,14 @@ async def download_hdtube_video(page_url, video_url, filepath, progress_cb=None,
         cookies = {}
 
     # ─ـ روش 1: multi-segment ──
-    logger.info(f"[DL-HDTUBE] Attempt 1: multi-segment ({MULTI_SEGMENT_WORKERS} workers)")
+    logger.info(f"[DL-SHAMELESS] Attempt 1: multi-segment ({MULTI_SEGMENT_WORKERS} workers)")
     success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
     if success:
         return True, "", size
     if error == "Cancelled by user":
         return False, error, 0
     if error == "HTTP_403":
-        logger.info("[DL-HDTUBE] 403, refreshing session...")
+        logger.info("[DL-SHAMELESS] 403, refreshing session...")
         if progress_cb:
             await progress_cb("🔄 **Refreshing session...**")
         _, jar, _ = await _fetch_page(page_url)
@@ -1274,27 +1020,27 @@ async def download_hdtube_video(page_url, video_url, filepath, progress_cb=None,
             for c in jar:
                 new_cookies[c.key] = c.value
             cookies.update(new_cookies)
-            qualities, _, info = await extract_hdtube_qualities(page_url, progress_cb=None)
+            qualities, _, info = await extract_shameless_qualities(page_url, progress_cb=None)
             if qualities:
                 video_url = qualities[0]["url"]
-                logger.info("[DL-HDTUBE] Got fresh URL")
+                logger.info("[DL-SHAMELESS] Got fresh URL")
         success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
         if success:
             return True, "", size
-    logger.info(f"[DL-HDTUBE] Multi-segment failed: {error}")
+    logger.info(f"[DL-SHAMELESS] Multi-segment failed: {error}")
     _cleanup_file(filepath)
 
     # ─ـ روش 2: single-connection ──
-    logger.info("[DL-HDTUBE] Attempt 2: single-connection")
+    logger.info("[DL-SHAMELESS] Attempt 2: single-connection")
     success, error, size = await _download_single_aiohttp(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
     if success:
         return True, "", size
-    logger.info(f"[DL-HDTUBE] Single failed: {error}")
+    logger.info(f"[DL-SHAMELESS] Single failed: {error}")
     _cleanup_file(filepath)
 
-    # ─ـ روش 3: yt-dlp ──
-    logger.info("[DL-HDTUBE] Attempt 3: yt-dlp on direct URL")
-    success, error, size = await _download_with_ytdlp(video_url or page_url, filepath, progress_cb)
+    # ─ـ روش 3: yt-dlp ─ـ
+    logger.info("[DL-SHAMELESS] Attempt 3: yt-dlp on page URL")
+    success, error, size = await _download_with_ytdlp(page_url, filepath, progress_cb)
     if success:
         return True, "", size
     _cleanup_file(filepath)
@@ -1304,10 +1050,10 @@ async def download_hdtube_video(page_url, video_url, filepath, progress_cb=None,
 # ─── Wrapper (سازگار با bot architecture) ─────────────────────────────────
 
 
-async def download_hdtube_direct(url, filepath, progress_cb=None, video_url="", quality="high", dl_id=""):
+async def download_shameless_direct(url, filepath, progress_cb=None, video_url="", quality="high", dl_id=""):
     """Wrapper برای سازگاری با bot architecture."""
     if not video_url:
-        qualities, title, info = await extract_hdtube_qualities(url, progress_cb)
+        qualities, title, info = await extract_shameless_qualities(url, progress_cb)
         if not qualities:
             return False, title or "Extraction failed", 0
         selected = None
@@ -1326,13 +1072,6 @@ async def download_hdtube_direct(url, filepath, progress_cb=None, video_url="", 
         video_url = selected["url"]
         cookies = info.get("cookies", {})
     else:
-        qualities, title, info = await extract_hdtube_qualities(url, progress_cb)
+        qualities, title, info = await extract_shameless_qualities(url, progress_cb)
         cookies = info.get("cookies", {}) if info else {}
-        if qualities and video_url:
-            for q in qualities:
-                if q.get("url") and video_url in q["url"]:
-                    video_url = q["url"]
-                    break
-            else:
-                video_url = qualities[0]["url"]
-    return await download_hdtube_video(url, video_url, filepath, progress_cb, cookies=cookies, dl_id=dl_id)
+    return await download_shameless_video(url, video_url, filepath, progress_cb, cookies=cookies, dl_id=dl_id)
