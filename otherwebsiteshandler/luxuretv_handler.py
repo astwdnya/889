@@ -617,8 +617,7 @@ async def _download_with_ytdlp(url, filepath, progress_cb):
             "--buffer-size", "16K",
             "--max-filesize", str(MAX_DOWNLOAD_SIZE),
             "-o", filepath,
-            "--force-generic-extractor",
-            "--extractor-args", "generic:impersonate",
+            "--impersonate", "chrome",
             url,
         ]
         process = await asyncio.create_subprocess_exec(
@@ -747,9 +746,9 @@ async def download_luxuretv_video(
     logger.info(f"[DL-LX] Single failed: {error}")
     _cleanup_file(filepath)
 
-    # ─ـ روش 3: yt-dlp ──
-    logger.info("[DL-LX] Attempt 3: yt-dlp direct")
-    success, error, size = await _download_with_ytdlp(page_url, filepath, progress_cb)
+    # ─ـ روش 3: yt-dlp on direct video URL ──
+    logger.info("[DL-LX] Attempt 3: yt-dlp on direct URL")
+    success, error, size = await _download_with_ytdlp(video_url, filepath, progress_cb)
     if success:
         return True, "", size
     _cleanup_file(filepath)
