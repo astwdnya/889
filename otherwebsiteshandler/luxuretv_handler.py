@@ -168,80 +168,8 @@ async def _extract_via_ytdlp(url: str) -> Tuple[List[dict], str, dict]:
     if not shutil.which("yt-dlp") and not _has_ytdlp_module():
         return [], "yt-dlp not installed", {}
 
-    # Use yt-dlp as Python library for better control
-    try:
-        import yt_dlp
-    except ImportError:
-        # Fallback to CLI
-        return await _extract_via_ytdlp_cli(url)
-
-    sources = []
-    title = ""
-    info = {}
-
-    def _extract():
-        nonlocal title, info
-        opts = {
-            "no_warnings": True,
-            "no_download": True,
-            "no_check_certificates": True,
-            "skip_download": True,
-            "quiet": True,
-            "extract_flat": False,
-            "impersonate": "chrome",
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            result = ydl.extract_info(url, download=False)
-            if result is None:
-                return
-
-            if "entries" in result:
-                # Playlist — take first entry (main video, not ads)
-                for entry in result["entries"]:
-                    video_url = entry.get("url", "")
-                    if video_url and "/cf-stream/" in video_url:
-                        title = entry.get("title", "Untitled")
-                        # Clean title
-                        title = re.sub(r"\s*-\s*LuxureTV.*$", "", title, flags=re.IGNORECASE)
-                        sources.append({
-                            "label": "📺 MP4 (default)",
-                            "url": video_url,
-                            "height": 480,  # unknown, assume 480p
-                            "quality_key": "default",
-                            "method": "ytdlp",
-                            "is_hd": False,
-                        })
-                        # Extract http_headers and cookies from format
-                        if entry.get("formats"):
-                            fmt = entry["formats"][0]
-                            info["http_headers"] = fmt.get("http_headers", {})
-                            info["cookies"] = fmt.get("cookies", "")
-                        info["thumbnail"] = entry.get("thumbnail", "")
-                        info["extractor"] = entry.get("extractor", "")
-                        break
-            else:
-                video_url = result.get("url", "")
-                if video_url:
-                    title = result.get("title", "Untitled")
-                    title = re.sub(r"\s*-\s*LuxureTV.*$", "", title, flags=re.IGNORECASE)
-                    sources.append({
-                        "label": "📺 MP4 (default)",
-                        "url": video_url,
-                        "height": 480,
-                        "quality_key": "default",
-                        "method": "ytdlp",
-                        "is_hd": False,
-                    })
-                    if result.get("formats"):
-                        fmt = result["formats"][0]
-                        info["http_headers"] = fmt.get("http_headers", {})
-                        info["cookies"] = fmt.get("cookies", "")
-                    info["thumbnail"] = result.get("thumbnail", "")
-
-    # Run yt-dlp in a thread (it's synchronous)
-    await asyncio.get_event_loop().run_in_executor(None, _extract)
-
-    return sources, title, info
+    # Use yt-dlp CLI directly (Python API doesn't support --impersonate properly)
+    return await _extract_via_ytdlp_cli(url)
 
 
 def _has_ytdlp_module() -> bool:
