@@ -188,7 +188,7 @@ async def _extract_via_ytdlp(url: str) -> Tuple[List[dict], str, dict]:
             "skip_download": True,
             "quiet": True,
             "extract_flat": False,
-            "impersonate": True,
+            "impersonate": "chrome",
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.extract_info(url, download=False)
