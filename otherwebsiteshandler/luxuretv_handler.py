@@ -188,8 +188,7 @@ async def _extract_via_ytdlp(url: str) -> Tuple[List[dict], str, dict]:
             "skip_download": True,
             "quiet": True,
             "extract_flat": False,
-            # Cloudflare bypass — yt-dlp needs this to impersonate a real browser
-            "extractor_args": {"generic": ["impersonate"]},
+            "impersonate": True,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.extract_info(url, download=False)
@@ -261,6 +260,7 @@ async def _extract_via_ytdlp_cli(url: str) -> Tuple[List[dict], str, dict]:
     cmd = [
         "yt-dlp", "--no-warnings", "--no-playlist",
         "--dump-json", "--no-download", "--no-check-certificates",
+        "--impersonate", "chrome", "--extractor-args", "generic:impersonate",
         url,
     ]
 
