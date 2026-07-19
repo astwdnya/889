@@ -343,7 +343,7 @@ ADMIN_ID = 818185073
 
 MAX_FILE_SIZE_MB = 50000  # allow up to ~50GB (bot will split into 2GB parts)
 MAX_PART_SIZE = 1900 * 1024 * 1024  # 1.9GB per part for Telegram upload
-OUTPUT_FOLDER = "output_files"
+OUTPUT_FOLDER = os.path.join("/tmp", "output_files")
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 HEALTH_PORT = int(os.environ.get("PORT", 10000))
