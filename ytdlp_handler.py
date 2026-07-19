@@ -198,6 +198,7 @@ async def download_with_ytdlp(
     format_id: str,
     filepath: str,
     progress_cb,
+    actual_filepath: list = None,
 ) -> Tuple[bool, str, int]:
     """Download video using yt-dlp with the selected format."""
     await progress_cb("📥 **در حال دانلود با yt-dlp...**")
@@ -245,6 +246,7 @@ async def download_with_ytdlp(
             return False, stderr_text[:300], 0
 
         if not os.path.exists(filepath):
+            found = filepath
             for ext in [".mp4", ".mkv", ".webm"]:
                 alt = (
                     filepath.replace(".mp4", ext)
@@ -252,8 +254,12 @@ async def download_with_ytdlp(
                     else filepath + ext
                 )
                 if os.path.exists(alt):
-                    os.rename(alt, filepath)
+                    found = alt
                     break
+            if found != filepath:
+                if actual_filepath is not None:
+                    actual_filepath[0] = found
+                filepath = found
 
         if not os.path.exists(filepath):
             return False, "Output file not found", 0

@@ -2065,30 +2065,32 @@ async def ul_cancel_callback(event):
 
 # ====================== UPLOAD WITH PROGRESS ======================
 async def get_video_thumbnail(filepath: str) -> Optional[str]:
-    """یه فریم از وسط ویدیو به عنوان thumbnail می‌گیره"""
     try:
         thumb_path = filepath + "_thumb.jpg"
-        # مدت ویدیو رو بگیر تا فریم از وسط باشه
-        probe = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            filepath,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await probe.communicate()
-        duration = 0.0
+        seek_time = 1
         try:
-            duration = float(
-                json.loads(stdout.decode()).get("format", {}).get("duration", 0)
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                filepath,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except Exception:
+            stdout, _ = await probe.communicate()
+            duration = 0.0
+            try:
+                duration = float(
+                    json.loads(stdout.decode()).get("format", {}).get("duration", 0)
+                )
+            except Exception:
+                pass
+            seek_time = max(duration / 2, 1) if duration > 2 else 0
+        except FileNotFoundError:
             pass
-        seek_time = max(duration / 2, 1) if duration > 2 else 0
 
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -11660,9 +11662,11 @@ async def ytdlp_quality_callback(event):
             pass
 
     try:
+        actual_filepath = [filepath]
         success, error, size = await download_with_ytdlp(
-            entry["url"], chosen["format_id"], filepath, progress_cb
+            entry["url"], chosen["format_id"], filepath, progress_cb, actual_filepath=actual_filepath
         )
+        filepath = actual_filepath[0]
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
         if not success or not os.path.exists(filepath) or size < 1024:
