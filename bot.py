@@ -3017,9 +3017,11 @@ def _parse_mp4_info(filepath: str) -> Tuple[Optional[float], int, int]:
             tkhd = trak[tkhd_off : tkhd_off + tkhd_size]
             ver = tkhd[8]
             if ver == 0:
-                w_raw, h_raw = struct.unpack_from(">II", tkhd, 76)
+                w_raw = struct.unpack_from(">I", tkhd, 84)[0]
+                h_raw = struct.unpack_from(">I", tkhd, 88)[0]
             else:
-                w_raw, h_raw = struct.unpack_from(">II", tkhd, 88)
+                w_raw = struct.unpack_from(">I", tkhd, 100)[0]
+                h_raw = struct.unpack_from(">I", tkhd, 104)[0]
             w = w_raw >> 16
             h = h_raw >> 16
             if w > 0 and h > 0:
