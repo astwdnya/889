@@ -2937,35 +2937,64 @@ async def _run_ffmpeg(args: list) -> Tuple[int, str]:
 
 
 async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe",
-        "-v",
-        "quiet",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        input_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await proc.communicate()
-    if proc.returncode != 0:
-        return None, 0, 0
     try:
-        info = json.loads(stdout.decode())
-        dur = float(info.get("format", {}).get("duration", 0))
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            input_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            try:
+                info = json.loads(stdout.decode())
+                dur = float(info.get("format", {}).get("duration", 0))
+                w, h = 0, 0
+                for s in info.get("streams", []):
+                    if s.get("codec_type") == "video":
+                        w = int(s.get("width", 0))
+                        h = int(s.get("height", 0))
+                        if not dur:
+                            dur = float(s.get("duration", 0))
+                        break
+                return dur or None, w, h
+            except Exception:
+                pass
+    except FileNotFoundError:
+        pass
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-i",
+            input_path,
+            "-f",
+            "null",
+            "-",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        stderr_text = stderr.decode(errors="replace")
+        dur = None
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", stderr_text)
+        if m:
+            dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + float(f"0.{m.group(4)}")
         w, h = 0, 0
-        for s in info.get("streams", []):
-            if s.get("codec_type") == "video":
-                w = int(s.get("width", 0))
-                h = int(s.get("height", 0))
-                if not dur:
-                    dur = float(s.get("duration", 0))
-                break
-        return dur or None, w, h
-    except Exception:
-        return None, 0, 0
+        m = re.search(r"Stream.*Video:.*?(\d+)x(\d+)", stderr_text)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+        return dur, w, h
+    except FileNotFoundError:
+        pass
+
+    return None, 0, 0
 
 
 PERSIAN_SUB_TAGS = {"fa", "farsi", "persian", "parsi"}
