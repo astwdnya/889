@@ -4,6 +4,8 @@
 
 import asyncio
 import os
+import struct
+import io
 import re
 import sys
 import logging
@@ -2139,6 +2141,7 @@ async def send_file_with_progress(
         duration, width, height = await get_video_info(filepath)
     except FileNotFoundError:
         duration, width, height = None, 0, 0
+    is_video_ext = ext in (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp")
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
     is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
 
@@ -2223,7 +2226,7 @@ async def send_file_with_progress(
 
         try:
             thumb_path = thumb_filepath or (
-                await get_video_thumbnail(filepath) if is_video else None
+                await get_video_thumbnail(filepath) if (is_video or is_video_ext) else None
             )
         except FileNotFoundError:
             thumb_path = None
@@ -2936,6 +2939,96 @@ async def _run_ffmpeg(args: list) -> Tuple[int, str]:
     return proc.returncode, stderr.decode(errors="replace")
 
 
+def _parse_mp4_info(filepath: str) -> Tuple[Optional[float], int, int]:
+    try:
+        size = os.path.getsize(filepath)
+        if size > 500 * 1024 * 1024:
+            return None, 0, 0
+        with open(filepath, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None, 0, 0
+
+    if len(data) < 12:
+        return None, 0, 0
+    if data[4:8] not in (b"ftyp", b"moov"):
+        return None, 0, 0
+
+    def read_atom(data: bytes, offset: int, target: bytes):
+        while offset + 8 <= len(data):
+            size = struct.unpack_from(">I", data, offset)[0]
+            if size == 0:
+                break
+            atom_type = data[offset + 4 : offset + 8]
+            if atom_type == target:
+                return offset, size
+            if size == 1 and offset + 16 <= len(data):
+                size = struct.unpack_from(">Q", data, offset + 8)[0]
+            offset += size
+        return -1, 0
+
+    # Find moov
+    moov_off, moov_size = -1, 0
+    off = 0
+    while off + 8 <= len(data):
+        sz = struct.unpack_from(">I", data, off)[0]
+        if sz == 0:
+            break
+        atom_type = data[off + 4 : off + 8]
+        if atom_type == b"moov":
+            moov_off, moov_size = off, sz
+            break
+        if sz == 1 and off + 16 <= len(data):
+            sz = struct.unpack_from(">Q", data, off + 8)[0]
+        off += sz
+
+    if moov_off < 0:
+        return None, 0, 0
+
+    moov_data = data[moov_off : moov_off + moov_size]
+    dur = None
+    timescale = None
+
+    # Parse mvhd inside moov
+    mvhd_off, mvhd_size = read_atom(moov_data, 8, b"mvhd")
+    if mvhd_off >= 0 and mvhd_off + mvhd_size <= len(moov_data):
+        mvhd = moov_data[mvhd_off : mvhd_off + mvhd_size]
+        version = mvhd[8]
+        if version == 0:
+            timescale = struct.unpack_from(">I", mvhd, 20)[0]
+            duration = struct.unpack_from(">I", mvhd, 24)[0]
+        else:
+            timescale = struct.unpack_from(">I", mvhd, 28)[0]
+            duration = struct.unpack_from(">I", mvhd, 32)[0]
+        if timescale and timescale > 0:
+            dur = duration / timescale
+
+    w, h = 0, 0
+    # Find the first video trak → tkhd
+    trak_off = 8
+    while trak_off + 8 < len(moov_data):
+        t_off, t_size = read_atom(moov_data, trak_off, b"trak")
+        if t_off < 0:
+            break
+        trak = moov_data[t_off : t_off + t_size]
+        # Check if this trak has a video track (look for tkhd with width/height)
+        tkhd_off, tkhd_size = read_atom(trak, 8, b"tkhd")
+        if tkhd_off >= 0 and tkhd_off + tkhd_size <= len(trak):
+            tkhd = trak[tkhd_off : tkhd_off + tkhd_size]
+            ver = tkhd[8]
+            if ver == 0:
+                w_raw, h_raw = struct.unpack_from(">II", tkhd, 76)
+            else:
+                w_raw, h_raw = struct.unpack_from(">II", tkhd, 88)
+            w = w_raw >> 16
+            h = h_raw >> 16
+            if w > 0 and h > 0:
+                break
+        trak_off = t_off + t_size
+
+    return dur, w, h
+
+
 async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -2974,13 +3067,17 @@ async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
             "ffmpeg",
             "-i",
             input_path,
-            "-f",
-            "null",
-            "-",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return None, 0, 0
         stderr_text = stderr.decode(errors="replace")
         dur = None
         m = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", stderr_text)
@@ -2994,7 +3091,7 @@ async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
     except FileNotFoundError:
         pass
 
-    return None, 0, 0
+    return _parse_mp4_info(input_path)
 
 
 PERSIAN_SUB_TAGS = {"fa", "farsi", "persian", "parsi"}
