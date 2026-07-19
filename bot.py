@@ -2135,7 +2135,10 @@ async def send_file_with_progress(
         if ul_id not in active_uploads:
             active_uploads[ul_id] = {"paused": False, "cancelled": False}
 
-    duration, width, height = await get_video_info(filepath)
+    try:
+        duration, width, height = await get_video_info(filepath)
+    except FileNotFoundError:
+        duration, width, height = None, 0, 0
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
     is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
 
@@ -2147,71 +2150,83 @@ async def send_file_with_progress(
     try:
         # ویدیو: moov atom رو ببر اول فایل (Fast Start) برای استریمینگ
         if is_video:
-            fast_path = filepath + "_faststart.mp4"
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-i",
-                filepath,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                "-y",
-                fast_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0:
-                filepath = fast_path
-                tmp_files.append(fast_path)
+            try:
+                fast_path = filepath + "_faststart.mp4"
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-i",
+                    filepath,
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    "-y",
+                    fast_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0:
+                    filepath = fast_path
+                    tmp_files.append(fast_path)
+            except FileNotFoundError:
+                pass
 
         # صدا: استخراج کاور از تگ‌های ID3
         audio_title = ""
         audio_performer = ""
         if is_audio and not thumb_filepath:
-            cover_path = filepath + "_cover.jpg"
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-i",
-                filepath,
-                "-an",
-                "-vcodec",
-                "copy",
-                "-y",
-                cover_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-                thumb_filepath = cover_path
-                tmp_files.append(cover_path)
+            try:
+                cover_path = filepath + "_cover.jpg"
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-i",
+                    filepath,
+                    "-an",
+                    "-vcodec",
+                    "copy",
+                    "-y",
+                    cover_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+                    thumb_filepath = cover_path
+                    tmp_files.append(cover_path)
+            except FileNotFoundError:
+                pass
 
         # متادیتای صدا (عنوان و هنرمند)
         if is_audio:
-            probe = await asyncio.create_subprocess_exec(
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_format",
-                orig_filepath,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            out, _ = await probe.communicate()
             try:
-                tags = json.loads(out.decode()).get("format", {}).get("tags", {})
-                audio_title = tags.get("title", "")
-                audio_performer = tags.get("artist", "") or tags.get("TPE1", "")
-            except Exception:
+                probe = await asyncio.create_subprocess_exec(
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-print_format",
+                    "json",
+                    "-show_format",
+                    orig_filepath,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                out, _ = await probe.communicate()
+                try:
+                    tags = json.loads(out.decode()).get("format", {}).get("tags", {})
+                    audio_title = tags.get("title", "")
+                    audio_performer = tags.get("artist", "") or tags.get("TPE1", "")
+                except Exception:
+                    pass
+            except FileNotFoundError:
                 pass
 
-        thumb_path = thumb_filepath or (
-            await get_video_thumbnail(filepath) if is_video else None
-        )
+        try:
+            thumb_path = thumb_filepath or (
+                await get_video_thumbnail(filepath) if is_video else None
+            )
+        except FileNotFoundError:
+            thumb_path = None
 
         ul_buttons = None
         if ul_id:
