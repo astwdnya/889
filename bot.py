@@ -2143,7 +2143,6 @@ async def send_file_with_progress(
         duration, width, height = await get_video_info(filepath)
     except FileNotFoundError:
         duration, width, height = None, 0, 0
-    is_video_ext = ext in (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp")
     is_video = duration is not None and duration > 0 and width > 0 and height > 0
     is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
 
@@ -2155,83 +2154,71 @@ async def send_file_with_progress(
     try:
         # ویدیو: moov atom رو ببر اول فایل (Fast Start) برای استریمینگ
         if is_video:
-            try:
-                fast_path = filepath + "_faststart.mp4"
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-i",
-                    filepath,
-                    "-c",
-                    "copy",
-                    "-movflags",
-                    "+faststart",
-                    "-y",
-                    fast_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.communicate()
-                if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0:
-                    filepath = fast_path
-                    tmp_files.append(fast_path)
-            except FileNotFoundError:
-                pass
+            fast_path = filepath + "_faststart.mp4"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-i",
+                filepath,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-y",
+                fast_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0:
+                filepath = fast_path
+                tmp_files.append(fast_path)
 
         # صدا: استخراج کاور از تگ‌های ID3
         audio_title = ""
         audio_performer = ""
         if is_audio and not thumb_filepath:
-            try:
-                cover_path = filepath + "_cover.jpg"
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-i",
-                    filepath,
-                    "-an",
-                    "-vcodec",
-                    "copy",
-                    "-y",
-                    cover_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.communicate()
-                if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-                    thumb_filepath = cover_path
-                    tmp_files.append(cover_path)
-            except FileNotFoundError:
-                pass
+            cover_path = filepath + "_cover.jpg"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-i",
+                filepath,
+                "-an",
+                "-vcodec",
+                "copy",
+                "-y",
+                cover_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            if os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
+                thumb_filepath = cover_path
+                tmp_files.append(cover_path)
 
         # متادیتای صدا (عنوان و هنرمند)
         if is_audio:
+            probe = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                orig_filepath,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await probe.communicate()
             try:
-                probe = await asyncio.create_subprocess_exec(
-                    "ffprobe",
-                    "-v",
-                    "quiet",
-                    "-print_format",
-                    "json",
-                    "-show_format",
-                    orig_filepath,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                out, _ = await probe.communicate()
-                try:
-                    tags = json.loads(out.decode()).get("format", {}).get("tags", {})
-                    audio_title = tags.get("title", "")
-                    audio_performer = tags.get("artist", "") or tags.get("TPE1", "")
-                except Exception:
-                    pass
-            except FileNotFoundError:
+                tags = json.loads(out.decode()).get("format", {}).get("tags", {})
+                audio_title = tags.get("title", "")
+                audio_performer = tags.get("artist", "") or tags.get("TPE1", "")
+            except Exception:
                 pass
 
-        try:
-            thumb_path = thumb_filepath or (
-                await get_video_thumbnail(filepath) if (is_video or is_video_ext) else None
-            )
-        except FileNotFoundError:
-            thumb_path = None
+        thumb_path = thumb_filepath or (
+            await get_video_thumbnail(filepath) if is_video else None
+        )
 
         ul_buttons = None
         if ul_id:
@@ -2275,8 +2262,7 @@ async def send_file_with_progress(
                 pass
             raise
 
-        is_video_ext = ext in (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp")
-        if is_video or is_video_ext:
+        if is_video:
             duration_int = int(duration) if duration else 0
             attributes, mime_type = utils.get_attributes(
                 filepath,
@@ -2326,11 +2312,12 @@ async def send_file_with_progress(
             )
         else:
             attributes, mime_type = utils.get_attributes(filepath)
+            is_video_ext = ext in (".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".3gp")
             media = InputMediaUploadedDocument(
                 file=uploaded,
                 mime_type=mime_type,
                 attributes=attributes,
-                force_file=True,
+                force_file=not is_video_ext,
             )
 
         try:
@@ -3033,6 +3020,179 @@ def _parse_mp4_info(filepath: str) -> Tuple[Optional[float], int, int]:
     return dur, w, h
 
 
+def _parse_mkv_info(filepath: str) -> Tuple[Optional[float], int, int]:
+    try:
+        sz = os.path.getsize(filepath)
+        if sz > 500 * 1024 * 1024:
+            return None, 0, 0
+        with open(filepath, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None, 0, 0
+    if len(data) < 32 or data[:4] != b"\x1a\x45\xdf\xa3":
+        return None, 0, 0
+
+    def _vint(data: bytes, pos: int):
+        """Decode EBML variable-length integer, return (value, length) or None."""
+        if pos >= len(data):
+            return None, 0
+        first = data[pos]
+        mask = 0x80
+        length = 1
+        while not (first & mask):
+            mask >>= 1
+            length += 1
+            if length > 8:
+                return None, 0
+        if pos + length > len(data):
+            return None, 0
+        val = first & (mask - 1)
+        for i in range(1, length):
+            val = (val << 8) | data[pos + i]
+        return val, length
+
+    def _skip(data: bytes, pos: int):
+        """Skip past an EBML element at pos, return next element position."""
+        id_val, id_len = _vint(data, pos)
+        if id_val is None:
+            return -1
+        pos += id_len
+        size_val, size_len = _vint(data, pos)
+        if size_val is None:
+            return -1
+        pos += size_len
+        if size_val > len(data) - pos:
+            return -1
+        return pos + size_val
+
+    pos = 0
+    # Skip EBML header
+    while pos < len(data) - 4:
+        id_val, id_len = _vint(data, pos)
+        if id_val is None:
+            break
+        # 0x18538067 = Segment
+        if data[pos : pos + id_len] == b"\x18\x53\x80\x67":
+            pos += id_len
+            size_val, size_len = _vint(data, pos)
+            if size_val is None:
+                break
+            pos += size_len
+            segment_end = pos + size_val if size_val < 0xFFFFFFFFFF else len(data)
+            break
+        nxt = _skip(data, pos)
+        if nxt < 0:
+            break
+        pos = nxt
+    else:
+        return None, 0, 0
+
+    dur = None
+    timecode_scale = 1000000
+    w, h = 0, 0
+
+    seg_start = pos
+    while pos < segment_end and pos < len(data) - 4:
+        id_val, id_len = _vint(data, pos)
+        if id_val is None:
+            break
+        elem_id = data[pos : pos + id_len]
+
+        nxt = pos + id_len
+        size_val, size_len = _vint(data, nxt)
+        if size_val is None:
+            break
+        nxt += size_len
+        elem_end = nxt + size_val
+        if size_val == 0xFFFFFFFFFFFFFFFFFF or elem_end > len(data):
+            elem_end = len(data)
+
+        if elem_id == b"\x15\x49\xa9\x66" and dur is None:
+            # Info
+            ip = nxt
+            while ip + 2 < elem_end:
+                sub_id, sub_len = _vint(data, ip)
+                if sub_id is None:
+                    break
+                sp = ip + sub_len
+                sub_sz, sub_sl = _vint(data, sp)
+                if sub_sz is None:
+                    break
+                sp += sub_sl
+                sub_end = sp + sub_sz
+                raw = data[ip : ip + sub_len]
+                if raw == b"\x2a\xd7\xb1" and sp + 4 <= sub_end:
+                    timecode_scale = struct.unpack_from(">I", data, sp)[0]
+                elif raw == b"\x44\x89" and sp + 4 <= sub_end:
+                    dur = struct.unpack_from(">f", data, sp)[0]
+                ip = sub_end
+                if ip >= elem_end:
+                    break
+
+        elif elem_id == b"\x16\x54\xae\x6b" and (w == 0 or h == 0):
+            # Tracks
+            ip = nxt
+            while ip + 4 < elem_end and (w == 0 or h == 0):
+                tr_id, tr_len = _vint(data, ip)
+                if tr_id is None:
+                    break
+                if data[ip : ip + tr_len] == b"\xae":
+                    tp = ip + tr_len
+                    tr_sz, tr_sl = _vint(data, tp)
+                    if tr_sz is None:
+                        break
+                    tp += tr_sl
+                    tr_end = tp + tr_sz
+                    track_type = None
+                    while tp + 2 < tr_end:
+                        f_id, f_len = _vint(data, tp)
+                        if f_id is None:
+                            break
+                        fp = tp + f_len
+                        f_sz, f_sl = _vint(data, fp)
+                        if f_sz is None:
+                            break
+                        fp += f_sl
+                        f_end = fp + f_sz
+                        raw = data[tp : tp + f_len]
+                        if raw == b"\x83" and fp < f_end:
+                            track_type = data[fp]
+                            if track_type != 1:
+                                break
+                        if track_type == 1:
+                            if raw == b"\xe0":
+                                vp = fp
+                                while vp + 2 < f_end:
+                                    vf_id, vf_len = _vint(data, vp)
+                                    if vf_id is None:
+                                        break
+                                    vfp = vp + vf_len
+                                    vf_sz, vf_sl = _vint(data, vfp)
+                                    if vf_sz is None:
+                                        break
+                                    vfp += vf_sl
+                                    vf_end = vfp + vf_sz
+                                    vraw = data[vp : vp + vf_len]
+                                    if vraw == b"\xb0" and vfp + 4 <= vf_end:
+                                        w = struct.unpack_from(">I", data, vfp)[0]
+                                    elif vraw == b"\xba" and vfp + 4 <= vf_end:
+                                        h = struct.unpack_from(">I", data, vfp)[0]
+                                    vp = vf_end
+                        ip = tr_end
+                        break
+                ip = _skip(data, ip) if data[ip : ip + tr_len] != b"\xae" else ip
+                if ip < 0:
+                    break
+
+        pos = elem_end
+        if pos >= segment_end:
+            break
+
+    if dur is not None:
+        dur = dur * timecode_scale / 1e9
+    return dur, w, h
+
+
 async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -3095,7 +3255,10 @@ async def get_video_info(input_path: str) -> Tuple[Optional[float], int, int]:
     except FileNotFoundError:
         pass
 
-    return _parse_mp4_info(input_path)
+    dur, w, h = _parse_mp4_info(input_path)
+    if dur is not None and w > 0 and h > 0:
+        return dur, w, h
+    return _parse_mkv_info(input_path)
 
 
 PERSIAN_SUB_TAGS = {"fa", "farsi", "persian", "parsi"}
@@ -11662,11 +11825,9 @@ async def ytdlp_quality_callback(event):
             pass
 
     try:
-        actual_filepath = [filepath]
         success, error, size = await download_with_ytdlp(
-            entry["url"], chosen["format_id"], filepath, progress_cb, actual_filepath=actual_filepath
+            entry["url"], chosen["format_id"], filepath, progress_cb
         )
-        filepath = actual_filepath[0]
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
         if not success or not os.path.exists(filepath) or size < 1024:
